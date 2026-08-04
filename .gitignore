@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# Built by lmz/native/build.py on first use; rebuilt automatically.
+lmz/native/lmzcore-*.so
+lmz/native/lmzcore-*.dylib
+lmz/native/lmzcore-*.dll
+
+*.lmz
+build/
+dist/
+*.egg-info/

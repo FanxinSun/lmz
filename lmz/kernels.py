@@ -1,0 +1,404 @@
+"""Byte-plane split and merge.
+
+`split` turns an array of fixed-size elements into one contiguous plane per
+byte position; `merge` is its exact inverse. Splitting is what exposes the
+structure an entropy coder can use: in BF16 the sign+exponent byte takes only
+a few dozen distinct values while the mantissa byte is close to uniform noise,
+and separating them lets each be handled on its own terms.
+
+Three backends are tried in order. The native one is SIMD and releases the
+GIL, so it scales across threads. The others exist so the tool still works
+with no compiler and no third-party packages.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import os
+import threading
+
+_lock = threading.Lock()
+_lib = None
+_state = "unloaded"
+
+SUPPORTED_ESIZES = (1, 2, 4, 8)
+
+
+def _load_native():
+    """Load the compiled kernel, building it on first use. None if unavailable."""
+    global _lib, _state
+    if _state != "unloaded":
+        return _lib
+    with _lock:
+        if _state != "unloaded":
+            return _lib
+        if os.environ.get("LMZ_NO_NATIVE"):
+            _state = "disabled"
+            return None
+        try:
+            from .native import build as _build
+
+            path = _build.build()
+            if not path:
+                _state = "unavailable"
+                return None
+            lib = ctypes.CDLL(path)
+            lib.lmz_abi_version.restype = ctypes.c_int
+            if lib.lmz_abi_version() != 4:
+                _state = "abi-mismatch"
+                return None
+            lib.lmz_isa.restype = ctypes.c_char_p
+            v = ctypes.c_void_p
+            lib.lmz_split.restype = ctypes.c_int
+            lib.lmz_split.argtypes = [v, v, ctypes.c_size_t, ctypes.c_size_t, v]
+            lib.lmz_merge.restype = ctypes.c_int
+            lib.lmz_merge.argtypes = [v, v, ctypes.c_size_t, ctypes.c_size_t, v]
+            lib.lmz_merge_planes.restype = ctypes.c_int
+            lib.lmz_merge_planes.argtypes = [ctypes.POINTER(ctypes.c_void_p), v,
+                                             ctypes.c_size_t, ctypes.c_size_t, v]
+            lib.lmz_scratch_size.restype = ctypes.c_size_t
+            lib.lmz_scratch_size.argtypes = [ctypes.c_size_t, ctypes.c_size_t]
+            lib.lmz_hist.argtypes = [v, ctypes.c_size_t, v]
+            lib.lmz_distinct.restype = ctypes.c_int
+            lib.lmz_distinct.argtypes = [v, ctypes.c_size_t]
+            lib.lmz_split_bf16.restype = ctypes.c_int
+            lib.lmz_split_bf16.argtypes = [v, v, v, ctypes.c_size_t]
+            lib.lmz_merge_bf16.restype = ctypes.c_int
+            lib.lmz_merge_bf16.argtypes = [v, v, v, ctypes.c_size_t]
+            lib.lmz_rans_bound.restype = ctypes.c_size_t
+            lib.lmz_rans_bound.argtypes = [ctypes.c_size_t]
+            lib.lmz_rans_encode.restype = ctypes.c_long
+            lib.lmz_rans_encode.argtypes = [v, ctypes.c_size_t, v, ctypes.c_size_t]
+            lib.lmz_rans_decode.restype = ctypes.c_int
+            lib.lmz_rans_decode.argtypes = [v, ctypes.c_size_t, v, ctypes.c_size_t]
+            _lib = lib
+            _state = "native:" + lib.lmz_isa().decode()
+        except Exception:
+            _lib = None
+            _state = "unavailable"
+    return _lib
+
+
+def backend() -> str:
+    """Name of the active backend, for diagnostics."""
+    _load_native()
+    if _lib is not None:
+        return _state
+    try:
+        import numpy  # noqa: F401
+
+        return "numpy"
+    except ImportError:
+        return "python"
+
+
+def _ptr(obj):
+    """Address of a buffer plus a reference that must outlive the call.
+
+    Read-only bytes are addressed in place rather than copied; anything else
+    is exported through the buffer protocol.
+    """
+    if len(obj) == 0:
+        return 0, None
+    if type(obj) is bytes:
+        p = ctypes.c_char_p(obj)
+        return ctypes.cast(p, ctypes.c_void_p).value, (p, obj)
+    try:
+        arr = (ctypes.c_ubyte * len(obj)).from_buffer(obj)
+        return ctypes.addressof(arr), arr
+    except TypeError:
+        b = bytes(obj)  # read-only memoryview or other exporter
+        p = ctypes.c_char_p(b)
+        return ctypes.cast(p, ctypes.c_void_p).value, (p, b)
+
+
+# Element sizes above 2 need a working area as large as the chunk. Reusing it
+# per thread keeps that off the hot path.
+_scratch = threading.local()
+
+
+def _get_scratch(nbytes: int):
+    if nbytes == 0:
+        return 0, None
+    buf = getattr(_scratch, "buf", None)
+    if buf is None or len(buf) < nbytes:
+        buf = bytearray(nbytes)
+        _scratch.buf = buf
+    return _ptr(buf)
+
+
+def split(src, esize: int) -> bytearray:
+    """Deinterleave `src` into `esize` planes, concatenated in byte-position order.
+
+    len(src) must be a multiple of esize.
+    """
+    if esize not in SUPPORTED_ESIZES:
+        raise ValueError(f"unsupported element size {esize}")
+    n = len(src)
+    if esize == 1:
+        return bytearray(src)
+    if n % esize:
+        raise ValueError(f"buffer of {n} bytes is not a multiple of element size {esize}")
+    nelem = n // esize
+    out = bytearray(n)
+    if n == 0:
+        return out
+
+    lib = _load_native()
+    if lib is not None:
+        src_addr, _a = _ptr(src)
+        dst_addr, _b = _ptr(out)
+        scr_addr, _c = _get_scratch(lib.lmz_scratch_size(nelem, esize))
+        rc = lib.lmz_split(src_addr, dst_addr, nelem, esize, scr_addr)
+        if rc != 0:
+            raise ValueError(f"unsupported element size {esize}")
+        return out
+
+    try:
+        import numpy as np
+
+        a = np.frombuffer(src, dtype=np.uint8).reshape(nelem, esize)
+        np.frombuffer(out, dtype=np.uint8).reshape(esize, nelem)[:] = a.T
+        return out
+    except ImportError:
+        pass
+
+    # Extended slicing runs in C and is respectable even without numpy.
+    mv = bytes(src)
+    for k in range(esize):
+        out[k * nelem:(k + 1) * nelem] = mv[k::esize]
+    return out
+
+
+def merge(planes, esize: int, nelem: int) -> bytearray:
+    """Rebuild interleaved elements from concatenated planes. Inverse of `split`."""
+    if esize not in SUPPORTED_ESIZES:
+        raise ValueError(f"unsupported element size {esize}")
+    n = nelem * esize
+    if esize == 1:
+        return bytearray(planes)
+    if len(planes) != n:
+        raise ValueError(f"expected {n} plane bytes, got {len(planes)}")
+    out = bytearray(n)
+    if n == 0:
+        return out
+
+    lib = _load_native()
+    if lib is not None:
+        src_addr, _a = _ptr(planes)
+        dst_addr, _b = _ptr(out)
+        scr_addr, _c = _get_scratch(lib.lmz_scratch_size(nelem, esize))
+        rc = lib.lmz_merge(src_addr, dst_addr, nelem, esize, scr_addr)
+        if rc != 0:
+            raise ValueError(f"unsupported element size {esize}")
+        return out
+
+    try:
+        import numpy as np
+
+        src = np.frombuffer(planes, dtype=np.uint8).reshape(esize, nelem)
+        np.frombuffer(out, dtype=np.uint8).reshape(nelem, esize)[:] = src.T
+        return out
+    except ImportError:
+        pass
+
+    src = bytes(planes)
+    for k in range(esize):
+        out[k::esize] = src[k * nelem:(k + 1) * nelem]
+    return out
+
+
+def merge_planes(planes, esize: int, nelem: int, out):
+    """Interleave planes given as (buffer, offset) pairs into `out`.
+
+    The decoder gets its planes as separate objects: some are freshly
+    decompressed, others are slices of the payload that were stored as-is.
+    Taking them where they lie avoids copying the whole chunk into one
+    contiguous block purely to satisfy the kernel's calling convention.
+
+    Returns a memoryview of the filled portion of `out`.
+    """
+    n = nelem * esize
+    if len(planes) != esize:
+        raise ValueError(f"expected {esize} planes, got {len(planes)}")
+    if len(out) < n:
+        raise ValueError(f"output buffer holds {len(out)} bytes, need {n}")
+    view = memoryview(out)
+    if n == 0:
+        return view[:0]
+    if esize == 1:
+        obj, off = planes[0]
+        view[:n] = memoryview(obj)[off:off + n]
+        return view[:n]
+
+    lib = _load_native()
+    if lib is not None:
+        keep = []
+        addrs = (ctypes.c_void_p * esize)()
+        for k, (obj, off) in enumerate(planes):
+            addr, ref = _ptr(obj)
+            keep.append(ref)
+            addrs[k] = addr + off
+        dst, ref = _ptr(out)
+        keep.append(ref)
+        scr, ref = _get_scratch(lib.lmz_scratch_size(nelem, esize))
+        keep.append(ref)
+        rc = lib.lmz_merge_planes(addrs, dst, nelem, esize, scr)
+        if rc != 0:
+            raise ValueError(f"unsupported element size {esize}")
+        return view[:n]
+
+    gathered = bytearray(n)
+    for k, (obj, off) in enumerate(planes):
+        gathered[k * nelem:(k + 1) * nelem] = memoryview(obj)[off:off + nelem]
+    view[:n] = merge(gathered, esize, nelem)
+    return view[:n]
+
+
+def split_bf16(src) -> bytearray:
+    """Split BF16 words into an exponent plane and a sign+mantissa plane.
+
+    Unlike the byte split this cuts on the float's own field boundaries, so
+    the 8-bit exponent stays in one piece instead of being divided across
+    two alphabets. Output is the two planes back to back.
+    """
+    n = len(src)
+    if n % 2:
+        raise ValueError(f"buffer of {n} bytes is not a whole number of BF16 values")
+    nelem = n // 2
+    out = bytearray(n)
+    if nelem == 0:
+        return out
+    lib = _load_native()
+    if lib is not None:
+        s, _a = _ptr(src)
+        d, _b = _ptr(out)
+        lib.lmz_split_bf16(s, d, d + nelem, nelem)
+        return out
+    try:
+        import numpy as np
+
+        w = np.frombuffer(src, dtype="<u2")
+        view = np.frombuffer(out, dtype=np.uint8)
+        view[:nelem] = ((w >> 7) & 0xFF).astype(np.uint8)
+        view[nelem:] = (((w >> 8) & 0x80) | (w & 0x7F)).astype(np.uint8)
+        return out
+    except ImportError:
+        pass
+
+    # Last resort. A per-element Python loop is far too slow for a real model,
+    # but it keeps the tool correct rather than absent.
+    mv = memoryview(src)
+    for i in range(nelem):
+        w = mv[2 * i] | (mv[2 * i + 1] << 8)
+        out[i] = (w >> 7) & 0xFF
+        out[nelem + i] = ((w >> 8) & 0x80) | (w & 0x7F)
+    return out
+
+
+def merge_bf16(planes, nelem: int, out=None):
+    """Rebuild BF16 words from the two field planes. Inverse of `split_bf16`."""
+    n = nelem * 2
+    dst = out if (out is not None and len(out) >= n) else bytearray(n)
+    if nelem == 0:
+        return memoryview(dst)[:0]
+    lib = _load_native()
+    if lib is not None:
+        keep = []
+        addrs = []
+        for obj, off in planes:
+            a, ref = _ptr(obj)
+            keep.append(ref)
+            addrs.append(a + off)
+        d, ref = _ptr(dst)
+        keep.append(ref)
+        lib.lmz_merge_bf16(addrs[0], addrs[1], d, nelem)
+        return memoryview(dst)[:n]
+    try:
+        import numpy as np
+
+        def plane(idx):
+            obj, off = planes[idx]
+            return np.frombuffer(obj, dtype=np.uint8, count=nelem, offset=off)
+
+        pa = plane(0).astype(np.uint16)
+        pb = plane(1).astype(np.uint16)
+        words = ((pb & 0x80) << 8) | (pa << 7) | (pb & 0x7F)
+        np.frombuffer(dst, dtype="<u2", count=nelem)[:] = words
+        return memoryview(dst)[:n]
+    except ImportError:
+        pass
+
+    pa = memoryview(planes[0][0])[planes[0][1]:planes[0][1] + nelem]
+    pb = memoryview(planes[1][0])[planes[1][1]:planes[1][1] + nelem]
+    for i in range(nelem):
+        w = ((pb[i] & 0x80) << 8) | (pa[i] << 7) | (pb[i] & 0x7F)
+        dst[2 * i] = w & 0xFF
+        dst[2 * i + 1] = w >> 8
+    return memoryview(dst)[:n]
+
+
+def have_rans() -> bool:
+    """rANS needs the native kernel; there is no practical pure-Python coder."""
+    return _load_native() is not None
+
+
+# Encoding runs backwards from the end of a scratch buffer, so it needs room
+# for the worst case up front. Reused per thread.
+_rans_scratch = threading.local()
+
+
+def rans_encode(src) -> bytes | None:
+    """Order-0 rANS encode. Returns None if unavailable or the input is empty."""
+    lib = _load_native()
+    if lib is None or len(src) == 0:
+        return None
+    n = len(src)
+    cap = lib.lmz_rans_bound(n)
+    buf = getattr(_rans_scratch, "buf", None)
+    if buf is None or len(buf) < cap:
+        buf = _rans_scratch.buf = bytearray(cap)
+    src_addr, _a = _ptr(src)
+    dst_addr, _b = _ptr(buf)
+    written = lib.lmz_rans_encode(src_addr, n, dst_addr, cap)
+    if written < 0:
+        return None
+    return bytes(memoryview(buf)[:written])
+
+
+def rans_decode(payload, n: int, out=None):
+    """Decode a rANS stream to exactly `n` bytes."""
+    lib = _load_native()
+    if lib is None:
+        raise RuntimeError(
+            "this archive uses lmz's rANS coder, which needs the native kernel; "
+            "a C compiler (cc/gcc/clang) is required to build it")
+    dst = out if (out is not None and len(out) >= n) else bytearray(n)
+    if n == 0:
+        return memoryview(dst)[:0]
+    src_addr, _a = _ptr(payload)
+    dst_addr, _b = _ptr(dst)
+    if lib.lmz_rans_decode(src_addr, len(payload), dst_addr, n) != 0:
+        raise ValueError("malformed rANS stream")
+    return memoryview(dst)[:n]
+
+
+def histogram(buf) -> list[int]:
+    """Byte-value counts, 256 entries."""
+    if len(buf) == 0:
+        return [0] * 256
+    lib = _load_native()
+    if lib is not None:
+        hist = (ctypes.c_uint64 * 256)()
+        addr, _keep = _ptr(buf)
+        lib.lmz_hist(addr, len(buf), ctypes.byref(hist))
+        return list(hist)
+    try:
+        import numpy as np
+
+        return np.bincount(np.frombuffer(buf, dtype=np.uint8), minlength=256).tolist()
+    except ImportError:
+        counts = [0] * 256
+        for b in bytes(buf):
+            counts[b] += 1
+        return counts
