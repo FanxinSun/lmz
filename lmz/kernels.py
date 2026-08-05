@@ -44,7 +44,7 @@ def _load_native():
                 return None
             lib = ctypes.CDLL(path)
             lib.lmz_abi_version.restype = ctypes.c_int
-            if lib.lmz_abi_version() != 4:
+            if lib.lmz_abi_version() != 5:
                 _state = "abi-mismatch"
                 return None
             lib.lmz_isa.restype = ctypes.c_char_p
@@ -65,6 +65,15 @@ def _load_native():
             lib.lmz_split_bf16.argtypes = [v, v, v, ctypes.c_size_t]
             lib.lmz_merge_bf16.restype = ctypes.c_int
             lib.lmz_merge_bf16.argtypes = [v, v, v, ctypes.c_size_t]
+            lib.lmz_bucket_lut.restype = ctypes.c_int
+            lib.lmz_bucket_lut.argtypes = [v, ctypes.c_size_t, v]
+            lib.lmz_bucket_partition.restype = ctypes.c_int
+            lib.lmz_bucket_partition.argtypes = [v, v, ctypes.c_size_t, v,
+                                                 ctypes.c_size_t, v, v]
+            lib.lmz_bucket_unpartition.restype = ctypes.c_int
+            lib.lmz_bucket_unpartition.argtypes = [v, ctypes.POINTER(ctypes.c_void_p),
+                                                   ctypes.c_size_t, v,
+                                                   ctypes.c_size_t, v]
             lib.lmz_rans_bound.restype = ctypes.c_size_t
             lib.lmz_rans_bound.argtypes = [ctypes.c_size_t]
             lib.lmz_rans_encode.restype = ctypes.c_long
@@ -335,6 +344,109 @@ def merge_bf16(planes, nelem: int, out=None):
         w = ((pb[i] & 0x80) << 8) | (pa[i] << 7) | (pb[i] & 0x7F)
         dst[2 * i] = w & 0xFF
         dst[2 * i + 1] = w >> 8
+    return memoryview(dst)[:n]
+
+
+def bucket_lut(hist, k: int) -> bytes:
+    """Contiguous equal-mass buckets over the byte alphabet.
+
+    A pure function of the histogram, identical between the native and Python
+    paths, so an encoder and decoder that see the same symbol counts always
+    derive the same map and it never needs to be stored.
+    """
+    lib = _load_native()
+    if lib is not None:
+        arr = (ctypes.c_uint64 * 256)(*hist)
+        lut = ctypes.create_string_buffer(256)
+        if lib.lmz_bucket_lut(ctypes.byref(arr), k, lut) != 0:
+            raise ValueError(f"unsupported bucket count {k}")
+        return lut.raw
+    if not (1 <= k <= 32):
+        raise ValueError(f"unsupported bucket count {k}")
+    total = sum(hist)
+    if total == 0:
+        return bytes(256)
+    out = bytearray(256)
+    acc = 0
+    b = 0
+    for s in range(256):
+        out[s] = b
+        acc += hist[s]
+        while b + 1 < k and acc * k >= (b + 1) * total:
+            b += 1
+    return bytes(out)
+
+
+def bucket_counts(hist, lut: bytes, k: int) -> list[int]:
+    """Elements per bucket, from the context histogram and the bucket map."""
+    counts = [0] * k
+    for s in range(256):
+        counts[lut[s]] += hist[s]
+    return counts
+
+
+def bucket_partition(ctx, val, lut: bytes, k: int):
+    """Group val[i] into per-bucket segments by ctx[i]'s bucket.
+
+    Returns (buffer of concatenated segments, per-bucket lengths). Order is
+    preserved within each bucket, which is what makes it invertible.
+    """
+    n = len(ctx)
+    if len(val) != n:
+        raise ValueError("context and value planes differ in length")
+    out = bytearray(n)
+    lib = _load_native()
+    if lib is not None:
+        counts = (ctypes.c_uint64 * k)()
+        ca, _a = _ptr(ctx)
+        va, _b = _ptr(val)
+        la, _c = _ptr(lut)
+        oa, _d = _ptr(out)
+        if lib.lmz_bucket_partition(ca, va, n, la, k, oa, ctypes.byref(counts)) != 0:
+            raise ValueError(f"unsupported bucket count {k}")
+        return out, list(counts)
+    counts = bucket_counts(histogram(ctx), lut, k)
+    cur = [0] * k
+    pos = 0
+    for b in range(k):
+        cur[b] = pos
+        pos += counts[b]
+    cb = bytes(ctx)
+    vb = bytes(val)
+    for i in range(n):
+        b = lut[cb[i]]
+        out[cur[b]] = vb[i]
+        cur[b] += 1
+    return out, counts
+
+
+def bucket_unpartition(ctx, streams, lut: bytes, k: int, out=None):
+    """Inverse of bucket_partition. `streams` is a list of (buffer, offset)."""
+    n = len(ctx)
+    dst = out if (out is not None and len(out) >= n) else bytearray(n)
+    if n == 0:
+        return memoryview(dst)[:0]
+    lib = _load_native()
+    if lib is not None:
+        keep = []
+        addrs = (ctypes.c_void_p * k)()
+        for b, (obj, off) in enumerate(streams):
+            addr, ref = _ptr(obj)
+            keep.append(ref)
+            addrs[b] = (addr + off) if addr else 0
+        ca, _a = _ptr(ctx)
+        la, _b = _ptr(lut)
+        da, _c = _ptr(dst)
+        if lib.lmz_bucket_unpartition(ca, addrs, n, la, k, da) != 0:
+            raise ValueError(f"unsupported bucket count {k}")
+        return memoryview(dst)[:n]
+    cur = [off for (_obj, off) in streams]
+    views = [memoryview(obj) for (obj, _off) in streams]
+    cb = bytes(ctx)
+    for i in range(n):
+        b = lut[cb[i]]
+        dst[i] = views[b][cur[b]]
+        cur[b] += 1
     return memoryview(dst)[:n]
 
 

@@ -47,6 +47,25 @@ MAX_HEADER = 256 << 20  # refuse absurd declared header sizes
 # Element layouts that get their own treatment beyond the element width.
 KIND_BYTES = 0
 KIND_BF16 = 1
+KIND_REF = 2  # bytes duplicate an earlier output range; src is its offset
+
+# torch storage class -> (dtype name, element size, kind). Complex dtypes use
+# the width of one component pair's half so the split still lines up on a
+# power-of-two period.
+TORCH_STORAGE = {
+    "DoubleStorage": ("F64", 8, KIND_BYTES),
+    "FloatStorage": ("F32", 4, KIND_BYTES),
+    "HalfStorage": ("F16", 2, KIND_BYTES),
+    "BFloat16Storage": ("BF16", 2, KIND_BF16),
+    "LongStorage": ("I64", 8, KIND_BYTES),
+    "IntStorage": ("I32", 4, KIND_BYTES),
+    "ShortStorage": ("I16", 2, KIND_BYTES),
+    "CharStorage": ("I8", 1, KIND_BYTES),
+    "ByteStorage": ("U8", 1, KIND_BYTES),
+    "BoolStorage": ("BOOL", 1, KIND_BYTES),
+    "ComplexFloatStorage": ("C64", 8, KIND_BYTES),
+    "ComplexDoubleStorage": ("C128", 8, KIND_BYTES),
+}
 
 
 @dataclass(slots=True)
@@ -57,6 +76,7 @@ class Region:
     end: int
     esize: int
     kind: int = KIND_BYTES
+    src: int = -1  # for KIND_REF: the duplicated range's output offset
 
     @property
     def length(self) -> int:
@@ -241,9 +261,121 @@ def parse_gguf(f, size: int) -> Layout | None:
     return Layout("gguf", regions, tensors)
 
 
+def _pickle_storage_types(pkl: bytes) -> dict:
+    """Map torch storage keys to storage class names, without unpickling.
+
+    torch's persistent ids are tuples of ('storage', StorageClass, key,
+    location, numel). In the opcode stream the class arrives as a GLOBAL
+    (protocol 2) or STACK_GLOBAL (4+), possibly through a memo reference,
+    and the very next string pushed is the key. pickletools only reads the
+    stream, so nothing here executes.
+    """
+    import pickletools
+
+    memo: dict = {}
+    strings: list = []  # the last two string pushes, for STACK_GLOBAL
+    last = None  # what the latest op left on top: ("global", name) or ("str", s)
+    pending = None
+    out: dict = {}
+    for op, arg, _pos in pickletools.genops(pkl):
+        name = op.name
+        if name in ("SHORT_BINUNICODE", "BINUNICODE", "BINUNICODE8", "UNICODE",
+                    "STRING", "BINSTRING", "SHORT_BINSTRING"):
+            if pending is not None:
+                out[str(arg)] = pending
+                pending = None
+            last = ("str", arg)
+            strings.append(arg)
+            del strings[:-2]
+        elif name == "GLOBAL":
+            g = str(arg).split()[-1]
+            last = ("global", g)
+            if g.endswith("Storage"):
+                pending = g
+        elif name == "STACK_GLOBAL":
+            g = str(strings[-1]) if strings else ""
+            last = ("global", g)
+            if g.endswith("Storage"):
+                pending = g
+        elif name in ("BINPUT", "LONG_BINPUT"):
+            memo[arg] = last
+        elif name == "MEMOIZE":
+            memo[len(memo)] = last
+        elif name in ("BINGET", "LONG_BINGET"):
+            last = memo.get(arg)
+            if last and last[0] == "global" and last[1].endswith("Storage"):
+                pending = last[1]
+            elif last and last[0] == "str":
+                strings.append(last[1])
+                del strings[:-2]
+        else:
+            last = None
+    return out
+
+
+def parse_pytorch_zip(f, size: int) -> Layout | None:
+    """The torch.save zip container: data.pkl plus one file per storage.
+
+    Storages are stored uncompressed, so their payload ranges can be typed
+    from the pickled storage classes and split like any other tensor data.
+    Anything unexpected -- compressed entries, an unreadable pickle, keys
+    with no known dtype -- degrades to untyped bytes rather than failing.
+    """
+    import zipfile
+
+    f.seek(0)
+    if f.read(4) != b"PK\x03\x04":
+        return None
+    try:
+        zf = zipfile.ZipFile(f)
+        entries = zf.infolist()
+    except Exception:
+        return None
+    pkl_entry = next((zi for zi in entries
+                      if zi.filename.endswith("data.pkl")
+                      and zi.file_size <= MAX_HEADER), None)
+    if pkl_entry is None:
+        return None
+    prefix = pkl_entry.filename[:-len("data.pkl")]
+    try:
+        dtypes = _pickle_storage_types(zf.read(pkl_entry))
+    except Exception:
+        dtypes = {}
+
+    regions: list[Region] = []
+    tensors: dict = {}
+    for zi in entries:
+        if not zi.filename.startswith(prefix + "data/"):
+            continue
+        key = zi.filename.rsplit("/", 1)[1]
+        if zi.compress_type != zipfile.ZIP_STORED or zi.file_size == 0:
+            continue
+        # The central directory's extra field can differ from the local one,
+        # so the payload offset comes from the local header itself.
+        f.seek(zi.header_offset)
+        local = f.read(30)
+        if len(local) < 30 or local[:4] != b"PK\x03\x04":
+            continue
+        nlen, elen = struct.unpack("<HH", local[26:30])
+        start = zi.header_offset + 30 + nlen + elen
+        end = start + zi.file_size
+        if end > size:
+            continue
+        dtype, esize, kind = TORCH_STORAGE.get(dtypes.get(key, ""),
+                                               ("U8", 1, KIND_BYTES))
+        if zi.file_size % esize:
+            dtype, esize, kind = "U8", 1, KIND_BYTES
+        regions.append(Region(start, end, esize, kind))
+        tensors[f"data/{key}"] = {"dtype": dtype, "shape": [],
+                                  "offsets": [start, end]}
+    if not tensors:
+        return None
+    return Layout("pytorch", regions, tensors)
+
+
 def probe(f, size: int) -> Layout:
     """Identify the file's tensor layout, falling back to opaque bytes."""
-    for parser in (parse_safetensors, parse_gguf):
+    for parser in (parse_safetensors, parse_gguf, parse_pytorch_zip):
         try:
             layout = parser(f, size)
         except Exception:
@@ -253,14 +385,56 @@ def probe(f, size: int) -> Layout:
     return Layout("raw", [], None)
 
 
-def chunkify(layout: Layout, size: int, chunk_size: int) -> list[tuple[int, int, int, int]]:
-    """Cover [0, size) with (start, end, esize, kind) chunks.
+def _carve_refs(regions: list[Region], refs, size: int) -> list[Region]:
+    """Cut duplicate ranges out of the region list and insert them as refs.
+
+    `refs` is a list of (start, end, source_output_offset). Anything
+    malformed -- overlapping or out of bounds -- drops the whole dedup rather
+    than risking the layout: refs are an optimisation, never a requirement.
+    """
+    from bisect import bisect_right
+
+    refs = sorted(refs)
+    pos = 0
+    for s, e, _src in refs:
+        if s < pos or e <= s or e > size:
+            return regions
+        pos = e
+    ref_starts = [s for s, _e, _src in refs]
+    out: list[Region] = []
+    for r in regions:
+        cur = r.start
+        k = bisect_right(ref_starts, cur)
+        if k and refs[k - 1][1] > cur:
+            k -= 1
+        while k < len(refs) and refs[k][0] < r.end:
+            s, e, _src = refs[k]
+            a, b = max(s, r.start), min(e, r.end)
+            if b > cur:
+                if a > cur:
+                    out.append(Region(cur, a, r.esize, r.kind))
+                cur = b
+            k += 1
+        if cur < r.end:
+            out.append(Region(cur, r.end, r.esize, r.kind))
+    out.extend(Region(s, e, 1, KIND_REF, src) for s, e, src in refs)
+    out.sort(key=lambda r: r.start)
+    return out
+
+
+def chunkify(layout: Layout, size: int, chunk_size: int,
+             refs=None) -> list[tuple[int, int, int, int, int]]:
+    """Cover [0, size) with (start, end, esize, kind, src) chunks.
 
     Regions are coalesced before slicing so that runs of small same-dtype
     tensors -- a model has thousands of biases and norm weights -- do not each
-    become their own undersized chunk.
+    become their own undersized chunk. `refs` marks byte ranges that duplicate
+    an earlier output range; those become KIND_REF chunks carrying the source
+    offset in `src` (-1 everywhere else).
     """
     regions = sorted(layout.regions, key=lambda r: r.start)
+    if refs:
+        regions = _carve_refs(regions, refs, size)
 
     # Fill the gaps (header, padding, anything unclaimed) with 1-byte elements.
     covered: list[Region] = []
@@ -278,18 +452,22 @@ def chunkify(layout: Layout, size: int, chunk_size: int) -> list[tuple[int, int,
     merged: list[Region] = []
     for r in covered:
         prev = merged[-1] if merged else None
-        if prev and prev.esize == r.esize and prev.kind == r.kind and prev.end == r.start:
-            merged[-1] = Region(prev.start, r.end, r.esize, r.kind)
+        joins = (prev is not None and prev.end == r.start and prev.kind == r.kind
+                 and (prev.src + prev.length == r.src if r.kind == KIND_REF
+                      else prev.esize == r.esize))
+        if joins:
+            merged[-1] = Region(prev.start, r.end, prev.esize, prev.kind, prev.src)
         else:
             merged.append(r)
 
-    out: list[tuple[int, int, int, int]] = []
+    out: list[tuple[int, int, int, int, int]] = []
     for r in merged:
-        out.extend(_slice_region(r.start, r.end, r.esize, r.kind, chunk_size))
+        out.extend(_slice_region(r.start, r.end, r.esize, r.kind, chunk_size, r.src))
     return out
 
 
-def _slice_region(start: int, end: int, esize: int, kind: int, chunk_size: int):
+def _slice_region(start: int, end: int, esize: int, kind: int, chunk_size: int,
+                  src: int = -1):
     """Cut [start, end) into chunks whose lengths are multiples of esize."""
     step = max(chunk_size - chunk_size % esize, esize)
     out = []
@@ -299,9 +477,10 @@ def _slice_region(start: int, end: int, esize: int, kind: int, chunk_size: int):
         # A trailing piece shorter than one element cannot be split; the
         # region boundary already guarantees alignment, so this only guards
         # against malformed inputs.
-        if (stop - pos) % esize and stop == end:
-            out.append((pos, stop, 1, KIND_BYTES))
+        if kind != KIND_REF and (stop - pos) % esize and stop == end:
+            out.append((pos, stop, 1, KIND_BYTES, -1))
         else:
-            out.append((pos, stop, esize, kind))
+            out.append((pos, stop, esize, kind,
+                        src + (pos - start) if src >= 0 else -1))
         pos = stop
     return out

@@ -19,8 +19,8 @@ import zlib
 from math import log2
 
 from . import entropy, kernels
-from .format import (CODEC_BF16, CODEC_SPLIT, CODEC_STORED, CODEC_ZSTD,
-                     CorruptArchive)
+from .format import (CODEC_BF16, CODEC_BF16C, CODEC_SPLIT, CODEC_STORED,
+                     CODEC_ZSTD, CorruptArchive)
 from .planner import KIND_BF16, KIND_BYTES
 
 # Above this many bits per byte a stream is genuinely noise and is stored.
@@ -31,6 +31,20 @@ NOISE_BITS = 7.98
 # Bytes sampled when estimating entropy, taken from three places so a
 # non-uniform tensor is not judged by its opening bytes alone.
 SAMPLE_BYTES = 3 * 65536
+
+# Exponent-conditioned coding of the sign+mantissa plane. Eight equal-mass
+# exponent buckets were measured to capture the whole usable dependence on
+# real weights (the full 256-way context gains nothing further), and below
+# ~1M elements the extra frequency tables cost more than conditioning saves,
+# so small chunks skip the attempt entirely.
+COND_BUCKETS = 8
+COND_MIN_ELEMS = 1 << 20
+
+# What one rANS stream costs beyond its coded bytes: the 516-byte frequency
+# header plus the flushed states.
+RANS_OVERHEAD = 516 + 4 * 8
+
+_bf16c_hdr = struct.Struct(f"<BB{COND_BUCKETS}BI{COND_BUCKETS}I")
 
 _hdr_cache: dict[int, struct.Struct] = {}
 
@@ -113,6 +127,76 @@ def _min_gain(n: int) -> int:
     return max(1024, n >> 8)
 
 
+def _hist_entropy(counts, total: int) -> float:
+    if not total:
+        return 0.0
+    h = 0.0
+    for c in counts:
+        if c:
+            p = c / total
+            h -= p * log2(p)
+    return h
+
+
+def _est_stream(total: int, h: float) -> int:
+    """Predicted rANS stream size; a stream is never stored above raw size."""
+    if total == 0:
+        return 0
+    return min(total, int(total * h / 8) + RANS_OVERHEAD)
+
+
+def _encode_bf16_cond(exp, sm, nelem: int, level: int, method: int):
+    """Code the sign+mantissa plane with one rANS table per exponent bucket.
+
+    Decides from exact histograms whether conditioning beats one shared
+    table, and only encodes the winning side, so declining costs two
+    histogram passes and a partition rather than a wasted encode. Returns
+    (parts, flags) or None to fall back to the plain field split.
+
+    The bucket map is derived from the exponent histogram, which the decoder
+    reconstructs from the decoded exponent plane -- nothing about the map is
+    stored in the archive.
+    """
+    ehist = kernels.histogram(exp)
+    shist = kernels.histogram(sm)
+    h_sm = _hist_entropy(shist, nelem)
+    lut = kernels.bucket_lut(ehist, COND_BUCKETS)
+    part, counts = kernels.bucket_partition(exp, sm, lut, COND_BUCKETS)
+    pmv = memoryview(part)
+
+    est_cond = 0
+    pos = 0
+    for c in counts:
+        if c:
+            hseg = _hist_entropy(kernels.histogram(pmv[pos:pos + c]), c)
+            est_cond += _est_stream(c, hseg)
+            pos += c
+    est_plain = _est_stream(nelem, h_sm)
+    # The conditional side pays its larger header and one table per bucket;
+    # demand a clear win so estimate noise cannot flip the choice.
+    if est_cond + (_bf16c_hdr.size - _plane_header(2).size) + 512 >= est_plain:
+        return None
+
+    exp_used, exp_payload = _encode_stream(exp, level, method, plane=True)
+    sm_methods = []
+    seg_lens = []
+    parts = []
+    pos = 0
+    for c in counts:
+        if c == 0:
+            sm_methods.append(entropy.METHOD_STORED)
+            seg_lens.append(0)
+            continue
+        used, payload = _encode_stream(pmv[pos:pos + c], level, method, plane=True)
+        sm_methods.append(used)
+        seg_lens.append(len(payload))
+        parts.append(payload)
+        pos += c
+    header = _bf16c_hdr.pack(COND_BUCKETS, exp_used, *sm_methods,
+                             len(exp_payload), *seg_lens)
+    return [header, exp_payload] + parts, 0
+
+
 def encode_chunk(data, esize: int, level: int = 1, checksum: bool = True,
                  method: int = -1, kind: int = KIND_BYTES):
     """Encode one chunk.
@@ -129,6 +213,14 @@ def encode_chunk(data, esize: int, level: int = 1, checksum: bool = True,
     if kind == KIND_BF16 and esize == 2 and n % 2 == 0:
         nplanes, cid = 2, CODEC_BF16
         planes = kernels.split_bf16(data)
+        nelem = n // 2
+        if nelem >= COND_MIN_ELEMS and kernels.have_rans():
+            mv = memoryview(planes)
+            cond = _encode_bf16_cond(mv[:nelem], mv[nelem:], nelem, level, method)
+            if cond is not None:
+                parts, flags = cond
+                if sum(len(p) for p in parts) + _min_gain(n) < n:
+                    return parts, CODEC_BF16C, flags, crc
     elif splittable:
         nplanes, cid = esize, CODEC_SPLIT
         planes = kernels.split(data, esize)
@@ -178,6 +270,80 @@ def _decode_stream(raw, method: int, what: str, out_len: int | None = None):
         raise CorruptArchive(f"{what} failed to decode: {exc}") from exc
 
 
+def _decode_bf16c(payload, nelem: int, out=None):
+    """Decode a conditioned bf16 chunk back to interleaved bytes.
+
+    The exponent plane comes out first; its histogram rebuilds the bucket
+    map, which yields each bucket's expected length, and only then can the
+    sign+mantissa segments be decoded and dealt back into element order.
+    """
+    hdr = _bf16c_hdr
+    if len(payload) < hdr.size:
+        raise CorruptArchive("conditioned bf16 chunk is truncated")
+    fields = hdr.unpack_from(payload, 0)
+    k = fields[0]
+    if k != COND_BUCKETS:
+        raise CorruptArchive(f"conditioned bf16 chunk declares {k} buckets")
+    exp_method = fields[1]
+    sm_methods = fields[2:2 + k]
+    exp_len = fields[2 + k]
+    seg_lens = fields[3 + k:3 + k + k]
+    # These bytes came from the payload, not the validated chunk record; a
+    # value outside the method alphabet is damage, not a future format.
+    for m in (exp_method, *sm_methods):
+        if m not in entropy.METHOD_NAMES:
+            raise CorruptArchive(f"conditioned bf16 chunk names method {m}")
+
+    mv = memoryview(payload)
+    pos = hdr.size
+    if pos + exp_len > len(payload):
+        raise CorruptArchive("conditioned bf16 chunk is truncated")
+    if exp_method == entropy.METHOD_STORED:
+        if exp_len != nelem:
+            raise CorruptArchive(
+                f"exponent plane holds {exp_len} bytes, expected {nelem}")
+        exp = bytes(mv[pos:pos + exp_len])
+    else:
+        exp = _decode_stream(mv[pos:pos + exp_len], exp_method,
+                             "exponent plane", nelem)
+        if len(exp) != nelem:
+            raise CorruptArchive(
+                f"exponent plane decoded to {len(exp)} bytes, expected {nelem}")
+    pos += exp_len
+
+    ehist = kernels.histogram(exp)
+    lut = kernels.bucket_lut(ehist, k)
+    counts = kernels.bucket_counts(ehist, lut, k)
+
+    streams = []
+    for b in range(k):
+        ln = seg_lens[b]
+        want = counts[b]
+        if pos + ln > len(payload):
+            raise CorruptArchive("conditioned bf16 chunk is truncated")
+        m = sm_methods[b]
+        if want == 0:
+            if ln:
+                raise CorruptArchive(f"bucket {b} should be empty but holds {ln} bytes")
+            streams.append((b"", 0))
+        elif m == entropy.METHOD_STORED:
+            if ln != want:
+                raise CorruptArchive(
+                    f"bucket {b} holds {ln} bytes, expected {want}")
+            streams.append((payload, pos))
+        else:
+            block = _decode_stream(mv[pos:pos + ln], m, f"bucket {b}", want)
+            if len(block) != want:
+                raise CorruptArchive(
+                    f"bucket {b} decoded to {len(block)} bytes, expected {want}")
+            streams.append((block, 0))
+        pos += ln
+
+    sm = kernels.bucket_unpartition(exp, streams, lut, k)
+    buf = out if (out is not None and len(out) >= nelem * 2) else bytearray(nelem * 2)
+    return kernels.merge_bf16([(exp, 0), (sm, 0)], nelem, buf)
+
+
 def decode_chunk(payload, codec: int, esize: int, flags: int, rlen: int,
                  crc: int = 0, verify: bool = True, out=None):
     """Decode one chunk back to its exact original bytes.
@@ -189,6 +355,10 @@ def decode_chunk(payload, codec: int, esize: int, flags: int, rlen: int,
         result = payload
         if len(result) != rlen:
             raise ValueError(f"stored chunk is {len(result)} bytes, expected {rlen}")
+    elif codec == CODEC_BF16C:
+        if esize != 2 or rlen % 2:
+            raise ValueError("a conditioned bf16 chunk must have 2-byte elements")
+        result = _decode_bf16c(payload, rlen // 2, out)
     elif codec == CODEC_ZSTD:
         result = _decode_stream(payload, flags & 0x3, "chunk", rlen)
         if len(result) != rlen:

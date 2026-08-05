@@ -197,7 +197,7 @@ LMZ_API const char *lmz_isa(void)
 #endif
 }
 
-LMZ_API int lmz_abi_version(void) { return 4; }
+LMZ_API int lmz_abi_version(void) { return 5; }
 
 /* ------------------------------------------------------- recursive split */
 
@@ -411,6 +411,79 @@ LMZ_API int lmz_merge_bf16(const uint8_t *pa, const uint8_t *pb, uint8_t *dst,
                            size_t nelem)
 {
     merge_bf16_scalar(pa, pb, dst, nelem);
+    return 0;
+}
+
+/* ------------------------------------------------- bucketed conditioning */
+
+/*
+ * The sign+mantissa plane is not quite independent of the exponent: on real
+ * Llama weights the joint 16-bit entropy sits 0.075 bits per element below
+ * the sum of the two planes' own entropies. Grouping elements by their
+ * exponent and giving each group its own frequency table collects that gap,
+ * and eight equal-mass groups were measured to collect essentially all of it
+ * (7.8407 bits conditional versus 7.8407 with the full 256-way context).
+ *
+ * The bucket map is a pure function of the exponent histogram, so it is
+ * never stored: the decoder recovers the exponent plane first and rebuilds
+ * the identical map from the identical bytes.
+ */
+
+#define LMZ_MAX_BUCKETS 32
+
+/* Contiguous equal-mass buckets over the symbol alphabet. Deterministic:
+ * both sides derive it from the same histogram with the same integers. */
+LMZ_API int lmz_bucket_lut(const uint64_t *hist, size_t k, uint8_t *lut)
+{
+    if (k == 0 || k > LMZ_MAX_BUCKETS) return -1;
+    uint64_t total = 0;
+    for (int s = 0; s < 256; s++) total += hist[s];
+    if (total == 0) {
+        memset(lut, 0, 256);
+        return 0;
+    }
+    uint64_t acc = 0;
+    uint64_t b = 0;
+    for (int s = 0; s < 256; s++) {
+        lut[s] = (uint8_t)b;
+        acc += hist[s];
+        /* Move on once this bucket holds its share of the mass. */
+        while (b + 1 < k && acc * k >= (b + 1) * total) b++;
+    }
+    return 0;
+}
+
+/* Deal val[i] into per-bucket segments of `out` by ctx[i]'s bucket, keeping
+ * order within each bucket. counts[k] receives the segment lengths. */
+LMZ_API int lmz_bucket_partition(const uint8_t *ctx, const uint8_t *val,
+                                 size_t n, const uint8_t *lut, size_t k,
+                                 uint8_t *out, uint64_t *counts)
+{
+    if (k == 0 || k > LMZ_MAX_BUCKETS) return -1;
+    uint64_t hist[256];
+    lmz_hist(ctx, n, hist);
+    for (size_t b = 0; b < k; b++) counts[b] = 0;
+    for (int s = 0; s < 256; s++) counts[lut[s]] += hist[s];
+    uint8_t *cur[LMZ_MAX_BUCKETS];
+    uint8_t *p = out;
+    for (size_t b = 0; b < k; b++) {
+        cur[b] = p;
+        p += counts[b];
+    }
+    for (size_t i = 0; i < n; i++) *cur[lut[ctx[i]]]++ = val[i];
+    return 0;
+}
+
+/* Inverse of the partition: streams[b] holds bucket b's segment. */
+LMZ_API int lmz_bucket_unpartition(const uint8_t *ctx,
+                                   const uint8_t *const *streams, size_t n,
+                                   const uint8_t *lut, size_t k,
+                                   uint8_t *val_out)
+{
+    if (k == 0 || k > LMZ_MAX_BUCKETS) return -1;
+    const uint8_t *cur[LMZ_MAX_BUCKETS];
+    for (size_t b = 0; b < k; b++) cur[b] = streams[b];
+    for (size_t i = 0; i < n; i++) val_out[i] = *cur[lut[ctx[i]]]++;
     return 0;
 }
 

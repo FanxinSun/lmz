@@ -2,14 +2,17 @@
 
 Fast lossless compression for large model weights.
 
-On Llama-3.1-8B-Instruct, lmz removes **34.2%** — better than any
-general-purpose compressor and better than the published state of the art for
-model weights. Output is byte-for-byte identical to the input: no
-quantisation, no approximation.
+On Llama-3.1-8B-Instruct's BF16 shards, lmz removes **34.7%** — better than
+any general-purpose compressor and better than the published state of the art
+for model weights. On the model *directory* as Hugging Face actually ships it,
+lmz removes **64.6%**, because the directory carries the same weights twice —
+HF shards plus Meta's `original/` checkpoint — and lmz reads both containers
+and stores each tensor once. Output is byte-for-byte identical to the input:
+no quantisation, no approximation.
 
-| | saved on Llama-3.1-8B (BF16) |
+| | saved on Llama-3.1-8B (BF16 shards) |
 |---|---|
-| **lmz** | **34.2%** |
+| **lmz** | **34.7%** |
 | [ZipNN](https://github.com/zipnn/zipnn) (published, same model) | 33.6% |
 | [DFloat11](https://arxiv.org/pdf/2504.11651) (published) | ~30% |
 | bzip2 -9 | 30.7% |
@@ -40,14 +43,19 @@ above the order-0 entropy bound**. Huffman alone still gives up 1.6%, because
 it must round every symbol to a whole bit. rANS pays fractional bits and lands
 **within 0.16% of entropy**.
 
-That combination is the whole trick, and it is worth 2.6 points over the
-byte-splitting approach lmz started with:
+The last step is conditioning: the mantissa is *not quite* independent of the
+exponent, and dealing the sign+mantissa plane into eight exponent buckets,
+each with its own table, collects that remaining 0.075 bits per element.
+Together the three choices are worth 3.1 points over the byte-splitting
+approach lmz started with, and land within 0.3 points of the bound no
+lossless coder of any kind can pass:
 
 | encoder on real Llama BF16 | saved |
 |---|---|
 | byte split + zstd (where this project began) | 31.6% |
 | byte split + rANS on both planes | 34.0% |
-| **field split + rANS** | **34.4%** |
+| field split + rANS | 34.4% |
+| **field split + exponent-conditioned rANS** | **34.7%** |
 | theoretical joint-entropy bound | 35.0% |
 
 ## Quick start
@@ -55,9 +63,10 @@ byte-splitting approach lmz started with:
 No installation, no dependencies:
 
 ```
-./lmz-cli compress  model.safetensors            # -> model.safetensors.lmz
+./lmz-cli compress  model.safetensors            # also .gguf, .bin, .pth
 ./lmz-cli decompress model.safetensors.lmz       # -> model.safetensors
-./lmz-cli compress  ./my-model/                  # a whole model directory
+./lmz-cli compress  ./my-model/                  # a whole directory; duplicate
+                                                 #    tensors are stored once
 ```
 
 Python 3.9+ is the only requirement. On Python 3.14+ zstd comes from the
@@ -72,24 +81,41 @@ Check what is active with `./lmz-cli doctor`.
 
 Measured on real checkpoints, AMD Ryzen 7 9800X3D, Python 3.14, zstd 1.5.7.
 
-**Whole models**, all shards, compressed end to end:
+**Whole models**, compressed end to end, every roundtrip verified
+byte-identical:
 
 | model | size | compressed | saved |
 |---|---|---|---|
-| Llama-3.1-8B-Instruct (BF16) | 16.06 GB | 10.57 GB | **34.18%** |
-| Ministral-8B-Instruct (BF16) | 16.04 GB | 10.60 GB | **33.89%** |
-| GLM-4V-9B (BF16, 5 shards) | 9.47 GB | 6.27 GB | **33.80%** |
+| Llama-3.1-8B-Instruct, 4 BF16 shards | 16.06 GB | 10.49 GB | **34.70%** |
+| Llama-3.1-8B-Instruct, whole directory | 32.13 GB | 11.38 GB | **64.60%** |
+| Ministral-8B-Instruct, whole directory | 32.11 GB | 11.55 GB | **64.02%** |
+| GLM-4V-9B (BF16, 15 shards) | 27.82 GB | 18.46 GB | **33.64%** |
+| bge-m3 directory (FP32 `.bin` + onnx) | 4.59 GB | 2.45 GB | **46.48%** |
+| Llama-3-8B NF4-quantised (bitsandbytes) | 5.70 GB | 4.87 GB | **14.55%** |
+
+Each of those numbers has a reason. The two directory halvings are dedup:
+Llama's repo ships HF shards *plus* Meta's `original/consolidated.00.pth`,
+Ministral ships shards plus `consolidated.safetensors`, and in both cases
+~14.5 GB of tensors are byte-identical across the two containers (attention
+q/k differ — the HF conversion permutes them for its rope convention).
+bge-m3's `pytorch_model.bin` holds FP32 that was trained in FP16: two of its
+four byte planes are zeros and a third holds 3.0 bits, so the weights payload
+alone drops 57.5%. The NF4 checkpoint is mostly *already* at entropy — its
+BF16 embeddings compress 34%, its 4-bit payload barely at all, which is the
+honest outcome for quantised weights.
 
 **Throughput**, 1.09 GiB Llama shard, RAM-backed filesystem, including all I/O
-and per-chunk checksums:
+and per-chunk checksums, best of 3:
 
 | threads | compress | decompress |
 |---|---|---|
-| 1 | 0.40 GB/s | 0.40 GB/s |
-| 4 | 1.54 GB/s | 1.35 GB/s |
-| 8 | **1.92 GB/s** | **1.83 GB/s** |
-| 16 | 1.63 GB/s | 1.56 GB/s |
+| 1 | 0.31 GiB/s | 0.33 GiB/s |
+| 4 | 1.25 GiB/s | 1.16 GiB/s |
+| 8 | **1.97 GiB/s** | **1.76 GiB/s** |
+| 16 | 1.54 GiB/s | 1.61 GiB/s |
 
+Exponent conditioning costs ~20% single-threaded next to v0.1's plain field
+split; at 8 threads the job is memory-bound and the difference disappears.
 For scale, ZipNN publishes 1.15 GB/s compress and 1.65 GB/s decompress on this
 model — so lmz is ahead on ratio and on both speeds, though that comparison
 crosses different hardware and should be read loosely.
@@ -120,18 +146,41 @@ running them through a coder that cannot help.
 
 ## How it works
 
-**Planning.** The tensor index is read from the container (safetensors and
-GGUF are both understood) to recover the dtype layout, so every chunk holds
-elements of a single known width. Headers, padding and unrecognised formats
-become 1-byte-element regions, which still compress, just without the split.
-Runs of adjacent same-dtype tensors are coalesced first, so that a model's
-thousands of tiny bias and norm tensors don't each become an undersized chunk.
+**Planning.** The tensor index is read from the container (safetensors, GGUF
+and PyTorch's `.bin` zip checkpoints are all understood) to recover the dtype
+layout, so every chunk holds elements of a single known width. For a `.bin`
+the storage classes are read from `data.pkl` with `pickletools`, which only
+scans opcodes — nothing is unpickled or executed. Headers, padding and
+unrecognised formats become 1-byte-element regions, which still compress,
+just without the split. Runs of adjacent same-dtype tensors are coalesced
+first, so that a model's thousands of tiny bias and norm tensors don't each
+become an undersized chunk.
+
+**Deduplication.** Checkpoints genuinely repeat themselves: Ministral ships a
+`consolidated.safetensors` alongside the same weights in HF shards, and tied
+embeddings get stored twice. Tensors are grouped by size, then by a sampled
+digest, and only still-colliding groups are hashed in full (BLAKE2b-256), so
+the extra reads stay proportional to data that really is duplicated. A
+duplicate becomes a *ref chunk*: eight bytes naming the byte range it equals.
+Refs resolve by decoding the source's own chunks straight from the archive,
+so decompression stays a bag of independent jobs with no ordering.
 
 **Splitting.** BF16 chunks are cut on the float's own field boundaries: one
 plane takes the whole 8-bit exponent, the other takes the sign bit above 7
 mantissa bits. Everything else is cut on byte boundaries, one plane per byte
 position, which still separates exponents from mantissas for FP16/FP32/FP64
 and is what makes an FP32-upcast-from-BF16 checkpoint collapse.
+
+**Conditioning.** The sign+mantissa plane is not quite independent of the
+exponent: on real Llama weights the joint 16-bit entropy sits 0.075 bits per
+element below the sum of the planes' own entropies. So the mantissa plane is
+dealt into eight equal-mass exponent buckets, each entropy coded with its own
+table — measured to capture essentially all of the dependence (a full 256-way
+context gains nothing further). The bucket map is a pure function of the
+exponent histogram and is never stored: the decoder recovers the exponent
+plane first and rebuilds the identical map. The whole scheme is decided per
+chunk from exact histograms and declines automatically (small chunks, no
+correlation), which keeps it from ever costing bytes.
 
 **Per-plane adaptivity.** Every plane is judged on its own: entropy is
 estimated from a sample, genuine noise is stored without ever reaching the
@@ -168,7 +217,16 @@ looked like it would:
   the best variant found still sat 9.3% above. Replacing it with rANS was the
   single largest win.
 - **Order-1 context modelling is worthless here** — 2.6444 bits versus 2.6449
-  order-0, a 0.02% gain. Measuring that first saved building it.
+  order-0, a 0.02% gain. Measuring that first saved building it. The same
+  measurement pass killed two more tempting contexts on real Llama weights:
+  conditioning an exponent on the one directly above it in the same column
+  gains 0.0000 bits, and per-column-group tables gain 0.0002. The only
+  structure that survives measurement is *within* the element — exponent to
+  mantissa — worth 0.075 bits, which is what the bucket conditioning collects.
+- **The bucket map must not be stored.** Deriving it from the exponent
+  histogram on both sides costs one 256-entry integer scan and saves having
+  any map bytes or versioning at all; eight equal-mass buckets capture the
+  full 256-context conditional entropy to four decimal places.
 - **Preallocating the output is worth ~9x.** Writing to a sparse file faults
   in and clears a page per write. `fallocate` costs 15 ms for 2 GiB on ext4
   and repays it many times over — but on tmpfs a "block" is a page of RAM, so
@@ -188,7 +246,7 @@ looked like it would:
 ## Command line
 
 ```
-lmz compress    <input> [output]   -l LEVEL  -j N  --chunk-size N  --no-checksum  -f
+lmz compress    <input> [output]   -l LEVEL  -j N  --chunk-size N  --no-checksum  --no-dedup  -f
 lmz decompress  <input> [output]   -j N  --no-verify  -f
 lmz verify      <archive>          -j N
 lmz info        <archive>          --tensors  --json  --limit N
@@ -225,9 +283,9 @@ meta = lmz.info("model.lmz")                       # members, tensors, codecs
 dtype, shape, raw = lmz.read_tensor("model.lmz", "model.embed_tokens.weight")
 ```
 
-`compress` takes `level`, `workers`, `chunk_size`, `checksum` and `progress`;
-`decompress` takes `workers`, `verify_checksums`, `overwrite` and `progress`.
-`progress` is called with `(bytes_done, total)`.
+`compress` takes `level`, `workers`, `chunk_size`, `checksum`, `dedup` and
+`progress`; `decompress` takes `workers`, `verify_checksums`, `overwrite` and
+`progress`. `progress` is called with `(bytes_done, total)`.
 
 ## Archive format
 
@@ -244,6 +302,12 @@ lengths, a crc32, the codec, the element size, and a 2-bit method per plane.
 The table and manifest sit at the tail so writing streams in one pass, and
 both are read up front so decompression can start anywhere.
 
+Format v2 adds two codecs: `ref` (the payload is an 8-byte offset naming an
+identical earlier range; integrity rides on the source chunks' checksums) and
+`bf16-cond` (field split whose sign+mantissa plane is coded per exponent
+bucket, methods and lengths self-described in the payload). This build still
+reads v1 archives.
+
 Integrity is checked at three levels: chunks must tile the output exactly with
 no gap or overlap, each chunk carries a crc32 of its decoded bytes, and decoder
 failures are reported as corruption rather than surfacing as backend errors.
@@ -253,9 +317,14 @@ its destination directory.
 ## Limitations
 
 - **Lossless only.** Ratios are bounded by the real entropy of the weights.
-  34.4% on BF16 is within 0.6 points of the joint-entropy bound of 35.0%, so
-  there is very little left on the table for *any* method of this kind. If you
-  need 4x, you need quantisation, which is a different and lossy tool.
+  On BF16 the sign and mantissa are measured at 7.92 of 8 possible bits on
+  real Llama weights — genuine noise — which caps *any* lossless method near
+  35%, and lmz's conditioned coder sits within ~0.2 points of that joint
+  bound. Halving a BF16 checkpoint losslessly is information-theoretically
+  impossible; the halvings in the table above come from data that really is
+  redundant (duplicated tensors, FP32 containers holding 16-bit values). If
+  you need 4x on the weights themselves, you need quantisation, which is a
+  different and lossy tool.
 - **rANS archives need the native kernel.** It builds automatically wherever
   a C compiler exists. Without one, compression falls back to zstd (~31%
   instead of ~34%) and archives already written with rANS cannot be read —
@@ -277,13 +346,17 @@ its destination directory.
 python3 tests/test_lmz.py          # also runs under pytest
 ```
 
-24 tests covering kernel equivalence across all backends and element sizes,
+37 tests covering kernel equivalence across all backends and element sizes,
 rANS round-trips over adversarial distributions (including single-symbol
 streams, which exposed a frequency-field overflow), rANS landing within 2% of
-measured entropy, BF16 field-split reversibility, codec round-trips per dtype,
-safetensors/GGUF/raw layout detection, file and directory round-trips compared
-by hash, deterministic output across thread counts, tensor extraction,
-corruption and truncation detection, path-traversal rejection, and the CLI.
+measured entropy, BF16 field-split reversibility, bucket partition
+reversibility and native/Python agreement, conditioned-BF16 round-trips (and
+that conditioning declines on uncorrelated data), codec round-trips per
+dtype, safetensors/GGUF/PyTorch-zip/raw layout detection, tensor dedup within
+and across files, hostile ref chunks (self-referencing, out of range), v1
+archive compatibility, file and directory round-trips compared by hash,
+deterministic output across thread counts, tensor extraction, corruption and
+truncation detection, path-traversal rejection, and the CLI.
 
 `tests/make_model.py` generates synthetic checkpoints with per-channel
 lognormal scaling, which reproduces the exponent skew of trained weights —

@@ -9,9 +9,11 @@ That is what keeps decompression close to disk speed on a large model.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import posixpath
+import struct
 import sys
 import threading
 import time
@@ -20,12 +22,17 @@ from dataclasses import dataclass, field
 
 from . import codec as _codec
 from . import entropy, kernels
-from .format import ArchiveReader, ArchiveWriter, FormatError, Member
+from .format import (CODEC_REF, ArchiveReader, ArchiveWriter, CorruptArchive,
+                     FormatError, Member)
 from .parallel import default_workers, ordered_map, unordered_map
-from .planner import chunkify, probe
+from .planner import KIND_REF, chunkify, probe
 
 DEFAULT_CHUNK_SIZE = 8 << 20
 DEFAULT_LEVEL = 1
+
+# Tensors below this size are not worth deduplicating: the bookkeeping and
+# hashing outweigh a few kilobytes of norm weights.
+DEDUP_MIN_TENSOR = 64 << 10
 
 # Files that are not model weights but belong with them; kept so a compressed
 # model directory round-trips into something directly usable.
@@ -205,9 +212,89 @@ def _safe_member_path(base: str, rel: str) -> str:
 # ------------------------------------------------------------------ compress
 
 
+def _find_duplicate_tensors(paths: list[str], members: list[Member],
+                            layouts: list, workers: int):
+    """Byte-identical tensors across (and within) members, found by hashing.
+
+    Checkpoints genuinely repeat themselves: a consolidated file shipped
+    alongside its own shards, tied embeddings stored twice. Tensors are
+    grouped by size, then by a sampled digest, and only the still-colliding
+    groups are hashed in full, so the extra reads stay proportional to data
+    that really is duplicated. Returns ({member index: [(start, end, source
+    output offset)]}, deduplicated bytes).
+    """
+    by_size: dict[int, list] = {}
+    for idx, layout in enumerate(layouts):
+        if layout is None or not layout.tensors:
+            continue
+        seen: set[tuple[int, int]] = set()
+        for meta in layout.tensors.values():
+            s, e = meta["offsets"]
+            # Aliased names over one range must not become self-referencing.
+            if e - s >= DEDUP_MIN_TENSOR and (s, e) not in seen:
+                seen.add((s, e))
+                by_size.setdefault(e - s, []).append((idx, s, e))
+    flat = [item for group in by_size.values() if len(group) >= 2
+            for item in group]
+    if not flat:
+        return {}, 0
+
+    pool = _FdPool(paths, os.O_RDONLY)
+    try:
+        def sample_digest(item):
+            idx, s, e = item
+            n = e - s
+            h = hashlib.blake2b(digest_size=16)
+            fd = pool.get(idx)
+            if n <= 3 * 65536:
+                h.update(os.pread(fd, n, s))
+            else:
+                for off in (0, (n // 2) & ~63, n - 65536):
+                    h.update(os.pread(fd, 65536, s + off))
+            return item, h.digest()
+
+        sampled: dict = {}
+        for item, d in unordered_map(sample_digest, flat, workers):
+            sampled.setdefault((item[2] - item[1], d), []).append(item)
+
+        def full_digest(item):
+            idx, s, e = item
+            h = hashlib.blake2b(digest_size=32)
+            fd = pool.get(idx)
+            pos = s
+            while pos < e:
+                block = os.pread(fd, min(1 << 22, e - pos), pos)
+                if not block:
+                    raise IOError(f"short read hashing {paths[idx]} at {pos}")
+                h.update(block)
+                pos += len(block)
+            return item, h.digest()
+
+        flat2 = [item for group in sampled.values() if len(group) >= 2
+                 for item in group]
+        confirmed: dict = {}
+        for item, d in unordered_map(full_digest, flat2, workers):
+            confirmed.setdefault((item[2] - item[1], d), []).append(item)
+    finally:
+        pool.close()
+
+    refs: dict[int, list] = {}
+    saved = 0
+    for group in confirmed.values():
+        if len(group) < 2:
+            continue
+        group.sort()
+        pidx, ps, _pe = group[0]
+        src = members[pidx].dst + ps
+        for idx, s, e in group[1:]:
+            refs.setdefault(idx, []).append((s, e, src))
+            saved += e - s
+    return refs, saved
+
+
 def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
              workers: int | None = None, chunk_size: int = DEFAULT_CHUNK_SIZE,
-             checksum: bool = True, progress=None) -> Stats:
+             checksum: bool = True, dedup: bool = True, progress=None) -> Stats:
     """Compress a file or directory into the archive at `dst`."""
     workers = workers or default_workers()
     chunk_size = max(chunk_size, 1 << 16)
@@ -224,22 +311,34 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
 
     members: list[Member] = []
     paths: list[str] = []
-    plan: list[tuple[int, int, int, int, int]] = []  # member, start, end, esize, kind
+    layouts: list = []
+    sizes: list[int] = []
     base = 0
     for rel, full in entries:
         size = os.path.getsize(full)
         with open(full, "rb") as fh:
             layout = probe(fh, size)
-        member = Member(path=rel, size=size, dst=base, kind=layout.kind,
-                        mode=os.stat(full).st_mode & 0o777, tensors=layout.tensors)
-        idx = len(members)
-        members.append(member)
+        members.append(Member(path=rel, size=size, dst=base, kind=layout.kind,
+                              mode=os.stat(full).st_mode & 0o777,
+                              tensors=layout.tensors))
         paths.append(full)
-        for start, end, esize, kind in chunkify(layout, size, chunk_size):
-            plan.append((idx, start, end, esize, kind))
+        layouts.append(layout)
+        sizes.append(size)
         base += size
-
     total_in = base
+
+    refs_by_member: dict[int, list] = {}
+    dedup_bytes = 0
+    if dedup:
+        refs_by_member, dedup_bytes = _find_duplicate_tensors(
+            paths, members, layouts, workers)
+
+    plan: list[tuple] = []  # member, start, end, esize, kind, src
+    for idx, layout in enumerate(layouts):
+        for start, end, esize, kind, ref_src in chunkify(
+                layout, sizes[idx], chunk_size, refs=refs_by_member.get(idx)):
+            plan.append((idx, start, end, esize, kind, ref_src))
+
     manifest = {
         "version": 1,
         "tool": f"lmz {_version()}",
@@ -250,13 +349,22 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
         "total_size": total_in,
         "members": [m.to_json() for m in members],
     }
+    if dedup_bytes:
+        manifest["dedup_bytes"] = dedup_bytes
 
     pool = _FdPool(paths, os.O_RDONLY)
     done = 0
-    stats = Stats(input_bytes=total_in, files=len(members), chunks=len(plan))
+    stats = Stats(input_bytes=total_in, files=len(members), chunks=len(plan),
+                  detail={"dedup_bytes": dedup_bytes})
 
     def work(task):
-        idx, start, end, esize, kind = task
+        idx, start, end, esize, kind, ref_src = task
+        if kind == KIND_REF:
+            # The bytes equal an earlier output range; nothing is read and
+            # nothing needs a checksum of its own -- the source chunks carry
+            # theirs, and resolution decodes through them.
+            return (members[idx].dst + start, end - start,
+                    [struct.pack("<Q", ref_src)], CODEC_REF, 1, 0, 0)
         data = os.pread(pool.get(idx), end - start, start)
         if len(data) != end - start:
             raise IOError(f"short read on {members[idx].path} at {start}")
@@ -291,6 +399,41 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
 
 
 # ---------------------------------------------------------------- decompress
+
+
+def _ref_resolver(chunks, payload_of, verify_checksums: bool):
+    """A function that materialises the bytes behind one ref chunk.
+
+    Source chunks are decoded straight from the archive rather than read back
+    from the output, so resolution never depends on another chunk having been
+    written first and decompression stays a bag of independent jobs.
+    """
+    ordered = sorted(chunks, key=lambda c: c.dst)
+    starts = [c.dst for c in ordered]
+
+    def resolve(payload, rlen: int) -> bytearray:
+        if len(payload) != 8:
+            raise CorruptArchive("ref chunk payload must be 8 bytes")
+        (ref_src,) = struct.unpack("<Q", bytes(payload))
+        out = bytearray(rlen)
+        pos, end = ref_src, ref_src + rlen
+        i = bisect_right(starts, pos) - 1
+        while pos < end:
+            c = ordered[i] if 0 <= i < len(ordered) else None
+            if c is None or not (c.dst <= pos < c.dst + c.rlen):
+                raise CorruptArchive(f"ref target at byte {pos} is not covered")
+            if c.codec == CODEC_REF:
+                raise CorruptArchive("a ref chunk points at another ref")
+            data = _codec.decode_chunk(payload_of(c), c.codec, c.esize, c.flags,
+                                       c.rlen, c.crc, verify_checksums)
+            a = pos - c.dst
+            b = min(end - c.dst, c.rlen)
+            out[pos - ref_src:pos - ref_src + (b - a)] = data[a:b]
+            pos = c.dst + b
+            i += 1
+        return out
+
+    return resolve
 
 
 def decompress(src: str, dst: str, *, workers: int | None = None,
@@ -338,13 +481,22 @@ def decompress(src: str, dst: str, *, workers: int | None = None,
     out_pool = _FdPool(out_paths, os.O_WRONLY)
     done = 0
 
-    def work(chunk):
-        payload = os.pread(in_pool.get(0), chunk.clen, chunk.off)
-        if len(payload) != chunk.clen:
+    def payload_of(c):
+        payload = os.pread(in_pool.get(0), c.clen, c.off)
+        if len(payload) != c.clen:
             raise FormatError("archive is truncated")
-        data = _codec.decode_chunk(payload, chunk.codec, chunk.esize, chunk.flags,
-                                   chunk.rlen, chunk.crc, verify_checksums,
-                                   out=_scratch(chunk.rlen))
+        return payload
+
+    resolve_ref = _ref_resolver(chunks, payload_of, verify_checksums)
+
+    def work(chunk):
+        payload = payload_of(chunk)
+        if chunk.codec == CODEC_REF:
+            data = resolve_ref(payload, chunk.rlen)
+        else:
+            data = _codec.decode_chunk(payload, chunk.codec, chunk.esize,
+                                       chunk.flags, chunk.rlen, chunk.crc,
+                                       verify_checksums, out=_scratch(chunk.rlen))
         i = bisect_right(starts, chunk.dst) - 1
         if i < 0 or chunk.dst + chunk.rlen > members[i].dst + members[i].size:
             raise FormatError(f"chunk at {chunk.dst} does not fit any member")
@@ -404,12 +556,38 @@ def verify(src: str, *, workers: int | None = None, progress=None) -> Stats:
     pool = _FdPool([src], os.O_RDONLY)
     done = 0
 
+    ordered = sorted(chunks, key=lambda c: c.dst)
+    ordered_starts = [c.dst for c in ordered]
+
+    def check_ref(chunk, payload):
+        """A ref is sound if its whole target lies on non-ref chunks.
+
+        Those sources are each decoded and checksummed by their own turn in
+        this same pass, so decoding them again here would only repeat work.
+        """
+        if len(payload) != 8:
+            raise CorruptArchive("ref chunk payload must be 8 bytes")
+        (ref_src,) = struct.unpack("<Q", bytes(payload))
+        pos, end = ref_src, ref_src + chunk.rlen
+        i = bisect_right(ordered_starts, pos) - 1
+        while pos < end:
+            c = ordered[i] if 0 <= i < len(ordered) else None
+            if c is None or not (c.dst <= pos < c.dst + c.rlen):
+                raise CorruptArchive(f"ref target at byte {pos} is not covered")
+            if c.codec == CODEC_REF:
+                raise CorruptArchive("a ref chunk points at another ref")
+            pos = c.dst + min(end - c.dst, c.rlen)
+            i += 1
+
     def work(chunk):
         payload = os.pread(pool.get(0), chunk.clen, chunk.off)
         if len(payload) != chunk.clen:
             raise FormatError("archive is truncated")
-        _codec.decode_chunk(payload, chunk.codec, chunk.esize, chunk.flags,
-                            chunk.rlen, chunk.crc, True, out=_scratch(chunk.rlen))
+        if chunk.codec == CODEC_REF:
+            check_ref(chunk, payload)
+        else:
+            _codec.decode_chunk(payload, chunk.codec, chunk.esize, chunk.flags,
+                                chunk.rlen, chunk.crc, True, out=_scratch(chunk.rlen))
         return chunk.rlen
 
     try:
@@ -435,7 +613,7 @@ def info(src: str) -> dict:
         by_codec: dict[str, list[int]] = {}
         for c in reader.chunks:
             name = {0: "stored", 1: "entropy", 2: "split",
-                    3: "bf16-split"}.get(c.codec, "?")
+                    3: "bf16-split", 4: "ref", 5: "bf16-cond"}.get(c.codec, "?")
             slot = by_codec.setdefault(name, [0, 0, 0])
             slot[0] += 1
             slot[1] += c.rlen
@@ -473,6 +651,15 @@ def read_tensor(src: str, name: str, member: str | None = None) -> tuple[str, li
         m, meta = target
         start, end = meta["offsets"]
         lo, hi = m.dst + start, m.dst + end
+
+        def payload_of(c):
+            fh.seek(c.off)
+            payload = fh.read(c.clen)
+            if len(payload) != c.clen:
+                raise FormatError("archive is truncated")
+            return payload
+
+        resolve_ref = _ref_resolver(reader.chunks, payload_of, True)
         starts = [c.dst for c in reader.chunks]
         i = max(0, bisect_right(starts, lo) - 1)
         out = bytearray()
@@ -481,10 +668,12 @@ def read_tensor(src: str, name: str, member: str | None = None) -> tuple[str, li
                 break
             if c.dst + c.rlen <= lo:
                 continue
-            fh.seek(c.off)
-            payload = fh.read(c.clen)
-            data = _codec.decode_chunk(payload, c.codec, c.esize, c.flags,
-                                       c.rlen, c.crc, True)
+            payload = payload_of(c)
+            if c.codec == CODEC_REF:
+                data = resolve_ref(payload, c.rlen)
+            else:
+                data = _codec.decode_chunk(payload, c.codec, c.esize, c.flags,
+                                           c.rlen, c.crc, True)
             a = max(lo, c.dst) - c.dst
             b = min(hi, c.dst + c.rlen) - c.dst
             out += data[a:b]

@@ -78,7 +78,7 @@ def cmd_compress(args) -> int:
     bar = Progress("compressing", not args.quiet)
     stats = api.compress(src, dst, level=args.level, workers=args.threads,
                          chunk_size=args.chunk_size, checksum=not args.no_checksum,
-                         progress=bar)
+                         dedup=not args.no_dedup, progress=bar)
     bar.done()
     if not args.quiet:
         print(f"{src} -> {dst}")
@@ -86,6 +86,9 @@ def cmd_compress(args) -> int:
               f"{stats.ratio:.3f}x  ({stats.saved * 100:.1f}% smaller)")
         print(f"  {stats.seconds:.2f}s  {rate(stats.throughput)}  "
               f"{stats.files} file(s), {stats.chunks} chunks")
+        deduped = stats.detail.get("dedup_bytes", 0)
+        if deduped:
+            print(f"  {human(deduped)} of duplicate tensors stored once")
     return 0
 
 
@@ -131,6 +134,8 @@ def cmd_info(args) -> int:
           f"({(1 - size / orig) * 100 if orig else 0:.1f}% smaller)")
     print(f"chunks      {data['chunks']} of {human(man.get('chunk_size', 0))}  "
           f"level {man.get('level', '?')}  checksum {man.get('checksum', '?')}")
+    if man.get("dedup_bytes"):
+        print(f"dedup       {human(man['dedup_bytes'])} of duplicate tensors stored once")
     if data["codecs"]:
         print("chunk codecs")
         for name, (count, rlen, clen) in sorted(data["codecs"].items()):
@@ -199,7 +204,7 @@ def cmd_bench(args) -> int:
         layout = probe(fh, size)
         data = []
         taken = 0
-        for start, end, esize, kind in chunkify(layout, size, args.chunk_size):
+        for start, end, esize, kind, _src in chunkify(layout, size, args.chunk_size):
             if taken >= limit:
                 break
             fh.seek(start)
@@ -287,6 +292,8 @@ def build_parser() -> argparse.ArgumentParser:
                    metavar="N", help="chunk size (default: 8MiB)")
     c.add_argument("--no-checksum", action="store_true",
                    help="skip per-chunk crc32")
+    c.add_argument("--no-dedup", action="store_true",
+                   help="skip duplicate-tensor detection")
     c.add_argument("-f", "--force", action="store_true", help="overwrite output")
     common(c)
     c.set_defaults(func=cmd_compress)
