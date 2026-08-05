@@ -19,9 +19,9 @@ import zlib
 from math import log2
 
 from . import entropy, kernels
-from .format import (CODEC_BF16, CODEC_BF16C, CODEC_SPLIT, CODEC_STORED,
-                     CODEC_ZSTD, CorruptArchive)
-from .planner import KIND_BF16, KIND_BYTES
+from .format import (CODEC_BF16, CODEC_BF16C, CODEC_BLK, CODEC_SPLIT,
+                     CODEC_STORED, CODEC_ZSTD, CorruptArchive)
+from .planner import KIND_BF16, KIND_BYTES, KIND_Q80
 
 # Above this many bits per byte a stream is genuinely noise and is stored.
 # The threshold sits this close to 8 because rANS can profitably code a
@@ -45,6 +45,14 @@ COND_MIN_ELEMS = 1 << 20
 RANS_OVERHEAD = 516 + 4 * 8
 
 _bf16c_hdr = struct.Struct(f"<BB{COND_BUCKETS}BI{COND_BUCKETS}I")
+
+# A GGUF Q8_0 block: 2-byte fp16 scale then 32 int8 quants. Coding scale
+# bytes and quant bytes in one alphabet was measured to waste 2% of the
+# payload; below ~32k blocks the per-stream tables eat the gain.
+Q80_PERIOD = 34
+Q80_MIN_BLOCKS = 1 << 15
+
+_q80_hdr = struct.Struct(f"<BB{COND_BUCKETS}BBI{COND_BUCKETS}II")
 
 _hdr_cache: dict[int, struct.Struct] = {}
 
@@ -197,6 +205,137 @@ def _encode_bf16_cond(exp, sm, nelem: int, level: int, method: int):
     return [header, exp_payload] + parts, 0
 
 
+def _encode_q80(data, nblocks: int, level: int, method: int):
+    """Split Q8_0 blocks into scale planes and a quants plane, then code each.
+
+    The two scale bytes are the halves of one fp16, and they are correlated:
+    the low byte conditioned on the high byte's bucket was measured two bits
+    below its own entropy. The same exact-histogram comparison as the BF16
+    conditioner decides whether that conditioning pays; the quant bytes are a
+    single near-uniform alphabet either way. Returns (parts, flags) or None.
+    """
+    planes = kernels.split_stride(data, Q80_PERIOD)
+    mv = memoryview(planes)
+    lo, hi = mv[:nblocks], mv[nblocks:2 * nblocks]
+    quants = mv[2 * nblocks:]
+
+    hhist = kernels.histogram(hi)
+    lut = kernels.bucket_lut(hhist, COND_BUCKETS)
+    part, counts = kernels.bucket_partition(hi, lo, lut, COND_BUCKETS)
+    pmv = memoryview(part)
+    est_cond = 0
+    pos = 0
+    for c in counts:
+        if c:
+            est_cond += _est_stream(c, _hist_entropy(kernels.histogram(
+                pmv[pos:pos + c]), c))
+            pos += c
+    est_plain = _est_stream(nblocks, _hist_entropy(kernels.histogram(lo), nblocks))
+
+    hi_used, hi_payload = _encode_stream(hi, level, method, plane=True)
+    lo_methods = [entropy.METHOD_STORED] * COND_BUCKETS
+    lo_lens = [0] * COND_BUCKETS
+    lo_parts = []
+    if est_cond + 512 < est_plain:
+        k = COND_BUCKETS
+        pos = 0
+        for b, c in enumerate(counts):
+            if c == 0:
+                continue
+            used, payload = _encode_stream(pmv[pos:pos + c], level, method,
+                                           plane=True)
+            lo_methods[b] = used
+            lo_lens[b] = len(payload)
+            lo_parts.append(payload)
+            pos += c
+    else:
+        k = 0
+        used, payload = _encode_stream(lo, level, method, plane=True)
+        lo_methods[0] = used
+        lo_lens[0] = len(payload)
+        lo_parts.append(payload)
+    q_used, q_payload = _encode_stream(quants, level, method, plane=True)
+
+    header = _q80_hdr.pack(k, hi_used, *lo_methods, q_used,
+                           len(hi_payload), *lo_lens, len(q_payload))
+    return [header, hi_payload] + lo_parts + [q_payload], 0
+
+
+def _decode_q80(payload, nblocks: int, out=None):
+    """Decode a block-split Q8_0 chunk back to interleaved 34-byte blocks."""
+    hdr = _q80_hdr
+    if len(payload) < hdr.size:
+        raise CorruptArchive("block chunk is truncated")
+    fields = hdr.unpack_from(payload, 0)
+    k = fields[0]
+    if k not in (0, COND_BUCKETS):
+        raise CorruptArchive(f"block chunk declares {k} scale buckets")
+    hi_method = fields[1]
+    lo_methods = fields[2:2 + COND_BUCKETS]
+    q_method = fields[2 + COND_BUCKETS]
+    hi_len = fields[3 + COND_BUCKETS]
+    lo_lens = fields[4 + COND_BUCKETS:4 + 2 * COND_BUCKETS]
+    q_len = fields[4 + 2 * COND_BUCKETS]
+    for m in (hi_method, q_method, *lo_methods):
+        if m not in entropy.METHOD_NAMES:
+            raise CorruptArchive(f"block chunk names method {m}")
+
+    mv = memoryview(payload)
+    pos = hdr.size
+
+    def take(ln, m, what, want):
+        nonlocal pos
+        if pos + ln > len(payload):
+            raise CorruptArchive("block chunk is truncated")
+        if m == entropy.METHOD_STORED:
+            if ln != want:
+                raise CorruptArchive(f"{what} holds {ln} bytes, expected {want}")
+            block = (payload, pos)
+        else:
+            data = _decode_stream(mv[pos:pos + ln], m, what, want)
+            if len(data) != want:
+                raise CorruptArchive(
+                    f"{what} decoded to {len(data)} bytes, expected {want}")
+            block = (data, 0)
+        pos += ln
+        return block
+
+    hi_obj, hi_off = take(hi_len, hi_method, "scale-high plane", nblocks)
+    hi = bytes(memoryview(hi_obj)[hi_off:hi_off + nblocks])
+
+    if k == 0:
+        lo_obj, lo_off = take(lo_lens[0], lo_methods[0], "scale-low plane",
+                              nblocks)
+        for b in range(1, COND_BUCKETS):
+            if lo_lens[b]:
+                raise CorruptArchive("unbucketed block chunk carries bucket data")
+        lo = (lo_obj, lo_off)
+    else:
+        hhist = kernels.histogram(hi)
+        lut = kernels.bucket_lut(hhist, COND_BUCKETS)
+        counts = kernels.bucket_counts(hhist, lut, COND_BUCKETS)
+        streams = []
+        for b in range(COND_BUCKETS):
+            want = counts[b]
+            if want == 0:
+                if lo_lens[b]:
+                    raise CorruptArchive(
+                        f"scale bucket {b} should be empty but holds data")
+                streams.append((b"", 0))
+            else:
+                streams.append(take(lo_lens[b], lo_methods[b],
+                                    f"scale bucket {b}", want))
+        lo = (kernels.bucket_unpartition(hi, streams, lut, COND_BUCKETS), 0)
+
+    q_obj, q_off = take(q_len, q_method, "quant plane", 32 * nblocks)
+
+    streams = [lo, (hi, 0)]
+    streams += [(q_obj, q_off + j * nblocks) for j in range(32)]
+    buf = out if (out is not None and len(out) >= nblocks * Q80_PERIOD) else \
+        bytearray(nblocks * Q80_PERIOD)
+    return kernels.merge_stride(streams, nblocks, Q80_PERIOD, buf)
+
+
 def encode_chunk(data, esize: int, level: int = 1, checksum: bool = True,
                  method: int = -1, kind: int = KIND_BYTES):
     """Encode one chunk.
@@ -208,6 +347,16 @@ def encode_chunk(data, esize: int, level: int = 1, checksum: bool = True,
         method = entropy.DEFAULT_METHOD
     crc = zlib.crc32(data) & 0xFFFFFFFF if checksum else 0
     n = len(data)
+
+    if (kind == KIND_Q80 and esize == Q80_PERIOD and n % Q80_PERIOD == 0
+            and n // Q80_PERIOD >= Q80_MIN_BLOCKS and kernels.have_rans()):
+        blk = _encode_q80(data, n // Q80_PERIOD, level, method)
+        if blk is not None:
+            parts, flags = blk
+            if sum(len(p) for p in parts) + _min_gain(n) < n:
+                return parts, CODEC_BLK, flags, crc
+        # Otherwise fall through: 34 is not a splittable width, so the chunk
+        # takes the generic single-stream path exactly as it did before.
 
     splittable = esize > 1 and n % esize == 0 and esize in kernels.SUPPORTED_ESIZES
     if kind == KIND_BF16 and esize == 2 and n % 2 == 0:
@@ -359,6 +508,11 @@ def decode_chunk(payload, codec: int, esize: int, flags: int, rlen: int,
         if esize != 2 or rlen % 2:
             raise ValueError("a conditioned bf16 chunk must have 2-byte elements")
         result = _decode_bf16c(payload, rlen // 2, out)
+    elif codec == CODEC_BLK:
+        if esize != Q80_PERIOD or rlen % Q80_PERIOD:
+            raise ValueError(
+                f"a block chunk must be whole {Q80_PERIOD}-byte blocks")
+        result = _decode_q80(payload, rlen // Q80_PERIOD, out)
     elif codec == CODEC_ZSTD:
         result = _decode_stream(payload, flags & 0x3, "chunk", rlen)
         if len(result) != rlen:

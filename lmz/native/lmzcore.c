@@ -197,7 +197,7 @@ LMZ_API const char *lmz_isa(void)
 #endif
 }
 
-LMZ_API int lmz_abi_version(void) { return 5; }
+LMZ_API int lmz_abi_version(void) { return 6; }
 
 /* ------------------------------------------------------- recursive split */
 
@@ -414,6 +414,48 @@ LMZ_API int lmz_merge_bf16(const uint8_t *pa, const uint8_t *pb, uint8_t *dst,
     return 0;
 }
 
+/* -------------------------------------------------------- strided planes */
+
+/*
+ * Deinterleave fixed-period records into one plane per byte position, for
+ * periods the power-of-two kernel cannot express. Built for GGUF's
+ * block-quantised types: a Q8_0 block is 34 bytes -- a 2-byte fp16 scale
+ * and 32 int8 quants -- and coding scale bytes and quant bytes in one
+ * alphabet was measured to waste 2% of the payload on real weights.
+ *
+ * One sequential read against `period` write cursors; the cursor array
+ * lives in L1 and the loop runs at memory speed for the periods used here.
+ */
+
+#define LMZ_MAX_PERIOD 64
+
+LMZ_API int lmz_split_stride(const uint8_t *src, uint8_t *out,
+                             size_t nblocks, size_t period)
+{
+    if (period == 0 || period > LMZ_MAX_PERIOD) return -1;
+    uint8_t *cur[LMZ_MAX_PERIOD];
+    for (size_t k = 0; k < period; k++) cur[k] = out + k * nblocks;
+    const uint8_t *p = src;
+    for (size_t i = 0; i < nblocks; i++)
+        for (size_t k = 0; k < period; k++)
+            *cur[k]++ = *p++;
+    return 0;
+}
+
+/* Inverse, planes given one pointer per byte position. */
+LMZ_API int lmz_merge_stride(const uint8_t *const *planes, uint8_t *dst,
+                             size_t nblocks, size_t period)
+{
+    if (period == 0 || period > LMZ_MAX_PERIOD) return -1;
+    const uint8_t *cur[LMZ_MAX_PERIOD];
+    for (size_t k = 0; k < period; k++) cur[k] = planes[k];
+    uint8_t *p = dst;
+    for (size_t i = 0; i < nblocks; i++)
+        for (size_t k = 0; k < period; k++)
+            *p++ = *cur[k]++;
+    return 0;
+}
+
 /* ------------------------------------------------- bucketed conditioning */
 
 /*
@@ -523,27 +565,14 @@ LMZ_API int lmz_bucket_unpartition(const uint8_t *ctx,
 #define RANS_MAGIC1 '1'
 
 typedef struct {
-    uint32_t rcp_freq, freq, bias, cmpl_freq, rcp_shift;
+    uint32_t freq, bias, cmpl_freq;
 } RansEncSym;
 
 static void rans_enc_sym_init(RansEncSym *s, uint32_t start, uint32_t freq)
 {
     s->freq = freq;
     s->cmpl_freq = RANS_PROB_SCALE - freq;
-    if (freq < 2) {
-        /* A reciprocal for freq<2 would overflow; the identity below works
-         * because the quotient is then always zero or one. */
-        s->rcp_freq = ~0u;
-        s->rcp_shift = 0;
-        s->bias = start + RANS_PROB_SCALE - 1;
-    } else {
-        uint32_t shift = 0;
-        while (freq > (1u << shift)) shift++;
-        s->rcp_freq = (uint32_t)(((1ull << (shift + 31)) + freq - 1) / freq);
-        s->rcp_shift = shift - 1;
-        s->bias = start;
-    }
-    s->rcp_shift += 32;
+    s->bias = start;
 }
 
 static inline void rans_enc_put(uint32_t *r, uint8_t **pptr, const RansEncSym *sym)
@@ -560,7 +589,19 @@ static inline void rans_enc_put(uint32_t *r, uint8_t **pptr, const RansEncSym *s
         *pptr = p;
         x >>= 16;
     }
-    uint32_t q = (uint32_t)(((uint64_t)x * sym->rcp_freq) >> sym->rcp_shift);
+    /* The quotient must be floor(x/freq) EXACTLY for every state the
+     * renormalisation allows, which here reaches (1<<20)*freq -- past 2^31
+     * whenever freq exceeds 2048. The fixed-point reciprocal this used to
+     * use (after Giesen) is only exact below 2^31: it was built for a coder
+     * whose renormalisation keeps states under that line, and this one does
+     * not. Above it, a majority symbol's quotient could come out one high,
+     * landing the state in a neighbouring symbol's slot -- corruption that
+     * only strikes planes where one byte value passes 50% frequency, which
+     * float planes never produce but quantised-weight planes do. Hardware
+     * division is exact everywhere, and the encoder stays memory-bound at
+     * the thread counts that matter.
+     */
+    uint32_t q = x / sym->freq;
     *r = x + sym->bias + q * sym->cmpl_freq;
 }
 

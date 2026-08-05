@@ -120,6 +120,29 @@ def write_torch_bin(path: str, storages: list[tuple[str, str, bytes]]) -> None:
             zf.writestr(f"archive/data/{key}", raw)
 
 
+def q80_blocks(nblocks: int, seed: int = 1) -> bytes:
+    """Synthetic Q8_0 blocks: clustered fp16 scales, gaussian-ish int8 quants.
+
+    The scale-low byte depends on the scale-high byte and the quants use a
+    narrowed alphabet, mirroring the structure of real quantised weights that
+    the block codec exists to exploit.
+    """
+    out = bytearray()
+    x = seed | 1
+    for _ in range(nblocks):
+        x = (x * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
+        hi = 0x24 | ((x >> 5) & 0x3)
+        lo = ((x >> 8) & 0x3F) | ((hi & 1) << 6)
+        out.append(lo)
+        out.append(hi)
+        for _ in range(32):
+            x = (x * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
+            q = (((x >> 0) & 0xFF) + ((x >> 8) & 0xFF)
+                 + ((x >> 16) & 0xFF) + ((x >> 24) & 0xFF)) >> 2
+            out.append(q & 0xFF)
+    return bytes(out)
+
+
 def write_gguf(path: str, tensors: list[tuple[str, int, list, bytes]],
                alignment: int = 32) -> None:
     """Minimal GGUF writer: magic, KVs, tensor index, aligned data."""
@@ -280,6 +303,40 @@ def test_rans_adversarial_distributions():
     # frequency field ever overflows again this balloons instead.
     enc = kernels.rans_encode(bytes([42]) * (1 << 20))
     assert len(enc) < 1024, f"single-symbol stream took {len(enc)} bytes"
+
+
+def test_rans_majority_symbol_states():
+    """A >50% symbol drives encoder states past 2^31.
+
+    The fixed-point reciprocal the encoder once used is only exact below
+    2^31, so on rare states the quotient came out one high and the symbol
+    landed in a neighbour's slot. Scattered minority symbols steer states
+    through the risky window; contiguous runs happen not to, which is how a
+    real Q8_0 norm plane (3998:98, scattered) shipped the first failure.
+    """
+    if not kernels.have_rans():
+        return
+    # Each (seed, majority freq, length) was verified to make the reciprocal
+    # encoder emit a stream its own decoder rejects. Do not "simplify" the
+    # generator: the failure needs specific state trajectories, and most
+    # arrangements with the same histogram decode fine.
+    for seed, fmaj, n in ((95, 3998, 4096), (165, 3998, 4096),
+                          (1, 3900, 65536), (3, 3900, 65536)):
+        x = seed | 1
+        buf = bytearray([0x3E]) * n
+        minority = n * (4096 - fmaj) // 4096
+        placed = 0
+        while placed < minority:
+            x = (x * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
+            pos = x % n
+            if buf[pos] == 0x3E:
+                buf[pos] = 0x3F
+                placed += 1
+        data = bytes(buf)
+        enc = kernels.rans_encode(data)
+        assert enc is not None
+        assert bytes(kernels.rans_decode(enc, n)) == data, \
+            f"seed {seed}, majority {fmaj}/4096 over {n} bytes"
 
 
 def test_rans_rejects_malformed():
@@ -889,6 +946,91 @@ def test_pytorch_bin_layout_and_roundtrip():
         # Two of four byte planes in the fp32 payload are zeros; anything
         # near or below 1.5x means the container was not really parsed.
         assert stats.ratio > 1.5, f"fp32-from-bf16 only reached {stats.ratio:.3f}x"
+
+
+def test_stride_kernels():
+    """The strided split must equal slicing and merge must undo it."""
+    for period in (1, 2, 17, 34, 64):
+        for nblocks in (0, 1, 7, 100, 4097):
+            src = rand(nblocks * period, nblocks + period)
+            planes = kernels.split_stride(src, period)
+            expect = b"".join(src[k::period] for k in range(period))
+            assert bytes(planes) == expect, f"split period={period} n={nblocks}"
+            streams = [(bytes(planes), k * nblocks) for k in range(period)]
+            back = kernels.merge_stride(streams, nblocks, period)
+            assert bytes(back) == src, f"merge period={period} n={nblocks}"
+    for bad in (0, 65):
+        try:
+            kernels.split_stride(b"\0" * 130 * max(bad, 1), bad)
+            raise AssertionError(f"period {bad} should be rejected")
+        except ValueError:
+            pass
+
+
+def test_stride_fallback_matches_native():
+    script = (
+        "import os,sys;os.environ['LMZ_NO_NATIVE']='1';sys.path.insert(0,%r);"
+        "from lmz import kernels;"
+        "assert not kernels.backend().startswith('native');"
+        "src=bytes((i*11+3)%%256 for i in range(34*500));"
+        "p=kernels.split_stride(src,34);"
+        "s=[(bytes(p),k*500) for k in range(34)];"
+        "print(bytes(p).hex()[:64]);"
+        "print(bytes(kernels.merge_stride(s,500,34)).hex()[:64])" % ROOT
+    )
+    out = subprocess.run([sys.executable, "-c", script], capture_output=True,
+                         text=True, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
+    split_hex, merge_hex = out.stdout.strip().splitlines()
+    src = bytes((i * 11 + 3) % 256 for i in range(34 * 500))
+    assert split_hex == bytes(kernels.split_stride(src, 34)).hex()[:64]
+    assert merge_hex == src.hex()[:64]
+
+
+def test_q80_block_codec_roundtrip():
+    """Q8_0 chunks must choose the block codec and restore exactly."""
+    if not kernels.have_rans():
+        return
+    data = q80_blocks(codec.Q80_MIN_BLOCKS, 3)
+    parts, cid, flags, crc = codec.encode_chunk(data, 34, 1, True,
+                                                kind=planner.KIND_Q80)
+    assert cid == lmzformat.CODEC_BLK, f"expected block codec, got {cid}"
+    payload = b"".join(bytes(p) for p in parts)
+    assert len(payload) < len(data) * 0.95, "block codec should win clearly"
+    got = codec.decode_chunk(payload, cid, 34, flags, len(data), crc, True)
+    assert bytes(got) == data
+
+    for offset in (3, codec._q80_hdr.size + 4, len(payload) - 4):
+        damaged = bytearray(payload)
+        damaged[offset] ^= 0xFF
+        try:
+            codec.decode_chunk(bytes(damaged), cid, 34, flags, len(data), crc, True)
+            raise AssertionError(f"corruption at offset {offset} went undetected")
+        except FormatError:
+            pass
+
+
+def test_q80_gguf_file_roundtrip():
+    """A Q8_0 GGUF must be block-coded through the whole pipeline."""
+    if not kernels.have_rans():
+        return
+    nblocks = 150000
+    raw = q80_blocks(nblocks, 7)
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "m.gguf")
+        write_gguf(path, [("blk.0.w", 8, [32 * nblocks], raw)])
+        with open(path, "rb") as fh:
+            layout = planner.probe(fh, os.path.getsize(path))
+        region = next(r for r in layout.regions if r.kind == planner.KIND_Q80)
+        assert region.esize == 34
+
+        archive = os.path.join(d, "a.lmz")
+        stats = lmz.compress(path, archive, chunk_size=2 << 20)
+        assert "q8-block" in lmz.info(archive)["codecs"]
+        out = os.path.join(d, "o.gguf")
+        lmz.decompress(archive, out)
+        assert digest(out) == digest(path)
+        assert stats.saved > 0.05, f"only saved {stats.saved:.2%}"
 
 
 def test_v1_archives_still_read():

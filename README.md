@@ -92,6 +92,7 @@ byte-identical:
 | GLM-4V-9B (BF16, 15 shards) | 27.82 GB | 18.46 GB | **33.64%** |
 | bge-m3 directory (FP32 `.bin` + onnx) | 4.59 GB | 2.45 GB | **46.48%** |
 | Llama-3-8B NF4-quantised (bitsandbytes) | 5.70 GB | 4.87 GB | **14.55%** |
+| Llama-3.1-8B-Instruct Q8_0 GGUF | 8.54 GB | 7.97 GB | **6.66%** |
 
 Each of those numbers has a reason. The two directory halvings are dedup:
 Llama's repo ships HF shards *plus* Meta's `original/consolidated.00.pth`,
@@ -102,17 +103,20 @@ bge-m3's `pytorch_model.bin` holds FP32 that was trained in FP16: two of its
 four byte planes are zeros and a third holds 3.0 bits, so the weights payload
 alone drops 57.5%. The NF4 checkpoint is mostly *already* at entropy — its
 BF16 embeddings compress 34%, its 4-bit payload barely at all, which is the
-honest outcome for quantised weights.
+honest outcome for quantised weights. Q8_0 keeps a little more slack than
+other quantisations: its int8 quants are a genuine 7.67-bit alphabet and its
+fp16 block scales carry visible structure, which the block split collects —
+general-purpose compression manages 5.5% on the same file.
 
 **Throughput**, 1.09 GiB Llama shard, RAM-backed filesystem, including all I/O
 and per-chunk checksums, best of 3:
 
 | threads | compress | decompress |
 |---|---|---|
-| 1 | 0.31 GiB/s | 0.33 GiB/s |
-| 4 | 1.25 GiB/s | 1.16 GiB/s |
-| 8 | **1.97 GiB/s** | **1.76 GiB/s** |
-| 16 | 1.54 GiB/s | 1.61 GiB/s |
+| 1 | 0.31 GiB/s | 0.35 GiB/s |
+| 4 | 1.18 GiB/s | 1.18 GiB/s |
+| 8 | **1.92 GiB/s** | **1.76 GiB/s** |
+| 16 | 1.71 GiB/s | 1.64 GiB/s |
 
 Exponent conditioning costs ~20% single-threaded next to v0.1's plain field
 split; at 8 threads the job is memory-bound and the difference disappears.
@@ -167,9 +171,14 @@ so decompression stays a bag of independent jobs with no ordering.
 
 **Splitting.** BF16 chunks are cut on the float's own field boundaries: one
 plane takes the whole 8-bit exponent, the other takes the sign bit above 7
-mantissa bits. Everything else is cut on byte boundaries, one plane per byte
-position, which still separates exponents from mantissas for FP16/FP32/FP64
-and is what makes an FP32-upcast-from-BF16 checkpoint collapse.
+mantissa bits. GGUF Q8_0 chunks are cut on the *block* boundary instead: a
+Q8_0 block is a 2-byte fp16 scale followed by 32 int8 quants, and coding
+scale bytes and quant bytes in one alphabet was measured to waste 2% of the
+payload — so the scales become two planes of their own (the low byte coded
+per bucket of the high byte, which carries its exponent) and the quants one.
+Everything else is cut on byte boundaries, one plane per byte position, which
+still separates exponents from mantissas for FP16/FP32/FP64 and is what makes
+an FP32-upcast-from-BF16 checkpoint collapse.
 
 **Conditioning.** The sign+mantissa plane is not quite independent of the
 exponent: on real Llama weights the joint 16-bit entropy sits 0.075 bits per
@@ -227,6 +236,19 @@ looked like it would:
   histogram on both sides costs one 256-entry integer scan and saves having
   any map bytes or versioning at all; eight equal-mass buckets capture the
   full 256-context conditional entropy to four decimal places.
+- **The fixed-point reciprocal in the encoder was wrong, and 60 GB of
+  weights never noticed.** The classic rANS reciprocal (exact below 2^31)
+  was built for a coder whose renormalisation keeps states under that line;
+  this one's 16-bit renormalisation lets states reach 2^20 x freq, so any
+  symbol past 50% frequency can push a quotient one too high and write a
+  neighbouring symbol's slot. Float planes never have a majority byte value,
+  so every BF16 model round-tripped clean — the first Q8_0 file failed
+  verification within seconds, on a norm plane that is 97.6% one value with
+  the minority scattered (contiguous runs happen to dodge the bad states).
+  The quotient is now a hardware division: exact everywhere, byte-identical
+  output wherever the old path was right, and invisible in throughput at
+  every thread count. Verification catching it is the system working; the
+  regression test pins four seeds proven to break the old encoder.
 - **Preallocating the output is worth ~9x.** Writing to a sparse file faults
   in and clears a page per write. `fallocate` costs 15 ms for 2 GiB on ext4
   and repays it many times over — but on tmpfs a "block" is a page of RAM, so
@@ -305,8 +327,9 @@ both are read up front so decompression can start anywhere.
 Format v2 adds two codecs: `ref` (the payload is an 8-byte offset naming an
 identical earlier range; integrity rides on the source chunks' checksums) and
 `bf16-cond` (field split whose sign+mantissa plane is coded per exponent
-bucket, methods and lengths self-described in the payload). This build still
-reads v1 archives.
+bucket, methods and lengths self-described in the payload). v3 adds
+`q8-block` (Q8_0 block split: scale planes apart from quant bytes). This
+build still reads v1 and v2 archives.
 
 Integrity is checked at three levels: chunks must tile the output exactly with
 no gap or overlap, each chunk carries a crc32 of its decoded bytes, and decoder
@@ -329,16 +352,18 @@ its destination directory.
   a C compiler exists. Without one, compression falls back to zstd (~31%
   instead of ~34%) and archives already written with rANS cannot be read —
   `./lmz-cli doctor` reports which backend is live.
-- **Already-quantised weights don't compress.** INT8/FP8 checkpoints are
-  detected and stored unchanged. This is the correct outcome, not a failure,
-  but it means lmz has little to offer them.
+- **Already-quantised weights are mostly entropy.** Raw INT8/FP8 checkpoints
+  are detected and stored unchanged. GGUF Q8_0 is the exception — its block
+  structure leaves ~7% on the table, which the block codec collects — but
+  that is the honest ceiling, not a starting point.
 - **No GPU path.** DFloat11 and NeuZip decompress on the GPU so a model that
   doesn't fit in VRAM can still run; lmz only produces files and bytes. For
   that use case they win regardless of ratio.
 - **Decompressing to a file is I/O bound** on real storage. The gain there is
   that there are a third fewer bytes to move.
-- GGUF is parsed for its dtype layout; quantised GGUF blocks are treated as
-  opaque bytes, which is where their entropy already is.
+- GGUF is parsed for its dtype layout; Q8_0 tensors get the block split,
+  while K-quant blocks (Q4_K and friends) are treated as opaque bytes, which
+  is where their entropy already is.
 
 ## Tests
 
@@ -346,7 +371,8 @@ its destination directory.
 python3 tests/test_lmz.py          # also runs under pytest
 ```
 
-37 tests covering kernel equivalence across all backends and element sizes,
+41 tests covering kernel equivalence across all backends, element sizes and
+block periods,
 rANS round-trips over adversarial distributions (including single-symbol
 streams, which exposed a frequency-field overflow), rANS landing within 2% of
 measured entropy, BF16 field-split reversibility, bucket partition

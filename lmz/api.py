@@ -612,8 +612,8 @@ def info(src: str) -> dict:
         reader = ArchiveReader(fh)
         by_codec: dict[str, list[int]] = {}
         for c in reader.chunks:
-            name = {0: "stored", 1: "entropy", 2: "split",
-                    3: "bf16-split", 4: "ref", 5: "bf16-cond"}.get(c.codec, "?")
+            name = {0: "stored", 1: "entropy", 2: "split", 3: "bf16-split",
+                    4: "ref", 5: "bf16-cond", 6: "q8-block"}.get(c.codec, "?")
             slot = by_codec.setdefault(name, [0, 0, 0])
             slot[0] += 1
             slot[1] += c.rlen

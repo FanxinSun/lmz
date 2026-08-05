@@ -44,7 +44,7 @@ def _load_native():
                 return None
             lib = ctypes.CDLL(path)
             lib.lmz_abi_version.restype = ctypes.c_int
-            if lib.lmz_abi_version() != 5:
+            if lib.lmz_abi_version() != 6:
                 _state = "abi-mismatch"
                 return None
             lib.lmz_isa.restype = ctypes.c_char_p
@@ -65,6 +65,11 @@ def _load_native():
             lib.lmz_split_bf16.argtypes = [v, v, v, ctypes.c_size_t]
             lib.lmz_merge_bf16.restype = ctypes.c_int
             lib.lmz_merge_bf16.argtypes = [v, v, v, ctypes.c_size_t]
+            lib.lmz_split_stride.restype = ctypes.c_int
+            lib.lmz_split_stride.argtypes = [v, v, ctypes.c_size_t, ctypes.c_size_t]
+            lib.lmz_merge_stride.restype = ctypes.c_int
+            lib.lmz_merge_stride.argtypes = [ctypes.POINTER(ctypes.c_void_p), v,
+                                             ctypes.c_size_t, ctypes.c_size_t]
             lib.lmz_bucket_lut.restype = ctypes.c_int
             lib.lmz_bucket_lut.argtypes = [v, ctypes.c_size_t, v]
             lib.lmz_bucket_partition.restype = ctypes.c_int
@@ -345,6 +350,64 @@ def merge_bf16(planes, nelem: int, out=None):
         dst[2 * i] = w & 0xFF
         dst[2 * i + 1] = w >> 8
     return memoryview(dst)[:n]
+
+
+def split_stride(src, period: int) -> bytearray:
+    """Deinterleave fixed-period records into one plane per byte position.
+
+    For periods the power-of-two kernel cannot express, like Q8_0's 34-byte
+    blocks. Output is position-major: plane k occupies [k*n, (k+1)*n).
+    """
+    n = len(src)
+    if period <= 0 or period > 64:
+        raise ValueError(f"unsupported record period {period}")
+    if n % period:
+        raise ValueError(f"buffer of {n} bytes is not whole {period}-byte records")
+    nblocks = n // period
+    out = bytearray(n)
+    if n == 0:
+        return out
+    lib = _load_native()
+    if lib is not None:
+        sa, _a = _ptr(src)
+        da, _b = _ptr(out)
+        if lib.lmz_split_stride(sa, da, nblocks, period) != 0:
+            raise ValueError(f"unsupported record period {period}")
+        return out
+    sb = bytes(src)
+    for k in range(period):
+        out[k * nblocks:(k + 1) * nblocks] = sb[k::period]
+    return out
+
+
+def merge_stride(streams, nblocks: int, period: int, out=None):
+    """Re-interleave planes into fixed-period records. Inverse of split_stride.
+
+    `streams` is one (buffer, offset) per byte position, so decoded planes
+    are consumed where they lie.
+    """
+    n = nblocks * period
+    if len(streams) != period:
+        raise ValueError(f"expected {period} planes, got {len(streams)}")
+    dst = out if (out is not None and len(out) >= n) else bytearray(n)
+    if n == 0:
+        return memoryview(dst)[:0]
+    lib = _load_native()
+    if lib is not None:
+        keep = []
+        addrs = (ctypes.c_void_p * period)()
+        for k, (obj, off) in enumerate(streams):
+            addr, ref = _ptr(obj)
+            keep.append(ref)
+            addrs[k] = (addr + off) if addr else 0
+        da, _d = _ptr(dst)
+        if lib.lmz_merge_stride(addrs, da, nblocks, period) != 0:
+            raise ValueError(f"unsupported record period {period}")
+        return memoryview(dst)[:n]
+    view = memoryview(dst)
+    for k, (obj, off) in enumerate(streams):
+        view[k:n:period] = memoryview(obj)[off:off + nblocks]
+    return view[:n]
 
 
 def bucket_lut(hist, k: int) -> bytes:

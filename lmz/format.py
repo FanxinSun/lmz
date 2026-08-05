@@ -28,10 +28,11 @@ from dataclasses import dataclass, field
 
 MAGIC = b"LMZ\x01"
 TAIL = b"LMZTAIL\x01"
-# v2 adds ref chunks (cross-file tensor dedup) and conditioned BF16 chunks.
-# v1 archives contain neither, so this build reads both versions.
-FORMAT_VERSION = 2
-READABLE_VERSIONS = (1, 2)
+# v2 added ref chunks (cross-file tensor dedup) and conditioned BF16 chunks;
+# v3 adds block-split chunks for GGUF Q8_0. Earlier archives contain none of
+# the newer codecs, so this build reads every version listed.
+FORMAT_VERSION = 3
+READABLE_VERSIONS = (1, 2, 3)
 
 HEADER = struct.Struct("<4sHHQQQ")  # magic, version, flags, original_size, 2x reserved
 HEADER_SIZE = 32
@@ -52,6 +53,7 @@ CODEC_SPLIT = 2  # per-plane lengths, then per-plane data, split on byte bounds
 CODEC_BF16 = 3  # as CODEC_SPLIT, but split on bfloat16's own field bounds
 CODEC_REF = 4  # payload is a u64 offset: bytes equal an earlier output range
 CODEC_BF16C = 5  # BF16 field split; sign+mantissa coded per exponent bucket
+CODEC_BLK = 6  # fixed-period block split: scale planes apart from quant bytes
 
 
 class FormatError(ValueError):

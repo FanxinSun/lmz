@@ -30,7 +30,7 @@ ST_ESIZE = {
 GGML_TYPES = {
     0: ("F32", 1, 4, 4), 1: ("F16", 1, 2, 2), 2: ("Q4_0", 32, 18, 1),
     3: ("Q4_1", 32, 20, 1), 6: ("Q5_0", 32, 22, 1), 7: ("Q5_1", 32, 24, 1),
-    8: ("Q8_0", 32, 34, 1), 9: ("Q8_1", 32, 36, 1), 10: ("Q2_K", 256, 84, 1),
+    8: ("Q8_0", 32, 34, 34), 9: ("Q8_1", 32, 36, 1), 10: ("Q2_K", 256, 84, 1),
     11: ("Q3_K", 256, 110, 1), 12: ("Q4_K", 256, 144, 1), 13: ("Q5_K", 256, 176, 1),
     14: ("Q6_K", 256, 210, 1), 15: ("Q8_K", 256, 292, 1), 16: ("IQ2_XXS", 256, 66, 1),
     17: ("IQ2_XS", 256, 74, 1), 18: ("IQ3_XXS", 256, 98, 1), 19: ("IQ1_S", 256, 50, 1),
@@ -48,6 +48,7 @@ MAX_HEADER = 256 << 20  # refuse absurd declared header sizes
 KIND_BYTES = 0
 KIND_BF16 = 1
 KIND_REF = 2  # bytes duplicate an earlier output range; src is its offset
+KIND_Q80 = 3  # GGUF Q8_0 blocks: 2-byte fp16 scale + 32 int8 quants
 
 # torch storage class -> (dtype name, element size, kind). Complex dtypes use
 # the width of one component pair's half so the split still lines up on a
@@ -251,7 +252,16 @@ def parse_gguf(f, size: int) -> Layout | None:
                 nbytes = min(nbytes, nelem // blk * per_blk)
         else:
             tname, esize = f"TYPE_{ttype}", 1
-        kind = KIND_BF16 if ttype == 30 else KIND_BYTES
+        if ttype == 30:
+            kind = KIND_BF16
+        elif ttype == 8:
+            kind = KIND_Q80
+            # The block structure only holds if the tensor really is whole
+            # 34-byte blocks; a clamped or odd size falls back to plain bytes.
+            if nbytes % 34:
+                esize, kind = 1, KIND_BYTES
+        else:
+            kind = KIND_BYTES
         if nbytes > 0:
             regions.append(Region(start, start + nbytes, esize, kind))
         tensors[name] = {"dtype": tname, "shape": dims,
