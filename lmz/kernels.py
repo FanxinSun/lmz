@@ -23,6 +23,10 @@ _state = "unloaded"
 
 SUPPORTED_ESIZES = (1, 2, 4, 8)
 
+# Widest fixed-period record split_stride/merge_stride accept, matching
+# LMZ_MAX_PERIOD in the kernel. The widest GGUF block in use is Q6_K's 210.
+MAX_PERIOD = 256
+
 
 def _load_native():
     """Load the compiled kernel, building it on first use. None if unavailable."""
@@ -44,7 +48,7 @@ def _load_native():
                 return None
             lib = ctypes.CDLL(path)
             lib.lmz_abi_version.restype = ctypes.c_int
-            if lib.lmz_abi_version() != 6:
+            if lib.lmz_abi_version() != 9:
                 _state = "abi-mismatch"
                 return None
             lib.lmz_isa.restype = ctypes.c_char_p
@@ -79,6 +83,14 @@ def _load_native():
             lib.lmz_bucket_unpartition.argtypes = [v, ctypes.POINTER(ctypes.c_void_p),
                                                    ctypes.c_size_t, v,
                                                    ctypes.c_size_t, v]
+            lib.lmz_xor.restype = ctypes.c_int
+            lib.lmz_xor.argtypes = [v, v, ctypes.c_size_t, v]
+            lib.lmz_k4_scales.restype = ctypes.c_int
+            lib.lmz_k4_scales.argtypes = [v, ctypes.c_size_t, v, v]
+            lib.lmz_k4_pack.restype = ctypes.c_int
+            lib.lmz_k4_pack.argtypes = [v, ctypes.c_size_t, v]
+            lib.lmz_k4_unpack.restype = ctypes.c_int
+            lib.lmz_k4_unpack.argtypes = [v, ctypes.c_size_t, v]
             lib.lmz_rans_bound.restype = ctypes.c_size_t
             lib.lmz_rans_bound.argtypes = [ctypes.c_size_t]
             lib.lmz_rans_encode.restype = ctypes.c_long
@@ -356,10 +368,11 @@ def split_stride(src, period: int) -> bytearray:
     """Deinterleave fixed-period records into one plane per byte position.
 
     For periods the power-of-two kernel cannot express, like Q8_0's 34-byte
-    blocks. Output is position-major: plane k occupies [k*n, (k+1)*n).
+    blocks or Q6_K's 210-byte ones. Output is position-major: plane k occupies
+    [k*n, (k+1)*n).
     """
     n = len(src)
-    if period <= 0 or period > 64:
+    if period <= 0 or period > MAX_PERIOD:
         raise ValueError(f"unsupported record period {period}")
     if n % period:
         raise ValueError(f"buffer of {n} bytes is not whole {period}-byte records")
@@ -511,6 +524,201 @@ def bucket_unpartition(ctx, streams, lut: bytes, k: int, out=None):
         dst[i] = views[b][cur[b]]
         cur[b] += 1
     return memoryview(dst)[:n]
+
+
+def xor_bytes(a, b, out=None):
+    """a ^ b, byte for byte. Both must be the same length.
+
+    This is the whole of a delta chunk's arithmetic. XOR rather than
+    subtraction because a borrow propagates into the high byte and destroys
+    the very thing being exploited -- that the high byte usually does not
+    change at all. Measured against integer subtraction and against an
+    order-preserving monotone map on real checkpoints and fine-tunes, plain
+    XOR won every time.
+    """
+    n = len(a)
+    if len(b) != n:
+        raise ValueError(f"cannot xor {n} bytes against {len(b)}")
+    dst = out if (out is not None and len(out) >= n) else bytearray(n)
+    if n == 0:
+        return memoryview(dst)[:0]
+
+    lib = _load_native()
+    if lib is not None:
+        aa, _x = _ptr(a)
+        bb, _y = _ptr(b)
+        dd, _z = _ptr(dst)
+        lib.lmz_xor(aa, bb, n, dd)
+        return memoryview(dst)[:n]
+    try:
+        import numpy as np
+
+        na = np.frombuffer(bytes(a), dtype=np.uint8)
+        nb = np.frombuffer(bytes(b), dtype=np.uint8)
+        np.frombuffer(dst, dtype=np.uint8, count=n)[:] = na ^ nb
+        return memoryview(dst)[:n]
+    except ImportError:
+        pass
+
+    ba, bb = bytes(a), bytes(b)
+    dst[:n] = (int.from_bytes(ba, "big") ^ int.from_bytes(bb, "big")).to_bytes(
+        n, "big")
+    return memoryview(dst)[:n]
+
+
+# A Q4_K/Q5_K super-block: 256 weights in 8 sub-blocks, each with a 6-bit
+# scale and a 6-bit min packed into a shared 12-byte field.
+K4_SUBBLOCKS = 8
+K4_SCALE_BYTES = 12
+K4_QUANT_BYTES = 128
+
+
+def k4_scales(planes, nblocks: int):
+    """Unpack ggml's 12 packed scale bytes into 8 scale and 8 min planes.
+
+    `planes` is the 12 byte-planes of the scales field, back to back. Returns
+    (scales, mins), each 8 planes of `nblocks`. Four of each pair straddle a
+    byte boundary, which is why a byte-plane split cannot see them.
+
+    Used only to derive a coding context, never to reconstruct: the packed
+    bytes are still coded as their own field.
+    """
+    n = K4_SUBBLOCKS * nblocks
+    sc, mn = bytearray(n), bytearray(n)
+    if nblocks == 0:
+        return sc, mn
+    if len(planes) < K4_SCALE_BYTES * nblocks:
+        raise ValueError("scale field is shorter than 12 planes")
+
+    lib = _load_native()
+    if lib is not None:
+        sp, _a = _ptr(planes)
+        da, _b = _ptr(sc)
+        db, _c = _ptr(mn)
+        lib.lmz_k4_scales(sp, nblocks, da, db)
+        return sc, mn
+    try:
+        import numpy as np
+
+        sp = np.frombuffer(bytes(planes), dtype=np.uint8,
+                           count=K4_SCALE_BYTES * nblocks).reshape(12, nblocks)
+        a = np.frombuffer(sc, dtype=np.uint8).reshape(8, nblocks)
+        b = np.frombuffer(mn, dtype=np.uint8).reshape(8, nblocks)
+        a[0:4] = sp[0:4] & 63
+        b[0:4] = sp[4:8] & 63
+        a[4:8] = (sp[8:12] & 0x0F) | ((sp[0:4] >> 6) << 4)
+        b[4:8] = (sp[8:12] >> 4) | ((sp[4:8] >> 6) << 4)
+        return sc, mn
+    except ImportError:
+        pass
+
+    mv = memoryview(planes)
+    for j in range(4):
+        a, b = mv[j * nblocks:(j + 1) * nblocks], mv[(j + 4) * nblocks:(j + 5) * nblocks]
+        for i in range(nblocks):
+            sc[j * nblocks + i] = a[i] & 63
+            mn[j * nblocks + i] = b[i] & 63
+    for j in range(4, 8):
+        lo = mv[(j + 4) * nblocks:(j + 5) * nblocks]
+        hs = mv[(j - 4) * nblocks:(j - 3) * nblocks]
+        hm = mv[j * nblocks:(j + 1) * nblocks]
+        for i in range(nblocks):
+            sc[j * nblocks + i] = (lo[i] & 0x0F) | ((hs[i] >> 6) << 4)
+            mn[j * nblocks + i] = (lo[i] >> 4) | ((hm[i] >> 6) << 4)
+    return sc, mn
+
+
+def k4_pack(qplanes, nblocks: int) -> bytearray:
+    """Regroup 128 quant planes so each output plane holds one sub-block.
+
+    ggml puts sub-block 2g in the low nibbles of quant bytes [32g, 32g+32) and
+    2g+1 in their high nibbles, so every byte plane mixes two alphabets. This
+    pairs two nibbles of the same sub-block into each output byte: one symbol
+    per two quants, so the coder still runs at byte rate, but with a single
+    context per byte.
+    """
+    n = K4_QUANT_BYTES * nblocks
+    out = bytearray(n)
+    if nblocks == 0:
+        return out
+    if len(qplanes) < n:
+        raise ValueError("quant field is shorter than 128 planes")
+
+    lib = _load_native()
+    if lib is not None:
+        sa, _a = _ptr(qplanes)
+        da, _b = _ptr(out)
+        lib.lmz_k4_pack(sa, nblocks, da)
+        return out
+    try:
+        import numpy as np
+
+        q = np.frombuffer(bytes(qplanes), dtype=np.uint8,
+                          count=n).reshape(128, nblocks)
+        o = np.frombuffer(out, dtype=np.uint8).reshape(128, nblocks)
+        for s in range(8):
+            g, sh = s >> 1, 4 if (s & 1) else 0
+            a = (q[32 * g:32 * g + 32:2] >> sh) & 0x0F
+            b = (q[32 * g + 1:32 * g + 32:2] >> sh) & 0x0F
+            o[16 * s:16 * s + 16] = a | (b << 4)
+        return out
+    except ImportError:
+        pass
+
+    mv = memoryview(qplanes)
+    for s in range(8):
+        g, sh = s >> 1, 4 if (s & 1) else 0
+        for i in range(16):
+            a = mv[(32 * g + 2 * i) * nblocks:(32 * g + 2 * i + 1) * nblocks]
+            b = mv[(32 * g + 2 * i + 1) * nblocks:(32 * g + 2 * i + 2) * nblocks]
+            base = (16 * s + i) * nblocks
+            for k in range(nblocks):
+                out[base + k] = ((a[k] >> sh) & 0x0F) | (((b[k] >> sh) & 0x0F) << 4)
+    return out
+
+
+def k4_unpack(packed, nblocks: int) -> bytearray:
+    """Inverse of k4_pack: sub-block planes back to ggml's quant planes."""
+    n = K4_QUANT_BYTES * nblocks
+    out = bytearray(n)
+    if nblocks == 0:
+        return out
+    if len(packed) < n:
+        raise ValueError("packed field is shorter than 128 planes")
+
+    lib = _load_native()
+    if lib is not None:
+        sa, _a = _ptr(packed)
+        da, _b = _ptr(out)
+        lib.lmz_k4_unpack(sa, nblocks, da)
+        return out
+    try:
+        import numpy as np
+
+        p = np.frombuffer(bytes(packed), dtype=np.uint8,
+                          count=n).reshape(128, nblocks)
+        o = np.frombuffer(out, dtype=np.uint8).reshape(128, nblocks)
+        for g in range(4):
+            lo = p[32 * g:32 * g + 16]
+            hi = p[32 * g + 16:32 * g + 32]
+            for half in (0, 1):
+                sh = 4 * half
+                o[32 * g + half:32 * g + 32:2] = \
+                    ((lo >> sh) & 0x0F) | (((hi >> sh) & 0x0F) << 4)
+        return out
+    except ImportError:
+        pass
+
+    mv = memoryview(packed)
+    for c in range(128):
+        g, t = c >> 5, c & 31
+        sh = 4 * (t & 1)
+        lo = mv[(16 * (2 * g) + (t >> 1)) * nblocks:][:nblocks]
+        hi = mv[(16 * (2 * g + 1) + (t >> 1)) * nblocks:][:nblocks]
+        base = c * nblocks
+        for k in range(nblocks):
+            out[base + k] = ((lo[k] >> sh) & 0x0F) | (((hi[k] >> sh) & 0x0F) << 4)
+    return out
 
 
 def have_rans() -> bool:

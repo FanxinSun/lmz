@@ -29,10 +29,15 @@ from dataclasses import dataclass, field
 MAGIC = b"LMZ\x01"
 TAIL = b"LMZTAIL\x01"
 # v2 added ref chunks (cross-file tensor dedup) and conditioned BF16 chunks;
-# v3 adds block-split chunks for GGUF Q8_0. Earlier archives contain none of
-# the newer codecs, so this build reads every version listed.
-FORMAT_VERSION = 3
-READABLE_VERSIONS = (1, 2, 3)
+# v3 added block-split chunks for GGUF Q8_0; v4 replaces those with a block
+# split that carries its own field layout, which covers every GGUF
+# quantisation rather than one; v5 adds a field mode that codes a k-quant's
+# quants per sub-block class, described in the payload alongside the rest;
+# v6 adds delta chunks, which name an earlier output range the way a ref does
+# and carry the coded difference from it. Earlier archives contain none of the
+# newer codecs, so this build reads every version listed.
+FORMAT_VERSION = 6
+READABLE_VERSIONS = (1, 2, 3, 4, 5, 6)
 
 HEADER = struct.Struct("<4sHHQQQ")  # magic, version, flags, original_size, 2x reserved
 HEADER_SIZE = 32
@@ -53,7 +58,9 @@ CODEC_SPLIT = 2  # per-plane lengths, then per-plane data, split on byte bounds
 CODEC_BF16 = 3  # as CODEC_SPLIT, but split on bfloat16's own field bounds
 CODEC_REF = 4  # payload is a u64 offset: bytes equal an earlier output range
 CODEC_BF16C = 5  # BF16 field split; sign+mantissa coded per exponent bucket
-CODEC_BLK = 6  # fixed-period block split: scale planes apart from quant bytes
+CODEC_BLK = 6  # v3 Q8_0 block split; still decoded, no longer written
+CODEC_GBLK = 7  # block split whose field grouping is described in the payload
+CODEC_DELTA = 8  # payload names an earlier output range plus a coded difference
 
 
 class FormatError(ValueError):

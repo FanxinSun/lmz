@@ -78,7 +78,8 @@ def cmd_compress(args) -> int:
     bar = Progress("compressing", not args.quiet)
     stats = api.compress(src, dst, level=args.level, workers=args.threads,
                          chunk_size=args.chunk_size, checksum=not args.no_checksum,
-                         dedup=not args.no_dedup, progress=bar)
+                         dedup=not args.no_dedup, delta=not args.no_delta,
+                         progress=bar)
     bar.done()
     if not args.quiet:
         print(f"{src} -> {dst}")
@@ -89,6 +90,9 @@ def cmd_compress(args) -> int:
         deduped = stats.detail.get("dedup_bytes", 0)
         if deduped:
             print(f"  {human(deduped)} of duplicate tensors stored once")
+        delta = stats.detail.get("delta_bytes", 0)
+        if delta:
+            print(f"  {human(delta)} coded as differences from an earlier file")
     return 0
 
 
@@ -140,7 +144,7 @@ def cmd_info(args) -> int:
         print("chunk codecs")
         for name, (count, rlen, clen) in sorted(data["codecs"].items()):
             r = rlen / clen if clen else 0
-            print(f"  {name:8s} {count:7d} chunks  {human(rlen):>10s} -> "
+            print(f"  {name:10s} {count:7d} chunks  {human(rlen):>10s} -> "
                   f"{human(clen):>10s}  {r:.3f}x")
     print(f"members     {len(data['members'])}")
     for m in data["members"][:args.limit]:
@@ -204,14 +208,15 @@ def cmd_bench(args) -> int:
         layout = probe(fh, size)
         data = []
         taken = 0
-        for start, end, esize, kind, _src in chunkify(layout, size, args.chunk_size):
+        for start, end, esize, kind, _src, btype, _ikind in chunkify(
+                layout, size, args.chunk_size):
             if taken >= limit:
                 break
             fh.seek(start)
-            data.append((fh.read(end - start), esize, kind))
+            data.append((fh.read(end - start), esize, kind, btype))
             taken += end - start
 
-    total = sum(len(d) for d, _, _ in data)
+    total = sum(len(d) for d, _, _, _ in data)
     print(f"{path}: {layout.kind}, sampling {human(total)} in {len(data)} chunks\n")
     print(f"  {'codec':<22s} {'ratio':>8s} {'saved':>8s} {'compress':>12s} "
           f"{'decompress':>12s}")
@@ -225,46 +230,48 @@ def cmd_bench(args) -> int:
     def report(name, enc, dec, note_fn=None):
         """enc returns (encoded_size, opaque); dec takes the opaque back."""
         t = time.perf_counter()
-        encoded = [enc(d, e, k) for d, e, k in data]
+        encoded = [enc(d, e, k, b) for d, e, k, b in data]
         tc = time.perf_counter() - t
         out = sum(size for size, _ in encoded)
         t = time.perf_counter()
-        for (_, obj), (d, e, k) in zip(encoded, data):
-            dec(obj, d, e, k)
+        for (_, obj), (d, e, k, b) in zip(encoded, data):
+            dec(obj, d, e, k, b)
         td = time.perf_counter() - t
         note = note_fn() if note_fn else ""
         print(f"  {name:<22s} {total / out:>7.3f}x {(1 - out / total) * 100:>7.1f}% "
               f"{fmt(total / tc):>12s} {fmt(total / td):>12s}  {note}")
 
-    def enc_lmz(d, e, k, lvl, tally):
-        parts, cid, flags, _ = _codec.encode_chunk(d, e, lvl, False, kind=k)
+    def enc_lmz(d, e, k, b, lvl, tally):
+        parts, cid, flags, _ = _codec.encode_chunk(d, e, lvl, False, kind=k, btype=b)
         payload = b"".join(bytes(p) for p in parts)
         tally[cid] = tally.get(cid, 0) + 1
         return len(payload), (payload, cid, flags)
 
-    def dec_lmz(obj, d, e, k):
+    def dec_lmz(obj, d, e, k, b):
         payload, cid, flags = obj
         return _codec.decode_chunk(payload, cid, e, flags, len(d), 0, False)
 
     for lvl in (1, 3):
         tally: dict = {}
         report(f"lmz (level {lvl})",
-               lambda d, e, k, lvl=lvl, t=tally: enc_lmz(d, e, k, lvl, t), dec_lmz,
+               lambda d, e, k, b, lvl=lvl, t=tally: enc_lmz(d, e, k, b, lvl, t),
+               dec_lmz,
                note_fn=lambda t=tally: ("stored unchanged: no compressible structure"
                                         if set(t) == {0} else ""))
     if _entropy.HAVE_ZSTD:
         for lvl in (1, 3):
-            def enc_zstd(d, e, k, lvl=lvl):
+            def enc_zstd(d, e, k, b, lvl=lvl):
                 c = _entropy.compress(d, lvl, _entropy.METHOD_ZSTD)
                 return len(c), c
             report(f"zstd -{lvl} (plain)", enc_zstd,
-                   lambda obj, d, e, k: _entropy.decompress(obj, _entropy.METHOD_ZSTD))
+                   lambda obj, d, e, k, b: _entropy.decompress(
+                       obj, _entropy.METHOD_ZSTD))
 
-    def enc_gzip(d, e, k):
+    def enc_gzip(d, e, k, b):
         c = zlib.compress(d, 6)
         return len(c), c
 
-    report("gzip -6 (plain)", enc_gzip, lambda obj, d, e, k: zlib.decompress(obj))
+    report("gzip -6 (plain)", enc_gzip, lambda obj, d, e, k, b: zlib.decompress(obj))
     return 0
 
 
@@ -294,6 +301,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip per-chunk crc32")
     c.add_argument("--no-dedup", action="store_true",
                    help="skip duplicate-tensor detection")
+    c.add_argument("--no-delta", action="store_true",
+                   help="skip delta coding against matching tensors in an "
+                        "earlier file")
     c.add_argument("-f", "--force", action="store_true", help="overwrite output")
     common(c)
     c.set_defaults(func=cmd_compress)

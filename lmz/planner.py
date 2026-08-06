@@ -41,6 +41,102 @@ GGML_TYPES = {
     35: ("TQ2_0", 256, 66, 1),
 }
 
+# ggml type id -> (block bytes, field groups as (start, width)).
+#
+# A quantised block is a struct, not an array: a Q4_K block is two fp16
+# scales, twelve bytes of packed 6-bit sub-scales and 128 bytes of nibble
+# pairs. Coding all of that in one alphabet is the mistake that made lmz
+# useless on quantised models -- the fp16 exponent bytes and the near-uniform
+# quants land in one histogram and erase each other. Field order and widths
+# are ggml-common.h's struct layouts; every row sums to the block size in
+# GGML_TYPES above, which is what catches a typo here.
+#
+# A boundary that is wrong costs ratio, never correctness: the split is
+# reversed by byte position and knows nothing about what a field means.
+BLOCK_LAYOUTS = {
+    2:  (18,  ((0, 2), (2, 16))),                               # Q4_0    d, qs
+    3:  (20,  ((0, 2), (2, 2), (4, 16))),                       # Q4_1    d, m, qs
+    6:  (22,  ((0, 2), (2, 4), (6, 16))),                       # Q5_0    d, qh, qs
+    7:  (24,  ((0, 2), (2, 2), (4, 4), (8, 16))),               # Q5_1    d, m, qh, qs
+    8:  (34,  ((0, 2), (2, 32))),                               # Q8_0    d, qs
+    9:  (36,  ((0, 2), (2, 2), (4, 32))),                       # Q8_1    d, s, qs
+    10: (84,  ((0, 16), (16, 64), (80, 2), (82, 2))),           # Q2_K    scales, qs, d, dmin
+    11: (110, ((0, 32), (32, 64), (96, 12), (108, 2))),         # Q3_K    hmask, qs, scales, d
+    12: (144, ((0, 2), (2, 2), (4, 12), (16, 128))),            # Q4_K    d, dmin, scales, qs
+    13: (176, ((0, 2), (2, 2), (4, 12), (16, 32), (48, 128))),  # Q5_K    d, dmin, scales, qh, qs
+    14: (210, ((0, 128), (128, 64), (192, 16), (208, 2))),      # Q6_K    ql, qh, scales, d
+    16: (66,  ((0, 2), (2, 64))),                               # IQ2_XXS d, qs
+    17: (74,  ((0, 2), (2, 64), (66, 8))),                      # IQ2_XS  d, qs, scales
+    18: (98,  ((0, 2), (2, 96))),                               # IQ3_XXS d, qs
+    19: (50,  ((0, 2), (2, 32), (34, 16))),                     # IQ1_S   d, qs, qh
+    20: (18,  ((0, 2), (2, 16))),                               # IQ4_NL  d, qs
+    21: (110, ((0, 2), (2, 64), (66, 8), (74, 32), (106, 4))),  # IQ3_S   d, qs, qh, signs, scales
+    22: (82,  ((0, 2), (2, 64), (66, 8), (74, 8))),             # IQ2_S   d, qs, qh, scales
+    23: (136, ((0, 2), (2, 2), (4, 4), (8, 128))),              # IQ4_XS  d, scales_h, scales_l, qs
+    29: (56,  ((0, 32), (32, 16), (48, 8))),                    # IQ1_M   qs, qh, scales
+    34: (54,  ((0, 48), (48, 4), (52, 2))),                     # TQ1_0   qs, qh, d
+    35: (66,  ((0, 64), (64, 2))),                              # TQ2_0   qs, d
+}
+
+# Q8_K (292 bytes) is deliberately absent: ggml only builds it as a dot-product
+# intermediate, it never reaches a file, and it would not fit the chunk
+# record's one-byte element size.
+MAX_BLOCK_PERIOD = 255
+
+# ggml type -> (quant field start, scales field start, packing kind).
+#
+# A k-quant super-block is not one distribution but eight: each sub-block has
+# its own 6-bit scale and 6-bit min, and stores `d*q - m`, so a quant's
+# alphabet depends on which sub-block it came from. Those parameters sit
+# earlier in the block than the quants, so the decoder already holds them --
+# a context that costs nothing to transmit. It is worth 9.7 bits per block on
+# real Llama Q4_K weights, against 0.02 bits for anything available inside a
+# Q8_0 block, whose one scale covers the whole thing.
+#
+# Only listed here when the quants really are 8 sub-blocks of 32 nibbles over
+# ggml's K_SCALE_SIZE packing; the codec measures per chunk and declines when
+# the conditioning does not pay, so a listing can cost ratio but not
+# correctness.
+#
+# Q5_K has exactly the same layout for these two fields and is deliberately
+# absent. Its qs holds only the low four bits of a five-bit quant -- the fifth
+# lives in qh -- and the low bits of a peaked distribution are near-uniform
+# whatever the sub-block does. Measured on real Llama Q5_K it gains 0.000
+# points while the estimate itself costs 13% of encode time, so the listing
+# would be all cost. The payload describes the layout it used, so registering
+# it later needs no format change.
+SUB_K4 = 0
+SUBBLOCK_CTX = {
+    12: (16, 4, SUB_K4),  # Q4_K  qs[128] conditioned on scales[12]
+}
+
+
+def _check_subblock_ctx():
+    """Both fields named must be real groups of the block they belong to."""
+    for tid, (qstart, cstart, kind) in SUBBLOCK_CTX.items():
+        groups = BLOCK_LAYOUTS[tid][1]
+        assert kind == SUB_K4, tid
+        assert (qstart, 128) in groups, tid
+        assert (cstart, 12) in groups, tid
+        assert cstart + 12 <= qstart, tid  # context must decode first
+
+
+_check_subblock_ctx()
+
+
+def _check_block_layouts():
+    """Every group list must tile its block exactly and agree with GGML_TYPES."""
+    for tid, (period, groups) in BLOCK_LAYOUTS.items():
+        assert period == GGML_TYPES[tid][2] <= MAX_BLOCK_PERIOD, tid
+        pos = 0
+        for start, width in groups:
+            assert start == pos and width > 0, tid
+            pos += width
+        assert pos == period, tid
+
+
+_check_block_layouts()
+
 MAX_HEADER = 256 << 20  # refuse absurd declared header sizes
 
 
@@ -48,7 +144,11 @@ MAX_HEADER = 256 << 20  # refuse absurd declared header sizes
 KIND_BYTES = 0
 KIND_BF16 = 1
 KIND_REF = 2  # bytes duplicate an earlier output range; src is its offset
-KIND_Q80 = 3  # GGUF Q8_0 blocks: 2-byte fp16 scale + 32 int8 quants
+KIND_BLOCK = 3  # GGUF quantised blocks; esize is the block period
+# Bytes are an earlier output range XOR a coded difference. Unlike a ref, the
+# difference has the same element structure as the data it came from, so the
+# region keeps its width and `ikind` remembers how to code it.
+KIND_DELTA = 4
 
 # torch storage class -> (dtype name, element size, kind). Complex dtypes use
 # the width of one component pair's half so the split still lines up on a
@@ -77,7 +177,9 @@ class Region:
     end: int
     esize: int
     kind: int = KIND_BYTES
-    src: int = -1  # for KIND_REF: the duplicated range's output offset
+    src: int = -1  # for KIND_REF/KIND_DELTA: the source range's output offset
+    btype: int = -1  # for KIND_BLOCK: the ggml type, naming its field layout
+    ikind: int = KIND_BYTES  # for KIND_DELTA: how to code the difference
 
     @property
     def length(self) -> int:
@@ -252,18 +354,21 @@ def parse_gguf(f, size: int) -> Layout | None:
                 nbytes = min(nbytes, nelem // blk * per_blk)
         else:
             tname, esize = f"TYPE_{ttype}", 1
+        btype = -1
         if ttype == 30:
             kind = KIND_BF16
-        elif ttype == 8:
-            kind = KIND_Q80
+        elif ttype in BLOCK_LAYOUTS:
+            period = BLOCK_LAYOUTS[ttype][0]
             # The block structure only holds if the tensor really is whole
-            # 34-byte blocks; a clamped or odd size falls back to plain bytes.
-            if nbytes % 34:
+            # blocks; a clamped or odd size falls back to plain bytes.
+            if nbytes % period == 0:
+                esize, kind, btype = period, KIND_BLOCK, ttype
+            else:
                 esize, kind = 1, KIND_BYTES
         else:
             kind = KIND_BYTES
         if nbytes > 0:
-            regions.append(Region(start, start + nbytes, esize, kind))
+            regions.append(Region(start, start + nbytes, esize, kind, -1, btype))
         tensors[name] = {"dtype": tname, "shape": dims,
                          "offsets": [start, start + nbytes]}
     if not tensors:
@@ -422,29 +527,76 @@ def _carve_refs(regions: list[Region], refs, size: int) -> list[Region]:
             a, b = max(s, r.start), min(e, r.end)
             if b > cur:
                 if a > cur:
-                    out.append(Region(cur, a, r.esize, r.kind))
+                    out.append(Region(cur, a, r.esize, r.kind, -1, r.btype))
                 cur = b
             k += 1
         if cur < r.end:
-            out.append(Region(cur, r.end, r.esize, r.kind))
+            out.append(Region(cur, r.end, r.esize, r.kind, -1, r.btype))
     out.extend(Region(s, e, 1, KIND_REF, src) for s, e, src in refs)
     out.sort(key=lambda r: r.start)
     return out
 
 
-def chunkify(layout: Layout, size: int, chunk_size: int,
-             refs=None) -> list[tuple[int, int, int, int, int]]:
-    """Cover [0, size) with (start, end, esize, kind, src) chunks.
+def _carve_deltas(regions: list[Region], deltas, size: int) -> list[Region]:
+    """Retype ranges that will be coded as a difference from an earlier one.
+
+    Unlike a ref, a delta still carries data, so it keeps the covering
+    region's element width and remembers that region's kind for the encoder.
+    A range spanning several regions is cut at their boundaries, so each piece
+    is coded the way its own bytes deserve.
+    """
+    from bisect import bisect_right
+
+    deltas = sorted(deltas)
+    pos = 0
+    for s, e, _src in deltas:
+        if s < pos or e <= s or e > size:
+            return regions  # malformed: deltas are an optimisation, never a need
+        pos = e
+    starts = [s for s, _e, _src in deltas]
+
+    out: list[Region] = []
+    for r in regions:
+        if r.kind in (KIND_REF, KIND_DELTA):
+            out.append(r)
+            continue
+        cur = r.start
+        k = bisect_right(starts, cur)
+        if k and deltas[k - 1][1] > cur:
+            k -= 1
+        while k < len(deltas) and deltas[k][0] < r.end:
+            s, e, src = deltas[k]
+            a, b = max(s, r.start), min(e, r.end)
+            if b > cur:
+                if a > cur:
+                    out.append(Region(cur, a, r.esize, r.kind, -1, r.btype))
+                out.append(Region(a, b, r.esize, KIND_DELTA, src + (a - s),
+                                  r.btype, r.kind))
+                cur = b
+            k += 1
+        if cur < r.end:
+            out.append(Region(cur, r.end, r.esize, r.kind, -1, r.btype))
+    return out
+
+
+def chunkify(layout: Layout, size: int, chunk_size: int, refs=None,
+             deltas=None) -> list[tuple[int, int, int, int, int, int, int]]:
+    """Cover [0, size) with (start, end, esize, kind, src, btype, ikind) chunks.
 
     Regions are coalesced before slicing so that runs of small same-dtype
     tensors -- a model has thousands of biases and norm weights -- do not each
     become their own undersized chunk. `refs` marks byte ranges that duplicate
     an earlier output range; those become KIND_REF chunks carrying the source
-    offset in `src` (-1 everywhere else).
+    offset in `src` (-1 everywhere else). `deltas` marks ranges that are merely
+    *close* to an earlier range, which become KIND_DELTA chunks carrying both
+    the source offset and the width to code the difference at. `btype` names a
+    KIND_BLOCK chunk's GGUF field layout, and is -1 for every other kind.
     """
     regions = sorted(layout.regions, key=lambda r: r.start)
     if refs:
         regions = _carve_refs(regions, refs, size)
+    if deltas:
+        regions = _carve_deltas(regions, deltas, size)
 
     # Fill the gaps (header, padding, anything unclaimed) with 1-byte elements.
     covered: list[Region] = []
@@ -462,22 +614,26 @@ def chunkify(layout: Layout, size: int, chunk_size: int,
     merged: list[Region] = []
     for r in covered:
         prev = merged[-1] if merged else None
+        sourced = r.kind in (KIND_REF, KIND_DELTA)
         joins = (prev is not None and prev.end == r.start and prev.kind == r.kind
-                 and (prev.src + prev.length == r.src if r.kind == KIND_REF
-                      else prev.esize == r.esize))
+                 and prev.btype == r.btype and prev.ikind == r.ikind
+                 and (prev.src + prev.length == r.src if sourced else True)
+                 and (prev.esize == r.esize or r.kind == KIND_REF))
         if joins:
-            merged[-1] = Region(prev.start, r.end, prev.esize, prev.kind, prev.src)
+            merged[-1] = Region(prev.start, r.end, prev.esize, prev.kind,
+                                prev.src, prev.btype, prev.ikind)
         else:
             merged.append(r)
 
-    out: list[tuple[int, int, int, int, int]] = []
+    out: list[tuple[int, int, int, int, int, int, int]] = []
     for r in merged:
-        out.extend(_slice_region(r.start, r.end, r.esize, r.kind, chunk_size, r.src))
+        out.extend(_slice_region(r.start, r.end, r.esize, r.kind, chunk_size,
+                                 r.src, r.btype, r.ikind))
     return out
 
 
 def _slice_region(start: int, end: int, esize: int, kind: int, chunk_size: int,
-                  src: int = -1):
+                  src: int = -1, btype: int = -1, ikind: int = KIND_BYTES):
     """Cut [start, end) into chunks whose lengths are multiples of esize."""
     step = max(chunk_size - chunk_size % esize, esize)
     out = []
@@ -488,9 +644,9 @@ def _slice_region(start: int, end: int, esize: int, kind: int, chunk_size: int,
         # region boundary already guarantees alignment, so this only guards
         # against malformed inputs.
         if kind != KIND_REF and (stop - pos) % esize and stop == end:
-            out.append((pos, stop, 1, KIND_BYTES, -1))
+            out.append((pos, stop, 1, KIND_BYTES, -1, -1, KIND_BYTES))
         else:
             out.append((pos, stop, esize, kind,
-                        src + (pos - start) if src >= 0 else -1))
+                        src + (pos - start) if src >= 0 else -1, btype, ikind))
         pos = stop
     return out

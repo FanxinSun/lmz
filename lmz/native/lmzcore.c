@@ -197,7 +197,30 @@ LMZ_API const char *lmz_isa(void)
 #endif
 }
 
-LMZ_API int lmz_abi_version(void) { return 6; }
+LMZ_API int lmz_abi_version(void) { return 9; }
+
+/*
+ * out = a ^ b, the whole of a delta chunk's arithmetic.
+ *
+ * A training run rewrites every weight each checkpoint but moves each one very
+ * little, so nothing dedups while the XOR against the previous checkpoint is
+ * almost all zero bytes -- which the plane split and rANS then code for
+ * nearly nothing. Word-at-a-time is enough here; the loop is memory bound and
+ * the compiler vectorises it.
+ */
+LMZ_API int lmz_xor(const uint8_t *a, const uint8_t *b, size_t n, uint8_t *out)
+{
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t x, y;
+        memcpy(&x, a + i, 8);
+        memcpy(&y, b + i, 8);
+        x ^= y;
+        memcpy(out + i, &x, 8);
+    }
+    for (; i < n; i++) out[i] = (uint8_t)(a[i] ^ b[i]);
+    return 0;
+}
 
 /* ------------------------------------------------------- recursive split */
 
@@ -422,12 +445,14 @@ LMZ_API int lmz_merge_bf16(const uint8_t *pa, const uint8_t *pb, uint8_t *dst,
  * block-quantised types: a Q8_0 block is 34 bytes -- a 2-byte fp16 scale
  * and 32 int8 quants -- and coding scale bytes and quant bytes in one
  * alphabet was measured to waste 2% of the payload on real weights.
+ * The k-quants go wider: a Q6_K block is 210 bytes, which is where the
+ * period ceiling comes from.
  *
  * One sequential read against `period` write cursors; the cursor array
  * lives in L1 and the loop runs at memory speed for the periods used here.
  */
 
-#define LMZ_MAX_PERIOD 64
+#define LMZ_MAX_PERIOD 256
 
 LMZ_API int lmz_split_stride(const uint8_t *src, uint8_t *out,
                              size_t nblocks, size_t period)
@@ -526,6 +551,100 @@ LMZ_API int lmz_bucket_unpartition(const uint8_t *ctx,
     const uint8_t *cur[LMZ_MAX_BUCKETS];
     for (size_t b = 0; b < k; b++) cur[b] = streams[b];
     for (size_t i = 0; i < n; i++) val_out[i] = *cur[lut[ctx[i]]]++;
+    return 0;
+}
+
+/* ------------------------------------------------- k-quant sub-block work */
+
+/*
+ * A Q4_K super-block holds 256 weights in eight sub-blocks, each with its own
+ * 6-bit scale and 6-bit min; the quant a sub-block stores is `d*q - m`. So a
+ * nibble's distribution depends on which sub-block it belongs to, and the
+ * sub-block's parameters are decoded before its quants -- a context that
+ * costs nothing to transmit. Conditioning on it was measured at 9.7 bits per
+ * block on real Llama Q4_K weights, against 0.02 bits for every context that
+ * can be built inside a Q8_0 block.
+ *
+ * Two obstacles, one per function below. The sub-block parameters are packed
+ * six bits at a time across twelve bytes, four of each straddling a byte
+ * boundary; and the quants themselves interleave two sub-blocks per byte, so
+ * a byte-plane split leaves every byte holding two different alphabets.
+ */
+
+/*
+ * ggml's get_scale_min_k4, applied plane-wise across a whole chunk. `sp` is
+ * twelve planes of `nblocks` bytes; `sc` and `mn` receive eight each.
+ *
+ * Only ever used to derive a context. The twelve bytes are still coded as
+ * their own field, so an unpacking that disagreed with ggml would cost ratio
+ * and could not cost correctness.
+ */
+LMZ_API int lmz_k4_scales(const uint8_t *sp, size_t nblocks,
+                          uint8_t *sc, uint8_t *mn)
+{
+    for (size_t j = 0; j < 4; j++) {
+        const uint8_t *a = sp + j * nblocks;
+        const uint8_t *b = sp + (j + 4) * nblocks;
+        uint8_t *ds = sc + j * nblocks;
+        uint8_t *dm = mn + j * nblocks;
+        for (size_t i = 0; i < nblocks; i++) {
+            ds[i] = a[i] & 63;
+            dm[i] = b[i] & 63;
+        }
+    }
+    for (size_t j = 4; j < 8; j++) {
+        const uint8_t *lo = sp + (j + 4) * nblocks;
+        const uint8_t *hs = sp + (j - 4) * nblocks;
+        const uint8_t *hm = sp + j * nblocks;
+        uint8_t *ds = sc + j * nblocks;
+        uint8_t *dm = mn + j * nblocks;
+        for (size_t i = 0; i < nblocks; i++) {
+            ds[i] = (uint8_t)((lo[i] & 0x0F) | ((hs[i] >> 6) << 4));
+            dm[i] = (uint8_t)((lo[i] >> 4) | ((hm[i] >> 6) << 4));
+        }
+    }
+    return 0;
+}
+
+/*
+ * Regroup 128 quant planes so each output plane belongs to one sub-block.
+ *
+ * ggml stores sub-block 2g in the low nibbles of quant bytes [32g, 32g+32)
+ * and sub-block 2g+1 in their high nibbles. Pairing two nibbles of the *same*
+ * sub-block back into a byte keeps one symbol per two quants -- so the coder
+ * still runs at byte rate over a 256-entry table -- while giving every byte a
+ * single context. Adjacent quants measured independent, so the pairing costs
+ * nothing: 979.53 bits per block packed against 979.90 coded as loose
+ * nibbles, and the packed form needs half the symbols.
+ */
+LMZ_API int lmz_k4_pack(const uint8_t *q, size_t nblocks, uint8_t *packed)
+{
+    for (size_t s = 0; s < 8; s++) {
+        const size_t g = s >> 1, sh = (s & 1) ? 4 : 0;
+        for (size_t i = 0; i < 16; i++) {
+            const uint8_t *a = q + (32 * g + 2 * i) * nblocks;
+            const uint8_t *b = q + (32 * g + 2 * i + 1) * nblocks;
+            uint8_t *d = packed + (16 * s + i) * nblocks;
+            for (size_t n = 0; n < nblocks; n++)
+                d[n] = (uint8_t)(((a[n] >> sh) & 0x0F)
+                                 | (((b[n] >> sh) & 0x0F) << 4));
+        }
+    }
+    return 0;
+}
+
+/* Inverse of lmz_k4_pack. */
+LMZ_API int lmz_k4_unpack(const uint8_t *packed, size_t nblocks, uint8_t *q)
+{
+    for (size_t c = 0; c < 128; c++) {
+        const size_t g = c >> 5, t = c & 31, sh = 4 * (t & 1);
+        const uint8_t *lo = packed + (16 * (2 * g) + (t >> 1)) * nblocks;
+        const uint8_t *hi = packed + (16 * (2 * g + 1) + (t >> 1)) * nblocks;
+        uint8_t *d = q + c * nblocks;
+        for (size_t n = 0; n < nblocks; n++)
+            d[n] = (uint8_t)(((lo[n] >> sh) & 0x0F)
+                             | (((hi[n] >> sh) & 0x0F) << 4));
+    }
     return 0;
 }
 

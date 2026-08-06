@@ -22,10 +22,10 @@ from dataclasses import dataclass, field
 
 from . import codec as _codec
 from . import entropy, kernels
-from .format import (CODEC_REF, ArchiveReader, ArchiveWriter, CorruptArchive,
-                     FormatError, Member)
+from .format import (CODEC_DELTA, CODEC_REF, ArchiveReader, ArchiveWriter,
+                     CorruptArchive, FormatError, Member)
 from .parallel import default_workers, ordered_map, unordered_map
-from .planner import KIND_REF, chunkify, probe
+from .planner import KIND_DELTA, KIND_REF, chunkify, probe
 
 DEFAULT_CHUNK_SIZE = 8 << 20
 DEFAULT_LEVEL = 1
@@ -33,6 +33,20 @@ DEFAULT_LEVEL = 1
 # Tensors below this size are not worth deduplicating: the bookkeeping and
 # hashing outweigh a few kilobytes of norm weights.
 DEDUP_MIN_TENSOR = 64 << 10
+
+# Delta coding: a tensor that is merely *close* to one in an earlier member.
+# A training run rewrites every weight each checkpoint and moves each a
+# little, so nothing dedups while the XOR is nearly all zeros -- measured at
+# 69.2% against 56.3% for coding the checkpoint alone, with not one tensor
+# byte-identical. The floor matches dedup's, because the candidates that
+# matter are not always large: a real Adam state saves two moments per
+# parameter as separate ~91 KB storages, and one of the two is where the whole
+# win lives. The sample is large enough that a block-quantised candidate still
+# clears BLOCK_MIN_BLOCKS and so is judged by the coder that would really run
+# on it.
+DELTA_MIN_TENSOR = DEDUP_MIN_TENSOR
+DELTA_SAMPLE = 1 << 20
+DELTA_MIN_GAIN = 0.05  # the difference must beat coding alone by this much
 
 # Files that are not model weights but belong with them; kept so a compressed
 # model directory round-trips into something directly usable.
@@ -292,9 +306,105 @@ def _find_duplicate_tensors(paths: list[str], members: list[Member],
     return refs, saved
 
 
+def _find_delta_candidates(paths, members, layouts, refs, workers, level):
+    """Tensors that are close to one in an earlier member, but not identical.
+
+    Matched by name, dtype and size -- which is exactly what a checkpoint
+    series or a fine-tune of a known base produces -- then decided by encoding
+    a sample both ways. That costs two encodes per candidate and settles the
+    question with the coder that will actually run, so a pair that has drifted
+    too far declines on its own rather than on a rule of thumb.
+
+    Sources are always the earliest member holding the tensor, so a delta
+    never points at another delta and resolving one stays a single hop.
+    Returns ({member index: [(start, end, source output offset)]}, bytes covered).
+    """
+    taken = {}
+    for idx, items in (refs or {}).items():
+        taken[idx] = {(s, e) for s, e, _src in items}
+
+    groups: dict = {}
+    region_at: list = []
+    for idx, layout in enumerate(layouts):
+        at = {}
+        if layout is not None:
+            for r in layout.regions:
+                at[r.start] = r
+            for name, meta in (layout.tensors or {}).items():
+                s, e = meta["offsets"]
+                if e - s < DELTA_MIN_TENSOR or (s, e) in taken.get(idx, ()):
+                    continue
+                groups.setdefault((name, meta.get("dtype", ""), e - s), []) \
+                    .append((idx, s, e))
+        region_at.append(at)
+
+    work = []
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        group.sort()
+        pidx, ps, _pe = group[0]
+        for idx, s, e in group[1:]:
+            r = region_at[idx].get(s)
+            if r is None or r.start != s or r.end != e:
+                continue  # only whole, singly-owned regions
+            work.append((pidx, ps, idx, s, e, r))
+    if not work:
+        return {}, 0
+
+    pool = _FdPool(paths, os.O_RDONLY)
+    try:
+        def decide(item):
+            pidx, ps, idx, s, e, r = item
+            n = e - s
+            take = min(DELTA_SAMPLE, n)
+            take -= take % max(r.esize, 1)
+            if take <= 0:
+                return None
+            off = ((n - take) // 2 // max(r.esize, 1)) * max(r.esize, 1)
+            a = os.pread(pool.get(pidx), take, ps + off)
+            b = os.pread(pool.get(idx), take, s + off)
+            if len(a) != take or len(b) != take or a == b:
+                return None  # identical samples are dedup's job, not this one
+            diff = bytes(kernels.xor_bytes(b, a))
+
+            def coded(buf):
+                parts = _codec.encode_chunk(buf, r.esize, level, False,
+                                            kind=r.kind, btype=r.btype)[0]
+                return sum(len(p) for p in parts)
+
+            if coded(diff) < coded(b) * (1 - DELTA_MIN_GAIN):
+                return idx, s, e, members[pidx].dst + ps
+            return None
+
+        deltas: dict[int, list] = {}
+        covered = 0
+        for got in unordered_map(decide, work, workers):
+            if got is None:
+                continue
+            idx, s, e, src = got
+            deltas.setdefault(idx, []).append((s, e, src))
+            covered += e - s
+    finally:
+        pool.close()
+    for items in deltas.values():
+        items.sort()
+    return deltas, covered
+
+
+def _locate_output(members, off: int):
+    """Which member an output offset falls in, and where inside its file."""
+    starts = [m.dst for m in members]
+    i = bisect_right(starts, off) - 1
+    if i < 0 or off >= members[i].dst + members[i].size:
+        raise ValueError(f"output offset {off} falls in no member")
+    return i, off - members[i].dst
+
+
 def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
              workers: int | None = None, chunk_size: int = DEFAULT_CHUNK_SIZE,
-             checksum: bool = True, dedup: bool = True, progress=None) -> Stats:
+             checksum: bool = True, dedup: bool = True, delta: bool = True,
+             progress=None) -> Stats:
     """Compress a file or directory into the archive at `dst`."""
     workers = workers or default_workers()
     chunk_size = max(chunk_size, 1 << 16)
@@ -333,11 +443,20 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
         refs_by_member, dedup_bytes = _find_duplicate_tensors(
             paths, members, layouts, workers)
 
-    plan: list[tuple] = []  # member, start, end, esize, kind, src
+    # Deltas come after dedup so a tensor that is byte-identical becomes a ref,
+    # which costs eight bytes, rather than a difference of all zeros.
+    deltas_by_member: dict[int, list] = {}
+    delta_bytes = 0
+    if delta and len(members) > 1:
+        deltas_by_member, delta_bytes = _find_delta_candidates(
+            paths, members, layouts, refs_by_member, workers, level)
+
+    plan: list[tuple] = []  # member, start, end, esize, kind, src, btype, ikind
     for idx, layout in enumerate(layouts):
-        for start, end, esize, kind, ref_src in chunkify(
-                layout, sizes[idx], chunk_size, refs=refs_by_member.get(idx)):
-            plan.append((idx, start, end, esize, kind, ref_src))
+        for task in chunkify(layout, sizes[idx], chunk_size,
+                             refs=refs_by_member.get(idx),
+                             deltas=deltas_by_member.get(idx)):
+            plan.append((idx,) + task)
 
     manifest = {
         "version": 1,
@@ -351,14 +470,17 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
     }
     if dedup_bytes:
         manifest["dedup_bytes"] = dedup_bytes
+    if delta_bytes:
+        manifest["delta_bytes"] = delta_bytes
 
     pool = _FdPool(paths, os.O_RDONLY)
     done = 0
     stats = Stats(input_bytes=total_in, files=len(members), chunks=len(plan),
-                  detail={"dedup_bytes": dedup_bytes})
+                  detail={"dedup_bytes": dedup_bytes,
+                          "delta_bytes": delta_bytes})
 
     def work(task):
-        idx, start, end, esize, kind, ref_src = task
+        idx, start, end, esize, kind, ref_src, btype, ikind = task
         if kind == KIND_REF:
             # The bytes equal an earlier output range; nothing is read and
             # nothing needs a checksum of its own -- the source chunks carry
@@ -368,8 +490,18 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
         data = os.pread(pool.get(idx), end - start, start)
         if len(data) != end - start:
             raise IOError(f"short read on {members[idx].path} at {start}")
+        if kind == KIND_DELTA:
+            midx, moff = _locate_output(members, ref_src)
+            base = os.pread(pool.get(midx), end - start, moff)
+            if len(base) != end - start:
+                raise IOError(f"short read on {members[midx].path} at {moff}")
+            parts, flags, crc = _codec.encode_delta(
+                data, base, esize, level, checksum, kind=ikind, btype=btype,
+                src=ref_src)
+            return (members[idx].dst + start, end - start, parts, CODEC_DELTA,
+                    esize, flags, crc)
         parts, cid, flags, crc = _codec.encode_chunk(data, esize, level, checksum,
-                                                     kind=kind)
+                                                     kind=kind, btype=btype)
         return members[idx].dst + start, end - start, parts, cid, esize, flags, crc
 
     tmp = dst + ".part"
@@ -401,39 +533,61 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
 # ---------------------------------------------------------------- decompress
 
 
-def _ref_resolver(chunks, payload_of, verify_checksums: bool):
-    """A function that materialises the bytes behind one ref chunk.
+def _range_resolver(chunks, payload_of, verify_checksums: bool):
+    """A function that materialises the bytes at any earlier output range.
 
     Source chunks are decoded straight from the archive rather than read back
     from the output, so resolution never depends on another chunk having been
-    written first and decompression stays a bag of independent jobs.
+    written first and decompression stays a bag of independent jobs. A source
+    may not itself be a ref or a delta, which keeps resolution a single hop
+    instead of a chain of unknown depth.
     """
     ordered = sorted(chunks, key=lambda c: c.dst)
     starts = [c.dst for c in ordered]
 
-    def resolve(payload, rlen: int) -> bytearray:
-        if len(payload) != 8:
-            raise CorruptArchive("ref chunk payload must be 8 bytes")
-        (ref_src,) = struct.unpack("<Q", bytes(payload))
+    def resolve(src: int, rlen: int) -> bytearray:
         out = bytearray(rlen)
-        pos, end = ref_src, ref_src + rlen
+        pos, end = src, src + rlen
         i = bisect_right(starts, pos) - 1
         while pos < end:
             c = ordered[i] if 0 <= i < len(ordered) else None
             if c is None or not (c.dst <= pos < c.dst + c.rlen):
-                raise CorruptArchive(f"ref target at byte {pos} is not covered")
-            if c.codec == CODEC_REF:
-                raise CorruptArchive("a ref chunk points at another ref")
+                raise CorruptArchive(f"source at byte {pos} is not covered")
+            if c.codec in (CODEC_REF, CODEC_DELTA):
+                raise CorruptArchive(
+                    "a ref or delta chunk points at another one")
             data = _codec.decode_chunk(payload_of(c), c.codec, c.esize, c.flags,
                                        c.rlen, c.crc, verify_checksums)
             a = pos - c.dst
             b = min(end - c.dst, c.rlen)
-            out[pos - ref_src:pos - ref_src + (b - a)] = data[a:b]
+            out[pos - src:pos - src + (b - a)] = data[a:b]
             pos = c.dst + b
             i += 1
         return out
 
     return resolve
+
+
+def _chunk_decoder(chunks, payload_of, verify_checksums: bool):
+    """Decode any chunk, resolving ref and delta sources as needed."""
+    resolve = _range_resolver(chunks, payload_of, verify_checksums)
+
+    def decode(chunk, payload, out=None):
+        if chunk.codec == CODEC_REF:
+            if len(payload) != 8:
+                raise CorruptArchive("ref chunk payload must be 8 bytes")
+            (src,) = struct.unpack("<Q", bytes(payload))
+            return resolve(src, chunk.rlen)
+        if chunk.codec == CODEC_DELTA:
+            src, _inner, _off = _codec.delta_source(payload)
+            return _codec.decode_delta(payload, chunk.esize, chunk.flags,
+                                       chunk.rlen, resolve(src, chunk.rlen),
+                                       chunk.crc, verify_checksums)
+        return _codec.decode_chunk(payload, chunk.codec, chunk.esize,
+                                   chunk.flags, chunk.rlen, chunk.crc,
+                                   verify_checksums, out=out)
+
+    return decode
 
 
 def decompress(src: str, dst: str, *, workers: int | None = None,
@@ -487,16 +641,11 @@ def decompress(src: str, dst: str, *, workers: int | None = None,
             raise FormatError("archive is truncated")
         return payload
 
-    resolve_ref = _ref_resolver(chunks, payload_of, verify_checksums)
+    decode = _chunk_decoder(chunks, payload_of, verify_checksums)
 
     def work(chunk):
         payload = payload_of(chunk)
-        if chunk.codec == CODEC_REF:
-            data = resolve_ref(payload, chunk.rlen)
-        else:
-            data = _codec.decode_chunk(payload, chunk.codec, chunk.esize,
-                                       chunk.flags, chunk.rlen, chunk.crc,
-                                       verify_checksums, out=_scratch(chunk.rlen))
+        data = decode(chunk, payload, out=_scratch(chunk.rlen))
         i = bisect_right(starts, chunk.dst) - 1
         if i < 0 or chunk.dst + chunk.rlen > members[i].dst + members[i].size:
             raise FormatError(f"chunk at {chunk.dst} does not fit any member")
@@ -559,32 +708,46 @@ def verify(src: str, *, workers: int | None = None, progress=None) -> Stats:
     ordered = sorted(chunks, key=lambda c: c.dst)
     ordered_starts = [c.dst for c in ordered]
 
-    def check_ref(chunk, payload):
-        """A ref is sound if its whole target lies on non-ref chunks.
+    def check_source(src: int, rlen: int, what: str):
+        """The whole source range must lie on plain chunks.
 
         Those sources are each decoded and checksummed by their own turn in
         this same pass, so decoding them again here would only repeat work.
         """
-        if len(payload) != 8:
-            raise CorruptArchive("ref chunk payload must be 8 bytes")
-        (ref_src,) = struct.unpack("<Q", bytes(payload))
-        pos, end = ref_src, ref_src + chunk.rlen
+        pos, end = src, src + rlen
         i = bisect_right(ordered_starts, pos) - 1
         while pos < end:
             c = ordered[i] if 0 <= i < len(ordered) else None
             if c is None or not (c.dst <= pos < c.dst + c.rlen):
-                raise CorruptArchive(f"ref target at byte {pos} is not covered")
-            if c.codec == CODEC_REF:
-                raise CorruptArchive("a ref chunk points at another ref")
+                raise CorruptArchive(f"{what} at byte {pos} is not covered")
+            if c.codec in (CODEC_REF, CODEC_DELTA):
+                raise CorruptArchive("a ref or delta chunk points at another one")
             pos = c.dst + min(end - c.dst, c.rlen)
             i += 1
 
-    def work(chunk):
-        payload = os.pread(pool.get(0), chunk.clen, chunk.off)
-        if len(payload) != chunk.clen:
+    def payload_of(c):
+        payload = os.pread(pool.get(0), c.clen, c.off)
+        if len(payload) != c.clen:
             raise FormatError("archive is truncated")
+        return payload
+
+    resolve = _range_resolver(chunks, payload_of, True)
+
+    def work(chunk):
+        payload = payload_of(chunk)
         if chunk.codec == CODEC_REF:
-            check_ref(chunk, payload)
+            if len(payload) != 8:
+                raise CorruptArchive("ref chunk payload must be 8 bytes")
+            (src,) = struct.unpack("<Q", bytes(payload))
+            check_source(src, chunk.rlen, "ref target")
+        elif chunk.codec == CODEC_DELTA:
+            # A delta carries real data, so it is decoded and checksummed in
+            # full -- unlike a ref, nothing else in this pass would catch a
+            # damaged difference.
+            src, _inner, _off = _codec.delta_source(payload)
+            check_source(src, chunk.rlen, "delta source")
+            _codec.decode_delta(payload, chunk.esize, chunk.flags, chunk.rlen,
+                                resolve(src, chunk.rlen), chunk.crc, True)
         else:
             _codec.decode_chunk(payload, chunk.codec, chunk.esize, chunk.flags,
                                 chunk.rlen, chunk.crc, True, out=_scratch(chunk.rlen))
@@ -613,7 +776,8 @@ def info(src: str) -> dict:
         by_codec: dict[str, list[int]] = {}
         for c in reader.chunks:
             name = {0: "stored", 1: "entropy", 2: "split", 3: "bf16-split",
-                    4: "ref", 5: "bf16-cond", 6: "q8-block"}.get(c.codec, "?")
+                    4: "ref", 5: "bf16-cond", 6: "q8-block",
+                    7: "blk-split", 8: "delta"}.get(c.codec, "?")
             slot = by_codec.setdefault(name, [0, 0, 0])
             slot[0] += 1
             slot[1] += c.rlen
@@ -659,7 +823,7 @@ def read_tensor(src: str, name: str, member: str | None = None) -> tuple[str, li
                 raise FormatError("archive is truncated")
             return payload
 
-        resolve_ref = _ref_resolver(reader.chunks, payload_of, True)
+        decode = _chunk_decoder(reader.chunks, payload_of, True)
         starts = [c.dst for c in reader.chunks]
         i = max(0, bisect_right(starts, lo) - 1)
         out = bytearray()
@@ -668,12 +832,7 @@ def read_tensor(src: str, name: str, member: str | None = None) -> tuple[str, li
                 break
             if c.dst + c.rlen <= lo:
                 continue
-            payload = payload_of(c)
-            if c.codec == CODEC_REF:
-                data = resolve_ref(payload, c.rlen)
-            else:
-                data = _codec.decode_chunk(payload, c.codec, c.esize, c.flags,
-                                           c.rlen, c.crc, True)
+            data = decode(c, payload_of(c))
             a = max(lo, c.dst) - c.dst
             b = min(hi, c.dst + c.rlen) - c.dst
             out += data[a:b]

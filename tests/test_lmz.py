@@ -120,26 +120,46 @@ def write_torch_bin(path: str, storages: list[tuple[str, str, bytes]]) -> None:
             zf.writestr(f"archive/data/{key}", raw)
 
 
-def q80_blocks(nblocks: int, seed: int = 1) -> bytes:
-    """Synthetic Q8_0 blocks: clustered fp16 scales, gaussian-ish int8 quants.
+def quant_blocks(ttype: int, nblocks: int, seed: int = 1) -> bytes:
+    """Synthetic GGUF blocks carrying the structure the block codec looks for.
 
-    The scale-low byte depends on the scale-high byte and the quants use a
-    narrowed alphabet, mirroring the structure of real quantised weights that
-    the block codec exists to exploit.
+    Each field is filled according to its role in the layout: a 2-byte field
+    is an fp16 scale (few exponent values, with the low byte partly determined
+    by the high byte), a wide field is quants on a narrowed gaussian-ish
+    alphabet, and the narrow fields in between are packed sub-scales. That is
+    the shape real quantised weights have, and it exercises all three group
+    modes -- conditioned pair, per-position and concatenated.
     """
+    period, groups = planner.BLOCK_LAYOUTS[ttype]
     out = bytearray()
     x = seed | 1
-    for _ in range(nblocks):
+
+    def nxt() -> int:
+        nonlocal x
         x = (x * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
-        hi = 0x24 | ((x >> 5) & 0x3)
-        lo = ((x >> 8) & 0x3F) | ((hi & 1) << 6)
-        out.append(lo)
-        out.append(hi)
-        for _ in range(32):
-            x = (x * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
-            q = (((x >> 0) & 0xFF) + ((x >> 8) & 0xFF)
-                 + ((x >> 16) & 0xFF) + ((x >> 24) & 0xFF)) >> 2
-            out.append(q & 0xFF)
+        return x
+
+    for _ in range(nblocks):
+        for _start, width in groups:
+            if width == 2:
+                v = nxt()
+                hi = 0x20 | ((v >> 5) & 0x1F)   # 32 exponent values
+                # Two bits shared with the top of the exponent, which is what
+                # equal-mass bucketing of the high byte can actually see.
+                out.append(((v >> 16) & 0x3F) | (((hi >> 2) & 0x3) << 6))
+                out.append(hi)
+            elif width >= 32:
+                for _ in range(width):
+                    v = nxt()
+                    out.append(((v & 0xFF) + ((v >> 8) & 0xFF) + ((v >> 16) & 0xFF)
+                                + ((v >> 24) & 0xFF)) >> 2 & 0xFF)
+            else:
+                # Packed sub-scales: each byte position packs a different mix
+                # of fields, so the alphabets differ by position the way a
+                # k-quant's 6-bit scale array does.
+                for j in range(width):
+                    out.append((nxt() >> 11) & (0x3F >> (j & 0x3)))
+    assert len(out) == nblocks * period
     return bytes(out)
 
 
@@ -419,10 +439,10 @@ def test_safetensors_layout():
         assert sizes == {2, 4}, sizes
         chunks = planner.chunkify(layout, os.path.getsize(path), 1 << 20)
         assert chunks[0][0] == 0 and chunks[-1][1] == os.path.getsize(path)
-        for start, end, _, _, _ in chunks:
+        for start, end, *_rest in chunks:
             assert end > start
         # BF16 regions must be tagged so the codec can split on field bounds.
-        kinds = {k for _, _, _, k, _ in chunks}
+        kinds = {c[3] for c in chunks}
         assert planner.KIND_BF16 in kinds, kinds
 
 
@@ -810,6 +830,107 @@ def test_bf16_conditional_detects_corruption():
             pass
 
 
+def nudged_bf16(raw: bytes, seed: int, rate: int = 3) -> bytes:
+    """The same weights after a little more training.
+
+    Most values move by a step or two in the low mantissa bits and a few not
+    at all, which is what a checkpoint 1000 steps later actually looks like:
+    nothing dedups, but the XOR is almost all zeros.
+    """
+    out = bytearray(raw)
+    x = seed | 1
+    for i in range(0, len(out) - 1, 2):
+        x = (x * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
+        v = x >> 33
+        if v % rate:
+            out[i] ^= (v >> 8) & 0x07  # low mantissa bits only
+    return bytes(out)
+
+
+def test_delta_against_an_earlier_file():
+    """A near-copy must be coded as a difference, and come back exactly."""
+    base = weights_bf16(700000, 31)
+    moved = nudged_bf16(base, 5)
+    assert moved != base
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "run")
+        os.makedirs(src)
+        # Same tensor names in both, which is what a checkpoint series gives.
+        for name, blob in (("ckpt-1.safetensors", base),
+                           ("ckpt-2.safetensors", moved)):
+            write_safetensors(os.path.join(src, name),
+                              [("layer.0.weight", "BF16", [700000], blob)])
+        plain = os.path.join(d, "plain.lmz")
+        delta = os.path.join(d, "delta.lmz")
+        lmz.compress(src, plain, delta=False)
+        stats = lmz.compress(src, delta)
+
+        assert stats.detail["delta_bytes"] == len(base), stats.detail
+        assert "delta" in lmz.info(delta)["codecs"], lmz.info(delta)["codecs"]
+        assert "delta" not in lmz.info(plain)["codecs"]
+        assert os.path.getsize(delta) < os.path.getsize(plain) * 0.8, (
+            os.path.getsize(delta), os.path.getsize(plain))
+
+        out = os.path.join(d, "restored")
+        lmz.decompress(delta, out)
+        for name in ("ckpt-1.safetensors", "ckpt-2.safetensors"):
+            assert digest(os.path.join(src, name)) == digest(os.path.join(out, name))
+        lmz.verify(delta)
+
+        # Extraction has to resolve the source range too.
+        _dt, _sh, raw = lmz.read_tensor(delta, "layer.0.weight",
+                                        member="ckpt-2.safetensors")
+        assert raw == moved
+
+
+def test_delta_declines_when_the_files_differ():
+    """Unrelated tensors must not be coded as differences from each other."""
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "run")
+        os.makedirs(src)
+        for i, seed in enumerate((41, 43)):
+            write_safetensors(os.path.join(src, f"m{i}.safetensors"),
+                              [("layer.0.weight", "BF16", [700000],
+                                weights_bf16(700000, seed))])
+        arc = os.path.join(d, "a.lmz")
+        stats = lmz.compress(src, arc)
+        assert stats.detail["delta_bytes"] == 0, stats.detail
+        assert "delta" not in lmz.info(arc)["codecs"]
+
+
+def test_delta_corruption_rejected():
+    """A damaged delta must be rejected, never returned as wrong bytes."""
+    base = weights_bf16(700000, 31)
+    moved = nudged_bf16(base, 5)
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "run")
+        os.makedirs(src)
+        for name, blob in (("a.safetensors", base), ("b.safetensors", moved)):
+            write_safetensors(os.path.join(src, name),
+                              [("layer.0.weight", "BF16", [700000], blob)])
+        arc = os.path.join(d, "a.lmz")
+        lmz.compress(src, arc)
+        with open(arc, "rb") as fh:
+            reader = ArchiveReader(fh)
+            target = next(c for c in reader.chunks
+                          if c.codec == lmzformat.CODEC_DELTA)
+
+        # A source offset pointing at the delta's own output is circular.
+        for off, val in ((0, struct.pack("<Q", target.dst)),
+                         (0, struct.pack("<Q", 1 << 62)),
+                         (8, b"\xff")):
+            blob = bytearray(open(arc, "rb").read())
+            blob[target.off + off:target.off + off + len(val)] = val
+            bad = os.path.join(d, "bad.lmz")
+            with open(bad, "wb") as fh:
+                fh.write(blob)
+            try:
+                lmz.verify(bad)
+            except (FormatError, ValueError):
+                continue
+            raise AssertionError(f"damage at delta byte {off} was accepted")
+
+
 def test_dedup_across_files():
     """A tensor shipped twice under different names must be stored once."""
     shared = weights_bf16(150000, 21)
@@ -950,7 +1071,7 @@ def test_pytorch_bin_layout_and_roundtrip():
 
 def test_stride_kernels():
     """The strided split must equal slicing and merge must undo it."""
-    for period in (1, 2, 17, 34, 64):
+    for period in (1, 2, 17, 34, 64, 144, 210, 256):
         for nblocks in (0, 1, 7, 100, 4097):
             src = rand(nblocks * period, nblocks + period)
             planes = kernels.split_stride(src, period)
@@ -959,7 +1080,7 @@ def test_stride_kernels():
             streams = [(bytes(planes), k * nblocks) for k in range(period)]
             back = kernels.merge_stride(streams, nblocks, period)
             assert bytes(back) == src, f"merge period={period} n={nblocks}"
-    for bad in (0, 65):
+    for bad in (0, 257):
         try:
             kernels.split_stride(b"\0" * 130 * max(bad, 1), bad)
             raise AssertionError(f"period {bad} should be rejected")
@@ -987,27 +1108,329 @@ def test_stride_fallback_matches_native():
     assert merge_hex == src.hex()[:64]
 
 
-def test_q80_block_codec_roundtrip():
-    """Q8_0 chunks must choose the block codec and restore exactly."""
+def test_block_layouts_tile_their_blocks():
+    """Every GGUF field layout must cover its block exactly, once."""
+    for ttype, (period, groups) in planner.BLOCK_LAYOUTS.items():
+        name, _blk, per_blk, _es = planner.GGML_TYPES[ttype]
+        assert period == per_blk, f"{name}: layout says {period}, table says {per_blk}"
+        assert period <= kernels.MAX_PERIOD, f"{name}: period {period} exceeds kernel"
+        pos = 0
+        for start, width in groups:
+            assert start == pos and width > 0, f"{name}: field at {start} leaves a gap"
+            pos += width
+        assert pos == period, f"{name}: fields cover {pos} of {period} bytes"
+
+
+def test_block_codec_roundtrip():
+    """Every block quantisation must choose the block codec and restore exactly."""
     if not kernels.have_rans():
         return
-    data = q80_blocks(codec.Q80_MIN_BLOCKS, 3)
-    parts, cid, flags, crc = codec.encode_chunk(data, 34, 1, True,
-                                                kind=planner.KIND_Q80)
-    assert cid == lmzformat.CODEC_BLK, f"expected block codec, got {cid}"
-    payload = b"".join(bytes(p) for p in parts)
-    assert len(payload) < len(data) * 0.95, "block codec should win clearly"
-    got = codec.decode_chunk(payload, cid, 34, flags, len(data), crc, True)
-    assert bytes(got) == data
+    for ttype in (8, 10, 11, 12, 13, 14, 23):  # Q8_0, Q2_K..Q6_K, IQ4_XS
+        period = planner.BLOCK_LAYOUTS[ttype][0]
+        name = planner.GGML_TYPES[ttype][0]
+        data = quant_blocks(ttype, codec.BLOCK_MIN_BLOCKS * 4, ttype)
+        parts, cid, flags, crc = codec.encode_chunk(data, period, 1, True,
+                                                    kind=planner.KIND_BLOCK,
+                                                    btype=ttype)
+        assert cid == lmzformat.CODEC_GBLK, f"{name}: got codec {cid}"
+        payload = b"".join(bytes(p) for p in parts)
+        assert len(payload) < len(data) * 0.95, f"{name}: block codec should win"
+        got = codec.decode_chunk(payload, cid, period, flags, len(data), crc, True)
+        assert bytes(got) == data, f"{name}: round-trip differs"
 
-    for offset in (3, codec._q80_hdr.size + 4, len(payload) - 4):
+        # Damage must never pass as good data. It may be rejected, or it may
+        # land on a byte no decoder ever consults -- an interleaved rANS stream
+        # ends with a refill whose value cannot reach a symbol. What must not
+        # happen is a clean return of the wrong bytes.
+        head = codec._gblk_hdr.size + len(planner.BLOCK_LAYOUTS[ttype][1]) * 4
+        for offset in [1, 3, head, head + 7] + [
+                len(payload) * k // 11 for k in range(1, 11)]:
+            damaged = bytearray(payload)
+            damaged[offset] ^= 0xFF
+            try:
+                got = codec.decode_chunk(bytes(damaged), cid, period, flags,
+                                         len(data), crc, True)
+            except FormatError:
+                continue
+            assert bytes(got) == data, (
+                f"{name}: damage at {offset} decoded to wrong bytes silently")
+
+
+def test_block_codec_uses_every_group_mode():
+    """The three field modes are chosen by measurement, so all must be reachable."""
+    if not kernels.have_rans():
+        return
+    seen = set()
+    for ttype in (8, 12, 14):
+        period, groups = planner.BLOCK_LAYOUTS[ttype]
+        data = quant_blocks(ttype, codec.BLOCK_MIN_BLOCKS * 8, ttype)
+        parts, cid, _flags, _crc = codec.encode_chunk(data, period, 1, True,
+                                                      kind=planner.KIND_BLOCK,
+                                                      btype=ttype)
+        assert cid == lmzformat.CODEC_GBLK
+        payload = b"".join(bytes(p) for p in parts)
+        pos = codec._gblk_hdr.size
+        for _ in groups:
+            _start, _width, mode = codec._gblk_grp.unpack_from(payload, pos)
+            pos += codec._gblk_grp.size
+            seen.add(mode)
+    assert seen == {codec.GRP_CONCAT, codec.GRP_PLANES, codec.GRP_COND}, seen
+
+
+def test_block_codec_declines_on_noise():
+    """Blocks with no structure must fall through to plain storage, not the split."""
+    if not kernels.have_rans():
+        return
+    period = planner.BLOCK_LAYOUTS[12][0]
+    data = rand(period * codec.BLOCK_MIN_BLOCKS * 2, 99)
+    parts, cid, flags, crc = codec.encode_chunk(data, period, 1, True,
+                                                kind=planner.KIND_BLOCK, btype=12)
+    assert cid != lmzformat.CODEC_GBLK, "noise must not pay for a block split"
+    payload = b"".join(bytes(p) for p in parts)
+    assert bytes(codec.decode_chunk(payload, cid, period, flags, len(data),
+                                    crc, True)) == data
+
+
+def _k4_quant(v: int, scale: int) -> int:
+    """A 4-bit quant whose spread follows its own sub-block's scale."""
+    span = 1 + scale * 7 // 63
+    return max(0, min(15, 8 + (v % (2 * span + 1)) - span))
+
+
+def k4_blocks(nblocks: int, ttype: int = 12, seed: int = 5) -> bytes:
+    """k-quant super-blocks whose quants really depend on their sub-block.
+
+    Built the way ggml builds them: eight 6-bit scales and eight 6-bit mins
+    packed by get_scale_min_k4's own straddling bit layout, and quants
+    interleaved two sub-blocks to a byte. A sub-block with a small scale holds
+    a narrower alphabet, which is the structure the sub-block mode collects
+    and which no byte-plane split can see.
+    """
+    period, groups = planner.BLOCK_LAYOUTS[ttype]
+    qstart = next(s for s, w in groups if w == 128)
+    x = seed | 1
+
+    def nxt() -> int:
+        nonlocal x
+        x = (x * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
+        return x >> 11
+
+    out = bytearray()
+    for _ in range(nblocks):
+        blk = bytearray(period)
+        for off in (0, 2):  # d, dmin: an fp16 with a narrow exponent range
+            blk[off] = nxt() & 0xFF
+            blk[off + 1] = 0x20 | (nxt() & 0x0F)
+
+        sc = [nxt() % 64 for _ in range(8)]
+        mn = [nxt() % 64 for _ in range(8)]
+        s = bytearray(12)
+        for j in range(4):
+            s[j] = sc[j]
+            s[j + 4] = mn[j]
+        for j in range(4, 8):
+            s[j + 4] = (sc[j] & 0x0F) | ((mn[j] & 0x0F) << 4)
+            s[j - 4] |= ((sc[j] >> 4) & 0x3) << 6
+            s[j] |= ((mn[j] >> 4) & 0x3) << 6
+        blk[4:16] = s
+
+        for i in range(16, qstart):  # Q5_K's qh sits between scales and quants
+            blk[i] = nxt() & 0xFF
+        for g in range(4):
+            for t in range(32):
+                blk[qstart + 32 * g + t] = (_k4_quant(nxt(), sc[2 * g])
+                                            | (_k4_quant(nxt(), sc[2 * g + 1]) << 4))
+        out += blk
+    assert len(out) == nblocks * period
+    return bytes(out)
+
+
+def block_modes(payload: bytes):
+    """Parse a block payload's field table: {start: (width, mode, sub)}."""
+    _period, ngroups = codec._gblk_hdr.unpack_from(payload, 0)
+    pos = codec._gblk_hdr.size
+    out = {}
+    for _ in range(ngroups):
+        start, width, mode = codec._gblk_grp.unpack_from(payload, pos)
+        pos += codec._gblk_grp.size
+        sub = None
+        if mode == codec.GRP_SUB:
+            sub = codec._gblk_sub.unpack_from(payload, pos)
+            pos += codec._gblk_sub.size
+        out[start] = (width, mode, sub, pos)
+    return out
+
+
+def encode_block_chunk(data, ttype, subctx=True):
+    period = planner.BLOCK_LAYOUTS[ttype][0]
+    saved = codec.SUBBLOCK_CTX
+    if not subctx:
+        codec.SUBBLOCK_CTX = {}
+    try:
+        parts, cid, flags, crc = codec.encode_chunk(
+            data, period, 1, True, kind=planner.KIND_BLOCK, btype=ttype)
+    finally:
+        codec.SUBBLOCK_CTX = saved
+    return b"".join(bytes(p) for p in parts), cid, flags, crc
+
+
+_K4_KERNEL_PROBE = (
+    "from lmz import kernels;"
+    "out=[]\n"
+    "for nb in (0,1,3,37,260):\n"
+    "    sp=bytes((i*37+nb)%256 for i in range(12*nb));"
+    "q=bytes((i*89+nb*5)%256 for i in range(128*nb));"
+    "sc,mn=kernels.k4_scales(sp,nb);"
+    "pk=kernels.k4_pack(q,nb);\n"
+    "    assert bytes(kernels.k4_unpack(pk,nb))==q, 'pack is not invertible'\n"
+    "    out.append((bytes(sc)+bytes(mn)+bytes(pk)).hex())\n"
+    "print(':'.join(out))"
+)
+
+
+def test_k4_kernels_agree_and_reverse():
+    """The sub-block kernels must agree across backends and undo themselves."""
+    script = ("import os,sys;os.environ['LMZ_NO_NATIVE']='1';"
+              "sys.path.insert(0,%r);"
+              "from lmz import kernels as _k;"
+              "assert not _k.backend().startswith('native');" % ROOT
+              ) + _K4_KERNEL_PROBE
+    out = subprocess.run([sys.executable, "-c", script], capture_output=True,
+                         text=True, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
+
+    native = subprocess.run(
+        [sys.executable, "-c", "import sys;sys.path.insert(0,%r);" % ROOT
+         + _K4_KERNEL_PROBE],
+        capture_output=True, text=True, cwd=ROOT)
+    assert native.returncode == 0, native.stderr
+    assert out.stdout == native.stdout, "k4 kernel backends disagree"
+
+    # and the unpacking must be ggml's get_scale_min_k4, value for value
+    nb = 64
+    planes = [bytes(((i * 37 + j * 11) & 0xFF) for i in range(nb)) for j in range(12)]
+    sc, mn = kernels.k4_scales(b"".join(planes), nb)
+    for i in range(nb):
+        q = [planes[j][i] for j in range(12)]
+        for j in range(8):
+            if j < 4:
+                d, m = q[j] & 63, q[j + 4] & 63
+            else:
+                d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4)
+                m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4)
+            assert sc[j * nb + i] == d and mn[j * nb + i] == m, "not get_scale_min_k4"
+
+
+def test_subblock_mode_is_chosen_and_reverses():
+    """Quants that depend on their sub-block take the sub mode, and come back."""
+    if not kernels.have_rans():
+        return
+    for ttype in sorted(planner.SUBBLOCK_CTX):
+        name = planner.GGML_TYPES[ttype][0]
+        period = planner.BLOCK_LAYOUTS[ttype][0]
+        qstart = planner.SUBBLOCK_CTX[ttype][0]
+        data = k4_blocks(codec.BLOCK_MIN_BLOCKS * 4, ttype, ttype)
+
+        payload, cid, flags, crc = encode_block_chunk(data, ttype)
+        assert cid == lmzformat.CODEC_GBLK, f"{name}: got codec {cid}"
+        modes = block_modes(payload)
+        assert modes[qstart][1] == codec.GRP_SUB, f"{name}: quants took another mode"
+        got = codec.decode_chunk(payload, cid, period, flags, len(data), crc, True)
+        assert bytes(got) == data, f"{name}: round-trip differs"
+
+        # and it must be chosen because it wins, not merely because it is offered
+        plain, _c, _f, _r = encode_block_chunk(data, ttype, subctx=False)
+        assert len(payload) < len(plain), (
+            f"{name}: sub mode cost {len(payload)} against {len(plain)}")
+
+
+def test_subblock_mode_spans_a_gap_before_the_quants():
+    """A context field need not sit immediately before the field it conditions.
+
+    Q5_K puts qh between its scales and its quants. It is not registered --
+    on real weights it gains 0.000 points, because qs holds only the low four
+    bits of a five-bit quant -- but the payload describes whatever layout it
+    used, so the path has to work and is exercised here.
+    """
+    if not kernels.have_rans():
+        return
+    ttype, qstart = 13, 48
+    period = planner.BLOCK_LAYOUTS[ttype][0]
+    data = k4_blocks(codec.BLOCK_MIN_BLOCKS * 4, ttype, ttype)
+    saved = codec.SUBBLOCK_CTX
+    codec.SUBBLOCK_CTX = {ttype: (qstart, 4, planner.SUB_K4)}
+    try:
+        payload, cid, flags, crc = encode_block_chunk(data, ttype)
+    finally:
+        codec.SUBBLOCK_CTX = saved
+    assert block_modes(payload)[qstart][1] == codec.GRP_SUB
+    got = codec.decode_chunk(payload, cid, period, flags, len(data), crc, True)
+    assert bytes(got) == data, "Q5_K layout round-trip differs"
+
+
+def test_subblock_mode_declines_without_structure():
+    """Quants unrelated to their sub-block must not pay for the extra tables."""
+    if not kernels.have_rans():
+        return
+    for ttype in sorted(planner.SUBBLOCK_CTX):
+        qstart = planner.SUBBLOCK_CTX[ttype][0]
+        data = quant_blocks(ttype, codec.BLOCK_MIN_BLOCKS * 4, ttype)
+        payload, cid, _flags, _crc = encode_block_chunk(data, ttype)
+        if cid != lmzformat.CODEC_GBLK:
+            continue
+        assert block_modes(payload)[qstart][1] != codec.GRP_SUB, (
+            f"{planner.GGML_TYPES[ttype][0]}: sub mode taken with nothing to gain")
+
+
+def test_subblock_descriptor_is_validated():
+    """A damaged sub-block descriptor must be rejected, never acted on."""
+    if not kernels.have_rans():
+        return
+    ttype, period = 12, planner.BLOCK_LAYOUTS[12][0]
+    qstart = planner.SUBBLOCK_CTX[ttype][0]
+    data = k4_blocks(codec.BLOCK_MIN_BLOCKS * 4, ttype, ttype)
+    payload, cid, flags, crc = encode_block_chunk(data, ttype)
+    end = block_modes(payload)[qstart][3]
+    off = end - codec._gblk_sub.size
+    good = codec._gblk_sub.unpack_from(payload, off)
+
+    # ctx_start past the quants would let a field read lanes it has not decoded
+    for field, value in ((0, qstart), (0, 200), (1, 11), (2, 7), (3, 1),
+                         (4, 0), (5, 0), (4, 31), (5, 31)):
+        bad = list(good)
+        bad[field] = value
         damaged = bytearray(payload)
-        damaged[offset] ^= 0xFF
+        damaged[off:off + codec._gblk_sub.size] = codec._gblk_sub.pack(*bad)
         try:
-            codec.decode_chunk(bytes(damaged), cid, 34, flags, len(data), crc, True)
-            raise AssertionError(f"corruption at offset {offset} went undetected")
+            got = codec.decode_chunk(bytes(damaged), cid, period, flags,
+                                     len(data), crc, True)
         except FormatError:
-            pass
+            continue
+        assert bytes(got) == data, (
+            f"field {field}={value} decoded to wrong bytes silently")
+
+
+def test_kquant_gguf_file_roundtrip():
+    """A Q4_K GGUF must be block-coded through the whole pipeline."""
+    if not kernels.have_rans():
+        return
+    nblocks = 40000
+    raw = quant_blocks(12, nblocks, 7)
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "m.gguf")
+        write_gguf(path, [("blk.0.w", 12, [256 * nblocks], raw)])
+        with open(path, "rb") as fh:
+            layout = planner.probe(fh, os.path.getsize(path))
+        region = next(r for r in layout.regions if r.kind == planner.KIND_BLOCK)
+        assert region.esize == 144 and region.btype == 12
+
+        archive = os.path.join(d, "a.lmz")
+        stats = lmz.compress(path, archive, chunk_size=2 << 20)
+        assert "blk-split" in lmz.info(archive)["codecs"]
+        out = os.path.join(d, "o.gguf")
+        lmz.decompress(archive, out)
+        assert digest(out) == digest(path)
+        assert stats.saved > 0.05, f"only saved {stats.saved:.2%}"
 
 
 def test_q80_gguf_file_roundtrip():
@@ -1015,22 +1438,42 @@ def test_q80_gguf_file_roundtrip():
     if not kernels.have_rans():
         return
     nblocks = 150000
-    raw = q80_blocks(nblocks, 7)
+    raw = quant_blocks(8, nblocks, 7)
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "m.gguf")
         write_gguf(path, [("blk.0.w", 8, [32 * nblocks], raw)])
         with open(path, "rb") as fh:
             layout = planner.probe(fh, os.path.getsize(path))
-        region = next(r for r in layout.regions if r.kind == planner.KIND_Q80)
-        assert region.esize == 34
+        region = next(r for r in layout.regions if r.kind == planner.KIND_BLOCK)
+        assert region.esize == 34 and region.btype == 8
 
         archive = os.path.join(d, "a.lmz")
         stats = lmz.compress(path, archive, chunk_size=2 << 20)
-        assert "q8-block" in lmz.info(archive)["codecs"]
+        assert "blk-split" in lmz.info(archive)["codecs"]
         out = os.path.join(d, "o.gguf")
         lmz.decompress(archive, out)
         assert digest(out) == digest(path)
         assert stats.saved > 0.05, f"only saved {stats.saved:.2%}"
+
+
+def test_v3_q8_block_chunks_still_decode():
+    """v3 wrote a Q8_0-only block payload; this build must still read it.
+
+    Built here with every plane stored rather than entropy coded, which
+    exercises the v3 header and plane order without needing the v3 encoder.
+    """
+    nblocks = 300
+    data = quant_blocks(8, nblocks, 5)
+    planes = bytes(kernels.split_stride(data, 34))
+    lo, hi, quants = (planes[:nblocks], planes[nblocks:2 * nblocks],
+                      planes[2 * nblocks:])
+    stored = entropy.METHOD_STORED
+    header = codec._q80_hdr.pack(0, stored, stored, *([stored] * 7), stored,
+                                 nblocks, nblocks, *([0] * 7), len(quants))
+    payload = header + hi + lo + quants
+    got = codec.decode_chunk(payload, lmzformat.CODEC_BLK, 34, 0, len(data), 0,
+                             False)
+    assert bytes(got) == data
 
 
 def test_v1_archives_still_read():

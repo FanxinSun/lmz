@@ -19,9 +19,11 @@ import zlib
 from math import log2
 
 from . import entropy, kernels
-from .format import (CODEC_BF16, CODEC_BF16C, CODEC_BLK, CODEC_SPLIT,
-                     CODEC_STORED, CODEC_ZSTD, CorruptArchive)
-from .planner import KIND_BF16, KIND_BYTES, KIND_Q80
+from .format import (CODEC_BF16, CODEC_BF16C, CODEC_BLK, CODEC_DELTA,
+                     CODEC_GBLK, CODEC_REF, CODEC_SPLIT, CODEC_STORED,
+                     CODEC_ZSTD, CorruptArchive)
+from .planner import (BLOCK_LAYOUTS, KIND_BF16, KIND_BLOCK, KIND_BYTES,
+                      SUB_K4, SUBBLOCK_CTX)
 
 # Above this many bits per byte a stream is genuinely noise and is stored.
 # The threshold sits this close to 8 because rANS can profitably code a
@@ -48,11 +50,132 @@ _bf16c_hdr = struct.Struct(f"<BB{COND_BUCKETS}BI{COND_BUCKETS}I")
 
 # A GGUF Q8_0 block: 2-byte fp16 scale then 32 int8 quants. Coding scale
 # bytes and quant bytes in one alphabet was measured to waste 2% of the
-# payload; below ~32k blocks the per-stream tables eat the gain.
+# payload. v3 archives hold this shape and no other; the generalised block
+# codec below writes everything now.
 Q80_PERIOD = 34
-Q80_MIN_BLOCKS = 1 << 15
 
 _q80_hdr = struct.Struct(f"<BB{COND_BUCKETS}BBI{COND_BUCKETS}II")
+
+# Generalised block split. A quantised GGUF block is a struct of fields, and
+# each field is judged separately:
+#
+#   GRP_CONCAT  one stream for the whole field. A 128-byte quant array is one
+#               alphabet repeated, so one table beats 128 near-identical ones.
+#   GRP_PLANES  one stream per byte position. The two halves of an fp16 scale,
+#               or the twelve bytes of Q4_K's packed 6-bit sub-scales, hold
+#               genuinely different alphabets -- measured 15.6% recoverable
+#               split by position against 10.9% merged.
+#   GRP_COND    a 2-byte field is an fp16: code the high byte plain and the low
+#               byte per high-byte bucket, the same conditioning the Q8_0 scale
+#               already used. Worth another 0.19% of a Q4_K file.
+#
+# The choice is made per field from exact histograms and written into the
+# payload, so no per-quantisation tuning is compiled in and a GGUF type this
+# build has never seen still decodes on any other build.
+#   GRP_SUB     a k-quant's quants, coded per sub-block class. See below.
+GRP_CONCAT = 0
+GRP_PLANES = 1
+GRP_COND = 2
+GRP_SUB = 3
+
+# Sub-block conditioning for k-quants.
+#
+# A Q4_K super-block is eight sub-blocks, each with its own 6-bit scale and
+# 6-bit min, storing `d*q - m`. A quant's alphabet therefore depends on which
+# sub-block produced it, and both parameters sit earlier in the block, so the
+# decoder holds them before it needs them. Two things stand in the way and
+# both are undone in the kernel: the parameters are packed six bits at a time
+# with four of each straddling a byte boundary, and ggml interleaves two
+# sub-blocks per quant byte, so every byte plane mixes two alphabets.
+#
+# Four scale classes by four min classes was measured best on real Llama Q4_K
+# weights once the frequency tables are paid for. The min carries most of it:
+# at a fixed sixteen streams, splitting the min four ways and the scale four
+# ways beats splitting the scale sixteen ways and ignoring the min by half a
+# point of the whole file.
+#
+#   quants, one shared table (v4)     989.28 bits/block
+#   conditioned, 16 streams           979.53 bits/block   -> +0.74% of the file
+#
+# Finer contexts model better and lose anyway: eight by eight reaches 977.86
+# bits but needs 64 tables, which costs more than the extra 1.7 bits returns.
+SUB_KS = 4
+SUB_KM = 4
+SUB_BUCKETS = SUB_KS * SUB_KM
+
+# Below this the per-stream frequency tables cost more than the split saves.
+# The estimator declines on its own well before here; this only avoids doing
+# the arithmetic on tiny chunks.
+BLOCK_MIN_BLOCKS = 1 << 12
+
+_gblk_hdr = struct.Struct("<HB")   # block period, field count
+_gblk_grp = struct.Struct("<HHB")  # start, width, mode
+_gblk_str = struct.Struct("<BI")   # method, payload length
+# Follows a GRP_SUB group only: where its context field is, how the block
+# divides, and how finely each parameter is bucketed. Written out so the
+# payload stays self-describing -- a decoder needs no ggml type table.
+_gblk_sub = struct.Struct("<HHBBBB")  # ctx start, ctx width, nsub, kind, ks, km
+
+_lut_cache: dict[int, bytes] = {}
+
+
+def _ident_lut(k: int) -> bytes:
+    """Bucket map for a context plane that already holds bucket indices."""
+    lut = _lut_cache.get(k)
+    if lut is None:
+        lut = _lut_cache[k] = bytes(min(i, k - 1) for i in range(256))
+    return lut
+
+
+def _sub_classes(ctx_planes, nblocks: int, ks: int, km: int) -> bytes:
+    """One context class per (sub-block, block), from the packed parameters.
+
+    Returns 8 planes of `nblocks` bytes, each value in [0, ks*km). Every input
+    is a decoded byte and both bucket maps are pure functions of their
+    histograms, so the decoder rebuilds this exactly and none of it is stored.
+    """
+    sc, mn = kernels.k4_scales(ctx_planes, nblocks)
+    lut_s = kernels.bucket_lut(kernels.histogram(sc), ks)
+    lut_m = kernels.bucket_lut(kernels.histogram(mn), km)
+    # Pre-scale the scale map by km so the two compose by addition, then add
+    # the planes as one big integer. Every byte sum is at most ks*km-1, so no
+    # carry ever crosses a byte and this stays an elementwise add at C speed.
+    a = bytes(sc).translate(bytes(min(x, ks - 1) * km for x in lut_s))
+    b = bytes(mn).translate(bytes(min(x, km - 1) for x in lut_m))
+    if not a:
+        return b""
+    return (int.from_bytes(a, "big") + int.from_bytes(b, "big")).to_bytes(
+        len(a), "big")
+
+
+def _sub_segments(mv, nblocks: int, start: int, width: int, sub):
+    """Deal a k-quant's quants into one segment per sub-block class.
+
+    Returns (segments, classes). Segment b concatenates, over sub-blocks in
+    order, every packed byte whose sub-block fell in class b -- so one
+    frequency table serves the whole field for that class.
+    """
+    ctx_start, ctx_width, nsub, _kind, ks, km = sub
+    k = ks * km
+    cls = _sub_classes(mv[ctx_start * nblocks:(ctx_start + ctx_width) * nblocks],
+                       nblocks, ks, km)
+    packed = kernels.k4_pack(mv[start * nblocks:(start + width) * nblocks],
+                             nblocks)
+    pmv = memoryview(packed)
+    lut = _ident_lut(k)
+    per = width // nsub
+    segs = [[] for _ in range(k)]
+    for s in range(nsub):
+        ctx = cls[s * nblocks:(s + 1) * nblocks] * per
+        part, counts = kernels.bucket_partition(
+            ctx, pmv[s * per * nblocks:(s + 1) * per * nblocks], lut, k)
+        part = memoryview(part)
+        pos = 0
+        for b in range(k):
+            if counts[b]:
+                segs[b].append(bytes(part[pos:pos + counts[b]]))
+                pos += counts[b]
+    return [b"".join(x) for x in segs], cls
 
 _hdr_cache: dict[int, struct.Struct] = {}
 
@@ -205,60 +328,309 @@ def _encode_bf16_cond(exp, sm, nelem: int, level: int, method: int):
     return [header, exp_payload] + parts, 0
 
 
-def _encode_q80(data, nblocks: int, level: int, method: int):
-    """Split Q8_0 blocks into scale planes and a quants plane, then code each.
+def _group_streams(width: int, mode: int, sub=None) -> int:
+    """How many streams a field contributes, from its width and mode alone."""
+    if mode == GRP_CONCAT:
+        return 1
+    if mode == GRP_PLANES:
+        return width
+    if mode == GRP_SUB:
+        return sub[4] * sub[5]
+    return 1 + COND_BUCKETS
 
-    The two scale bytes are the halves of one fp16, and they are correlated:
-    the low byte conditioned on the high byte's bucket was measured two bits
-    below its own entropy. The same exact-histogram comparison as the BF16
-    conditioner decides whether that conditioning pays; the quant bytes are a
-    single near-uniform alphabet either way. Returns (parts, flags) or None.
+
+def _choose_group(mv, nblocks: int, start: int, width: int, sub=None):
+    """Pick how one field is coded, from exact histograms of its planes.
+
+    Returns (mode, estimated bytes, conditioning work) where the last item is
+    the already-computed partition when GRP_COND wins, so the encode does not
+    repeat it.
     """
-    planes = kernels.split_stride(data, Q80_PERIOD)
-    mv = memoryview(planes)
-    lo, hi = mv[:nblocks], mv[nblocks:2 * nblocks]
-    quants = mv[2 * nblocks:]
+    hists = [kernels.histogram(mv[(start + j) * nblocks:(start + j + 1) * nblocks])
+             for j in range(width)]
+    est = _est_stream(nblocks * width, _hist_entropy(
+        [sum(h[s] for h in hists) for s in range(256)], nblocks * width))
+    mode, best = GRP_CONCAT, est + _gblk_str.size
 
-    hhist = kernels.histogram(hi)
-    lut = kernels.bucket_lut(hhist, COND_BUCKETS)
+    if width > 1:
+        est = sum(_est_stream(nblocks, _hist_entropy(h, nblocks)) for h in hists)
+        est += width * _gblk_str.size
+        if est < best:
+            mode, best = GRP_PLANES, est
+
+    if sub is not None:
+        # A k-quant's quants, coded per sub-block class. The partition is the
+        # expensive part and the encode needs it too, so it is handed back
+        # rather than recomputed.
+        segs, _cls = _sub_segments(mv, nblocks, start, width, sub)
+        est = sum(_est_stream(len(s), _hist_entropy(kernels.histogram(s), len(s)))
+                  for s in segs)
+        est += len(segs) * _gblk_str.size + _gblk_sub.size
+        # Demand a clear win so estimate noise cannot flip the choice.
+        if est + 512 < best:
+            return GRP_SUB, est, segs
+
+    if width != 2 or nblocks == 0:
+        return mode, best, None
+
+    # An fp16 field: the low byte is not independent of the high byte, which
+    # carries the exponent. Partitioning is O(nblocks) on two planes, cheap
+    # enough to measure rather than guess.
+    lo = mv[start * nblocks:(start + 1) * nblocks]
+    hi = mv[(start + 1) * nblocks:(start + 2) * nblocks]
+    lut = kernels.bucket_lut(hists[1], COND_BUCKETS)
     part, counts = kernels.bucket_partition(hi, lo, lut, COND_BUCKETS)
     pmv = memoryview(part)
-    est_cond = 0
+    est = _est_stream(nblocks, _hist_entropy(hists[1], nblocks))
     pos = 0
     for c in counts:
         if c:
-            est_cond += _est_stream(c, _hist_entropy(kernels.histogram(
+            est += _est_stream(c, _hist_entropy(kernels.histogram(
                 pmv[pos:pos + c]), c))
             pos += c
-    est_plain = _est_stream(nblocks, _hist_entropy(kernels.histogram(lo), nblocks))
+    est += (1 + COND_BUCKETS) * _gblk_str.size
+    # Demand a clear win so estimate noise cannot flip the choice.
+    if est + 512 < best:
+        return GRP_COND, est, (part, counts)
+    return mode, best, None
 
-    hi_used, hi_payload = _encode_stream(hi, level, method, plane=True)
-    lo_methods = [entropy.METHOD_STORED] * COND_BUCKETS
-    lo_lens = [0] * COND_BUCKETS
-    lo_parts = []
-    if est_cond + 512 < est_plain:
-        k = COND_BUCKETS
-        pos = 0
-        for b, c in enumerate(counts):
-            if c == 0:
-                continue
-            used, payload = _encode_stream(pmv[pos:pos + c], level, method,
-                                           plane=True)
-            lo_methods[b] = used
-            lo_lens[b] = len(payload)
-            lo_parts.append(payload)
-            pos += c
-    else:
-        k = 0
-        used, payload = _encode_stream(lo, level, method, plane=True)
-        lo_methods[0] = used
-        lo_lens[0] = len(payload)
-        lo_parts.append(payload)
-    q_used, q_payload = _encode_stream(quants, level, method, plane=True)
 
-    header = _q80_hdr.pack(k, hi_used, *lo_methods, q_used,
-                           len(hi_payload), *lo_lens, len(q_payload))
-    return [header, hi_payload] + lo_parts + [q_payload], 0
+def _encode_gblk(data, nblocks: int, period: int, groups, level: int, method: int,
+                 subctx=None):
+    """Split blocks on their field boundaries and code each field its own way.
+
+    Every field records its own mode and stream lengths in the payload, so the
+    decoder needs no table of GGUF layouts to reverse this. Returns
+    (parts, flags).
+    """
+    planes = kernels.split_stride(data, period)
+    mv = memoryview(planes)
+    descs = []
+    subs = {}
+    streams = []  # (method, payload) in the order the decoder reads them
+
+    for start, width in groups:
+        sub = subctx[1] if (subctx is not None and start == subctx[0]) else None
+        mode, _est, cond = _choose_group(mv, nblocks, start, width, sub)
+        descs.append((start, width, mode))
+        if mode == GRP_SUB:
+            subs[start] = sub
+            for seg in cond:
+                streams.append(_encode_stream(seg, level, method, plane=True))
+        elif mode == GRP_CONCAT:
+            streams.append(_encode_stream(
+                mv[start * nblocks:(start + width) * nblocks], level, method,
+                plane=True))
+        elif mode == GRP_PLANES:
+            for j in range(width):
+                streams.append(_encode_stream(
+                    mv[(start + j) * nblocks:(start + j + 1) * nblocks], level,
+                    method, plane=True))
+        else:
+            part, counts = cond
+            pmv = memoryview(part)
+            streams.append(_encode_stream(
+                mv[(start + 1) * nblocks:(start + 2) * nblocks], level, method,
+                plane=True))
+            pos = 0
+            for c in counts:
+                if c == 0:
+                    streams.append((entropy.METHOD_STORED, b""))
+                    continue
+                streams.append(_encode_stream(pmv[pos:pos + c], level, method,
+                                              plane=True))
+                pos += c
+
+    parts = [_gblk_hdr.pack(period, len(descs))]
+    for start, width, mode in descs:
+        parts.append(_gblk_grp.pack(start, width, mode))
+        if mode == GRP_SUB:
+            parts.append(_gblk_sub.pack(*subs[start]))
+    parts += [_gblk_str.pack(m, len(p)) for m, p in streams]
+    return [b"".join(parts)] + [p for _m, p in streams], 0
+
+
+def _check_sub(sub, start: int, width: int) -> None:
+    """Validate a sub-block descriptor read from the payload.
+
+    These bytes are not covered by the chunk record, so anything outside what
+    the one defined packing can mean is damage rather than a future format.
+    """
+    ctx_start, ctx_width, nsub, kind, ks, km = sub
+    if kind != SUB_K4:
+        raise CorruptArchive(f"block field names sub-block packing {kind}")
+    if (ctx_width != kernels.K4_SCALE_BYTES or nsub != kernels.K4_SUBBLOCKS
+            or width != kernels.K4_QUANT_BYTES):
+        raise CorruptArchive("sub-block conditioning has the wrong field sizes")
+    if ctx_start + ctx_width > start:
+        # The context has to be decoded before the field it conditions.
+        raise CorruptArchive("sub-block context does not precede its quants")
+    if not (1 <= ks <= 32 and 1 <= km <= 32 and ks * km <= 32):
+        raise CorruptArchive(f"sub-block conditioning declares {ks}x{km} classes")
+
+
+def _decode_sub(lanes, nblocks: int, start: int, width: int, sub, take, skip):
+    """Rebuild a k-quant's quant planes from its per-class streams.
+
+    The context field is already decoded, so its bucket maps and every
+    segment length follow from bytes both sides agree on; the payload carries
+    no map and no counts.
+    """
+    ctx_start, ctx_width, nsub, _kind, ks, km = sub
+    k = ks * km
+    per = width // nsub
+
+    gathered = bytearray(ctx_width * nblocks)
+    for j in range(ctx_width):
+        obj, off = lanes[ctx_start + j]
+        gathered[j * nblocks:(j + 1) * nblocks] = memoryview(obj)[off:off + nblocks]
+    cls = _sub_classes(gathered, nblocks, ks, km)
+
+    hists = [kernels.histogram(cls[s * nblocks:(s + 1) * nblocks])
+             for s in range(nsub)]
+    counts = [sum(h[b] for h in hists) * per for b in range(k)]
+
+    streams = []
+    for b in range(k):
+        if counts[b] == 0:
+            skip(f"sub-block class {b}")
+            streams.append([b"", 0])
+        else:
+            obj, off = take(counts[b], f"sub-block class {b}")
+            streams.append([obj, off])
+
+    lut = _ident_lut(k)
+    packed = bytearray(width * nblocks)
+    pv = memoryview(packed)
+    for s in range(nsub):
+        ctx = cls[s * nblocks:(s + 1) * nblocks] * per
+        kernels.bucket_unpartition(ctx, [tuple(x) for x in streams], lut, k,
+                                   pv[s * per * nblocks:(s + 1) * per * nblocks])
+        for b in range(k):
+            streams[b][1] += hists[s][b] * per
+    return kernels.k4_unpack(packed, nblocks)
+
+
+def _decode_gblk(payload, rlen: int, out=None):
+    """Decode a field-split block chunk back to interleaved blocks.
+
+    Everything needed is in the payload: the block period, where each field
+    starts, how it was coded, and how long each stream is. The fields must
+    tile the block exactly, which is the check that catches a damaged header
+    before any of it is used as a length.
+    """
+    if len(payload) < _gblk_hdr.size:
+        raise CorruptArchive("block chunk is truncated")
+    period, ngroups = _gblk_hdr.unpack_from(payload, 0)
+    if period == 0 or ngroups == 0 or rlen % period:
+        raise CorruptArchive(
+            f"block chunk declares a {period}-byte block for {rlen} bytes")
+    nblocks = rlen // period
+    pos = _gblk_hdr.size
+
+    descs = []
+    covered = 0
+    nstreams = 0
+    for _ in range(ngroups):
+        if pos + _gblk_grp.size > len(payload):
+            raise CorruptArchive("block chunk is truncated")
+        start, width, mode = _gblk_grp.unpack_from(payload, pos)
+        pos += _gblk_grp.size
+        if start != covered or width == 0 or start + width > period:
+            raise CorruptArchive("block fields do not tile the block")
+        if mode not in (GRP_CONCAT, GRP_PLANES, GRP_COND, GRP_SUB):
+            raise CorruptArchive(f"block field names mode {mode}")
+        if mode == GRP_COND and width != 2:
+            raise CorruptArchive("a conditioned block field must be 2 bytes")
+        sub = None
+        if mode == GRP_SUB:
+            if pos + _gblk_sub.size > len(payload):
+                raise CorruptArchive("block chunk is truncated")
+            sub = _gblk_sub.unpack_from(payload, pos)
+            pos += _gblk_sub.size
+            _check_sub(sub, start, width)
+        covered += width
+        nstreams += _group_streams(width, mode, sub)
+        descs.append((start, width, mode, sub))
+    if covered != period:
+        raise CorruptArchive("block fields do not tile the block")
+
+    if pos + nstreams * _gblk_str.size > len(payload):
+        raise CorruptArchive("block chunk is truncated")
+    sdesc = []
+    for _ in range(nstreams):
+        m, ln = _gblk_str.unpack_from(payload, pos)
+        pos += _gblk_str.size
+        if m not in entropy.METHOD_NAMES:
+            raise CorruptArchive(f"block chunk names method {m}")
+        sdesc.append((m, ln))
+
+    mv = memoryview(payload)
+    idx = 0
+
+    def take(want: int, what: str):
+        nonlocal pos, idx
+        m, ln = sdesc[idx]
+        idx += 1
+        if pos + ln > len(payload):
+            raise CorruptArchive("block chunk is truncated")
+        if m == entropy.METHOD_STORED:
+            if ln != want:
+                raise CorruptArchive(f"{what} holds {ln} bytes, expected {want}")
+            block = (payload, pos)
+        else:
+            data = _decode_stream(mv[pos:pos + ln], m, what, want)
+            if len(data) != want:
+                raise CorruptArchive(
+                    f"{what} decoded to {len(data)} bytes, expected {want}")
+            block = (data, 0)
+        pos += ln
+        return block
+
+    def skip(what: str):
+        """Consume the stream slot of a context class that holds no elements."""
+        nonlocal idx
+        if sdesc[idx][1]:
+            raise CorruptArchive(f"{what} should be empty but holds data")
+        idx += 1
+
+    lanes = [None] * period
+    for start, width, mode, sub in descs:
+        if mode == GRP_CONCAT:
+            obj, off = take(width * nblocks, f"block bytes {start}..{start + width}")
+            for j in range(width):
+                lanes[start + j] = (obj, off + j * nblocks)
+        elif mode == GRP_PLANES:
+            for j in range(width):
+                lanes[start + j] = take(nblocks, f"block byte {start + j}")
+        elif mode == GRP_SUB:
+            q = _decode_sub(lanes, nblocks, start, width, sub, take, skip)
+            for j in range(width):
+                lanes[start + j] = (q, j * nblocks)
+        else:
+            hi_obj, hi_off = take(nblocks, f"block byte {start + 1}")
+            hi = bytes(memoryview(hi_obj)[hi_off:hi_off + nblocks])
+            hhist = kernels.histogram(hi)
+            lut = kernels.bucket_lut(hhist, COND_BUCKETS)
+            counts = kernels.bucket_counts(hhist, lut, COND_BUCKETS)
+            segs = []
+            for b in range(COND_BUCKETS):
+                if counts[b] == 0:
+                    if sdesc[idx][1]:
+                        raise CorruptArchive(
+                            f"block bucket {b} should be empty but holds data")
+                    idx += 1
+                    segs.append((b"", 0))
+                else:
+                    segs.append(take(counts[b], f"block bucket {b}"))
+            lanes[start] = (kernels.bucket_unpartition(hi, segs, lut,
+                                                       COND_BUCKETS), 0)
+            lanes[start + 1] = (hi, 0)
+
+    if pos != len(payload):
+        raise CorruptArchive("block chunk carries trailing bytes")
+    buf = out if (out is not None and len(out) >= rlen) else bytearray(rlen)
+    return kernels.merge_stride(lanes, nblocks, period, buf)
 
 
 def _decode_q80(payload, nblocks: int, out=None):
@@ -337,7 +709,7 @@ def _decode_q80(payload, nblocks: int, out=None):
 
 
 def encode_chunk(data, esize: int, level: int = 1, checksum: bool = True,
-                 method: int = -1, kind: int = KIND_BYTES):
+                 method: int = -1, kind: int = KIND_BYTES, btype: int = -1):
     """Encode one chunk.
 
     Returns (payload, codec, flags, crc). `payload` may be a list of buffers,
@@ -348,15 +720,21 @@ def encode_chunk(data, esize: int, level: int = 1, checksum: bool = True,
     crc = zlib.crc32(data) & 0xFFFFFFFF if checksum else 0
     n = len(data)
 
-    if (kind == KIND_Q80 and esize == Q80_PERIOD and n % Q80_PERIOD == 0
-            and n // Q80_PERIOD >= Q80_MIN_BLOCKS and kernels.have_rans()):
-        blk = _encode_q80(data, n // Q80_PERIOD, level, method)
-        if blk is not None:
-            parts, flags = blk
-            if sum(len(p) for p in parts) + _min_gain(n) < n:
-                return parts, CODEC_BLK, flags, crc
-        # Otherwise fall through: 34 is not a splittable width, so the chunk
-        # takes the generic single-stream path exactly as it did before.
+    layout = BLOCK_LAYOUTS.get(btype) if kind == KIND_BLOCK else None
+    if (layout is not None and esize == layout[0] and n % esize == 0
+            and n // esize >= BLOCK_MIN_BLOCKS and kernels.have_rans()):
+        recipe = SUBBLOCK_CTX.get(btype)
+        subctx = None
+        if recipe is not None:
+            qstart, cstart, skind = recipe
+            subctx = (qstart, (cstart, kernels.K4_SCALE_BYTES,
+                               kernels.K4_SUBBLOCKS, skind, SUB_KS, SUB_KM))
+        parts, flags = _encode_gblk(data, n // esize, layout[0], layout[1],
+                                    level, method, subctx)
+        if sum(len(p) for p in parts) + _min_gain(n) < n:
+            return parts, CODEC_GBLK, flags, crc
+        # Otherwise fall through: a block period is not a splittable width, so
+        # the chunk takes the generic single-stream path.
 
     splittable = esize > 1 and n % esize == 0 and esize in kernels.SUPPORTED_ESIZES
     if kind == KIND_BF16 and esize == 2 and n % 2 == 0:
@@ -402,6 +780,53 @@ def encode_chunk(data, esize: int, level: int = 1, checksum: bool = True,
     if used == entropy.METHOD_STORED:
         return ([data], CODEC_STORED, 0, crc)
     return ([payload], CODEC_ZSTD, used & 0x3, crc)
+
+
+# A delta chunk: the output offset it builds on, then which codec was used on
+# the difference. The difference is coded by the ordinary path, so it gets the
+# plane split and the same per-plane adaptivity as anything else.
+_delta_hdr = struct.Struct("<QB")
+
+
+def encode_delta(data, base, esize: int, level: int = 1, checksum: bool = True,
+                 kind: int = KIND_BYTES, btype: int = -1, src: int = 0):
+    """Code a chunk as its difference from an earlier output range.
+
+    The checksum is of the original bytes, not the difference, so it verifies
+    the reconstruction rather than the intermediate. Returns (parts, flags,
+    crc); the codec id is always CODEC_DELTA.
+    """
+    crc = zlib.crc32(data) & 0xFFFFFFFF if checksum else 0
+    diff = kernels.xor_bytes(data, base)
+    parts, cid, flags, _ = encode_chunk(bytes(diff), esize, level, False,
+                                        kind=kind, btype=btype)
+    return [_delta_hdr.pack(src, cid)] + list(parts), flags, crc
+
+
+def delta_source(payload):
+    """Where a delta chunk's source range starts, and where its data does."""
+    if len(payload) < _delta_hdr.size:
+        raise CorruptArchive("delta chunk is truncated")
+    src, inner = _delta_hdr.unpack_from(payload, 0)
+    if inner in (CODEC_REF, CODEC_DELTA):
+        raise CorruptArchive(
+            f"delta chunk names codec {inner} for its own difference")
+    return src, inner, _delta_hdr.size
+
+
+def decode_delta(payload, esize: int, flags: int, rlen: int, base, crc: int = 0,
+                 verify: bool = True):
+    """Rebuild a delta chunk from its source bytes and its coded difference."""
+    _src, inner, off = delta_source(payload)
+    if len(base) != rlen:
+        raise CorruptArchive(
+            f"delta source resolved to {len(base)} bytes, expected {rlen}")
+    diff = decode_chunk(memoryview(payload)[off:], inner, esize, flags, rlen,
+                        0, False)
+    result = kernels.xor_bytes(base, diff)
+    if verify and crc and (zlib.crc32(result) & 0xFFFFFFFF) != crc:
+        raise CorruptArchive("chunk failed its checksum; the archive is corrupt")
+    return result
 
 
 def _decode_stream(raw, method: int, what: str, out_len: int | None = None):
@@ -513,6 +938,8 @@ def decode_chunk(payload, codec: int, esize: int, flags: int, rlen: int,
             raise ValueError(
                 f"a block chunk must be whole {Q80_PERIOD}-byte blocks")
         result = _decode_q80(payload, rlen // Q80_PERIOD, out)
+    elif codec == CODEC_GBLK:
+        result = _decode_gblk(payload, rlen, out)
     elif codec == CODEC_ZSTD:
         result = _decode_stream(payload, flags & 0x3, "chunk", rlen)
         if len(result) != rlen:
