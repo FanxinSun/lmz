@@ -589,7 +589,5 @@ measurements against uniform random floats would not.
 ## Buy me a coffee
 
 lmz is free and unfunded. If it saved you disk or bandwidth —
-[**☕ Buy me a coffee**](assets/alipay.jpg) (Alipay, 打开支付宝，扫一扫):
-
-<a href="assets/alipay.jpg"><img src="assets/alipay.jpg" alt="Buy me a coffee — Alipay" width="240"></a>
+[**☕ Buy me a coffee**](assets/alipay.jpg) (Alipay, 打开支付宝，扫一扫).
 
