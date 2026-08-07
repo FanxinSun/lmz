@@ -292,7 +292,8 @@ def cmd_mount(args) -> int:
 
     server = mount(args.point, _store(args), names=args.model or None,
                    threads=args.threads, allow_other=args.allow_other,
-                   cache_blocks=args.cache_blocks, verify=args.verify)
+                   cache_blocks=args.cache_blocks, verify=args.verify,
+                   readahead=args.readahead)
     if not server.fs.entries:
         print("lmz: the store is empty; add a model first with `lmz add`",
               file=sys.stderr)
@@ -326,18 +327,24 @@ def cmd_mount(args) -> int:
         for name in sorted(server.fs.entries):
             print(f"  {args.point.rstrip('/')}/{name}/")
         print("press ctrl-c to unmount")
+    s = {}
     try:
         server.serve()
     except KeyboardInterrupt:
         pass
     finally:
+        # Read before close(), which drops the readers the counters live on.
+        s = server.fs.stats()
         server.close()
         fuse.unmount(args.point)
     if not args.quiet and not args.daemon:
-        s = server.fs.stats()
         print(f"\nunmounted: {server.requests} requests, "
               f"{human(server.bytes_served)} served, "
-              f"{human(s['decoded_bytes'])} decoded")
+              f"{human(s['decoded_bytes'])} decoded in "
+              f"{s['blocks_decoded']} blocks, {s['cache_hits']} cache hits"
+              + (f", readahead {s['readahead_issued']} issued / "
+                 f"{s['readahead_skipped']} skipped"
+                 if 'readahead_issued' in s else ""))
     return 0
 
 
@@ -560,8 +567,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="detach and serve in the background")
     mo.add_argument("--allow-other", action="store_true",
                     help="let other users read the mount (needs user_allow_other)")
-    mo.add_argument("--cache-blocks", type=int, default=64, metavar="N",
-                    help="decoded blocks held per reader thread (default: 64)")
+    mo.add_argument("--cache-blocks", type=int, default=512, metavar="N",
+                    help="decoded blocks held per model (default: 512, 32MiB)")
+    mo.add_argument("--readahead", type=int, default=None, metavar="N",
+                    help="threads decoding ahead of a sequential reader "
+                         "(0 disables; default: 1 under the GIL, more without)")
     mo.add_argument("--verify", action="store_true",
                     help="check every block's crc32 as it is read")
     mo.add_argument("-j", "--threads", type=int, default=None, metavar="N",

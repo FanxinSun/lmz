@@ -1841,6 +1841,87 @@ def test_coalesced_payload_reads_match():
             assert arc.read(0, len(want)) == want
 
 
+def test_prefetch_does_not_change_what_is_read():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "m.safetensors")
+        write_safetensors(path, [("w", "BF16", [1 << 17], weights_bf16(1 << 17, 11))])
+        archive = os.path.join(d, "a.lmz")
+        lmz.compress(path, archive, mapped=True)
+        with open(path, "rb") as fh:
+            want = fh.read()
+        with lmz.MappedArchive(archive, cache_blocks=256) as arc:
+            assert arc.prefetch(0, len(want)) > 0
+            assert arc.prefetch(0, len(want)) == 0  # already cached, no work
+            assert arc.read(0, len(want)) == want
+            # Out of range and empty requests are no-ops, not errors.
+            assert arc.prefetch(arc.size, 4096) == 0
+            assert arc.prefetch(0, 0) == 0
+
+
+def test_mapped_archive_reads_concurrently():
+    """One reader shared by many threads, which is how the mount uses it."""
+    import threading as _threading
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "m.safetensors")
+        write_safetensors(path, [("w", "BF16", [1 << 18], weights_bf16(1 << 18, 13))])
+        archive = os.path.join(d, "a.lmz")
+        lmz.compress(path, archive, mapped=True)
+        with open(path, "rb") as fh:
+            want = fh.read()
+
+        # A cache far too small for the file, so blocks are constantly
+        # evicted and re-decoded and the claim path is actually exercised.
+        with lmz.MappedArchive(archive, cache_blocks=4, workers=1) as arc:
+            errors = []
+            step = len(want) // 8
+
+            def reader(k):
+                try:
+                    for _ in range(6):
+                        # Overlapping ranges, so threads collide on blocks.
+                        off = (k * step // 2) % max(1, len(want) - step)
+                        got = arc.read(off, step)
+                        if got != want[off:off + step]:
+                            errors.append(f"thread {k} mismatch at {off}")
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"thread {k}: {type(exc).__name__}: {exc}")
+
+            threads = [_threading.Thread(target=reader, args=(k,))
+                       for k in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=120)
+            assert not any(t.is_alive() for t in threads), "a reader deadlocked"
+            assert not errors, errors[:4]
+
+
+def test_readahead_predicts_only_sequential_streams():
+    from lmz.store import Readahead
+
+    seen = []
+
+    class FakeArchive:
+        def prefetch(self, offset, length):
+            seen.append((offset, length))
+            return 0
+
+    arc = FakeArchive()
+    ra = Readahead(1, window=1 << 20, slice=1 << 18)
+    key = ("m", 0)
+    ra.note(arc, key, 0, 1 << 16)          # first read: nothing predicted
+    assert ra.issued == 0
+    ra.note(arc, key, 1 << 16, 1 << 16)    # continues: predict ahead
+    first = ra.issued
+    assert first > 0
+    ra.note(arc, key, 1 << 17, 1 << 16)    # still sequential, but already
+    assert ra.issued == first, "the frontier must not re-queue served slices"
+    ra.note(arc, key, 99 << 20, 1 << 16)   # a seek resets the stream
+    assert ra.issued == first
+    ra.close()
+
+
 class Skip(Exception):
     """Raised by a test that cannot run in this environment."""
 
@@ -1957,6 +2038,27 @@ def test_mount_serves_only_the_named_models():
         point = os.path.join(d, "mnt")
         with MountedStore(root, point, "--model", "keep"):
             assert os.listdir(point) == ["keep"]
+
+
+def test_mount_readahead_serves_the_same_bytes():
+    """Speculation may only change timing, never a byte of what is served."""
+    from lmz.store import Store
+
+    with tempfile.TemporaryDirectory() as d:
+        src = sample_model(os.path.join(d, "src"))
+        root = os.path.join(d, "store")
+        Store(root).add(src, "demo")
+        want = digest(os.path.join(src, "model.safetensors"))
+        for flags in (("--readahead", "0"), ("--readahead", "4")):
+            point = os.path.join(d, "mnt" + flags[1])
+            with MountedStore(root, point, *flags):
+                served = os.path.join(point, "demo", "model.safetensors")
+                assert digest(served) == want, flags
+                with open(served, "rb") as fh:  # a seek must reset the stream
+                    fh.seek(4096)
+                    head = fh.read(1024)
+                    fh.seek(0)
+                    assert fh.read(4096 + 1024)[4096:] == head
 
 
 def test_mount_matches_a_full_decompression():

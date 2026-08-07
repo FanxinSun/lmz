@@ -611,26 +611,30 @@ the rest of the package follows.
 
 ### What it costs
 
-Measured on the 1.74 GiB BF16 model above, AMD Ryzen 7 9800X3D, Python 3.14.
+Measured on the 1.74 GiB BF16 model above, AMD Ryzen 7 9800X3D, reading
+through the mount by concurrent readers.
 
-| | MiB/s |
-|---|---|
-| lmz mount, one reader | 533 |
-| lmz mount, 4 concurrent readers | 677 |
-| lmz mount, page cache warm | 24135 |
-| plain file, one reader | 5846 |
-| plain file, warm | 35652 |
+| server | 1 reader | 2 | 4 | 16 |
+|---|---|---|---|---|
+| CPython 3.14 (GIL) | 602 | 689 | 694 | 813 |
+| **free-threaded 3.14t** | **1476** | **1478** | **2490** | **3000** |
+| plain uncompressed file | 5492 | 43571 | 47104 | 23624 |
+| lmz mount, page cache warm | 24135 | | | |
 
-**The mount is not faster than reading an uncompressed file on this
-machine, and the table says so.** Decoding runs at 533–677 MiB/s, and this
-NVMe delivers several times that. The same crossover the random-access
-reader already documents applies here: decoding beats phone flash, eMMC, an
-SD card and a network filesystem, and it loses to a fast local SSD. The
-`plain file` rows are also flattered — under WSL2 `posix_fadvise(DONTNEED)`
-does not reach the Windows host's own cache, so a genuinely cold read of that
-file would be slower than 5846 MiB/s.
+**The mount is still not faster than reading an uncompressed file on this
+machine, and the table says so.** But it is now 2.8x faster than it was for a
+lone sequential reader and 4.4x for concurrent ones, and 3.0 GB/s is past the
+point where storage is usually the thing you are waiting for. The crossover
+the random-access reader already documents still applies: decoding beats
+phone flash, eMMC, an SD card and a network filesystem, and it loses to a
+fast local SSD.
 
-What the mount does win is the part that is not a throughput number:
+The `plain file` row cannot be measured honestly here and should not be
+quoted: under WSL2 `posix_fadvise(DONTNEED)` does not reach the Windows
+host's own cache, and the same file measured 1843 and 5846 MiB/s on
+successive "cold" runs.
+
+What the mount wins outright is the part that is not a throughput number:
 
 | | ready to read | disk needed |
 |---|---|---|
@@ -643,29 +647,53 @@ which is where the 24 GB/s row comes from. Repeated loads — the normal case
 for a model you actually use — are served from that cache without decoding
 anything.
 
-### Threads
+### Where the speed came from
 
-Two, by default, and the measurement is emphatic:
+Three things, each of which had to be measured before it was believed.
 
-| server threads | 1 reader | 4 readers |
-|---|---|---|
-| 2 | 529 | **670** |
-| 4 | 516 | 349 |
-| 8 | 503 | 337 |
+**Free-threading is most of it.** The decode path is native work with a
+little Python between the calls, and it is that Python which serialises. On a
+free-threaded build the caps lift by themselves — `lmz` asks the interpreter
+rather than being told — and the same mount goes from 813 to 3000 MiB/s.
+Under the GIL the server is best at **two** threads, and the measurement is
+emphatic: two serve 670 MiB/s where four serve 349 and eight 337, the same
+inversion decompression already documents.
 
-This is the same inversion the decode path already documents. A 64 KiB block
-is a few microseconds of Python around its native decode, so a third server
-thread spends its time acquiring the GIL rather than decoding — and it is
-worse here than for plain decompression, because the server threads contend
-with the reader's threads as well as with each other. A free-threaded
-interpreter has no such point, so the cap lifts there automatically; lmz asks
-the interpreter rather than being told.
+**A single sequential reader cannot be helped by threads at all**, because
+the kernel will not ask for the next block until this one is answered. Worse,
+buffered reads arrive at 128 KiB however large the caller's read is: the
+readahead window is capped at `VM_MAX_READAHEAD`, and `process_init_reply`
+takes the *smaller* of that and whatever a filesystem asks for, so a mount can
+only lower it. A 1.74 GiB read is 14299 round trips no matter what.
 
-Sequential reading through one file descriptor does not benefit from any of
-this, because the kernel waits for each reply before asking for the next, so
-that path measures one decode's latency and nothing else. Concurrency only
-pays when the reader is concurrent — which mmap-based loaders and sharded
-checkpoints both are.
+So the mount predicts instead of waiting. A stream is recognised when a read
+begins where the last one ended, and the window beyond it is decoded on idle
+cores while the current reply is being written — 687 to 1476 MiB/s. Two
+details decide whether that works at all, and getting either wrong made it
+*slower* than no prefetch:
+
+- The window is cut into slices across the pool. One task decoding 4 MiB is
+  serial, so it finishes a window behind the reader it is meant to be ahead
+  of — measured 1.6x slower than not prefetching.
+- A block already being decoded is waited on, not decoded again. Without
+  that, the prefetch and the reader race for the same blocks and the
+  speculation costs exactly what it saves. With it, serving the whole model
+  decodes 28579 blocks where the file contains 28577.
+
+**Reading ahead is switched off when the server is busy.** Speculation is
+only free while cores are idle; with several readers already saturating the
+decoder it took 17% away. The mount reads ahead only while two or fewer
+requests are in flight, which is exactly the lone-reader case that was
+starved, and leaves concurrent readers alone.
+
+Bigger blocks were tried and rejected. They compress slightly better, but a
+1 MiB request straddles two 1 MiB blocks and decodes twice what it serves:
+
+| block | saved | 1 reader | 16 readers | 4 KiB read amplification |
+|---|---|---|---|---|
+| **64 KiB** | 32.02% | **519** | **2680** | 16x |
+| 256 KiB | 32.54% | 263 | 1898 | 64x |
+| 1 MiB | 32.66% | 92 | 750 | 256x |
 
 ## Command line
 
@@ -685,7 +713,7 @@ lmz add         <path>             --name N  -l LEVEL  -j N  -f   --store DIR
 lmz models                         --json                        --store DIR
 lmz rm          <name>                                           --store DIR
 lmz mount       <mountpoint>       --model N  -d  --allow-other  --store DIR
-                                   --cache-blocks N  --verify  -j N
+                                   --cache-blocks N  --verify  -j N  --readahead N
 lmz unmount     <mountpoint>
 ```
 
@@ -767,7 +795,20 @@ server.serve()                                   # blocks until unmounted
 
 `Store` takes `root`; `add` takes `name`, `level`, `workers`, `force`,
 `block_size` and `progress`; `mount` takes `store`, `names`, `threads`,
-`allow_other`, `cache_blocks` and `verify`.
+`allow_other`, `cache_blocks`, `verify` and `readahead` (0 disables it).
+
+`MappedArchive.prefetch(offset, length)` decodes a range into the cache and
+returns how many blocks it had to decode, which is what the mount's readahead
+is built on. A reader that knows where it is going next can use it directly:
+
+```python
+with lmz.MappedArchive("model.lmz", cache_blocks=256) as arc:
+    arc.prefetch(offset, 4 << 20)        # on another thread, ahead of the read
+    data = arc.read(offset, 1 << 20)     # now a cache hit
+```
+
+It is safe to call from any thread against a shared reader: a block already
+being decoded elsewhere is waited on rather than decoded twice.
 
 `compress` takes `level`, `workers`, `chunk_size`, `checksum`, `dedup`,
 `delta`, `mapped`, `align` and `progress`; `append` takes `level`, `workers`,
@@ -847,10 +888,16 @@ its destination directory.
 - **Decompressing to a file is I/O bound** on real storage. The gain there is
   that there are a third fewer bytes to move.
 - **The mount is slower than an uncompressed file on fast local storage.**
-  533–677 MiB/s of decoding against several GB/s of NVMe. It wins on the disk
-  it saves, on never expanding anything, and on repeat reads out of the page
-  cache — not on cold sequential throughput. Where the storage is slower than
-  the decoder, which is most on-device storage, it wins there too.
+  1.5–3.0 GB/s of decoding free-threaded, and 0.6–0.8 under the GIL, against
+  several GB/s of NVMe. It wins on the disk it saves, on never expanding
+  anything, and on repeat reads out of the page cache — not on cold
+  sequential throughput. Where the storage is slower than the decoder, which
+  is most on-device storage, it wins there too.
+- **Under the GIL the mount is roughly a quarter of its free-threaded speed**
+  (813 against 3000 MiB/s) and reading ahead is disabled, because a prefetch
+  thread can only take the interpreter lock away from the thread whose reply
+  the reader is waiting on. This is the one place where the interpreter build
+  changes what lmz can do rather than just how fast it does it.
 - **Mounting is Linux-only and needs `fuse3`.** `fusermount3` must be on PATH
   and `/dev/fuse` readable; `lmz doctor` reports whether it is. The store and
   its random-access reader work everywhere, mount or no mount. Serving mmap
@@ -875,7 +922,7 @@ its destination directory.
 python3 tests/test_lmz.py          # also runs under pytest
 ```
 
-72 tests covering kernel equivalence across all backends, element sizes and
+76 tests covering kernel equivalence across all backends, element sizes and
 block periods,
 rANS round-trips over adversarial distributions (including single-symbol
 streams, which exposed a frequency-field overflow), rANS landing within 2% of
@@ -906,7 +953,13 @@ growing an archive with `append` (matching a one-shot compression, refusing a
 name already present, leaving a rejected append's bytes untouched, and keeping
 a page-mapped archive page-mapped), single-member `extract`,
 that coalescing a run of block payloads into one read returns what reading
-them one at a time returns,
+them one at a time returns, that prefetching changes no byte of what is
+subsequently read and costs nothing when the blocks are already cached,
+that eight threads sharing one reader over deliberately overlapping ranges
+against a cache far too small never deadlock and never disagree with the
+original, that the readahead predicts only genuinely sequential streams and
+its frontier never re-queues a slice it has already asked for,
+that a mount serves identical bytes with readahead on and off,
 the store (add, list, remove, a refused overwrite leaving the first copy
 intact, name normalisation rejecting empty and traversing names, rebuilding a
 lost index from the archives, and reading a tensor out of a stored model),
