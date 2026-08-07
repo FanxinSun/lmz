@@ -141,15 +141,27 @@ def _zstd_decompress(data: bytes) -> bytes:
 class ArchiveWriter:
     """Streams chunk payloads out, then writes the table, manifest and footer."""
 
-    def __init__(self, fileobj, manifest: dict, flags: int = 0, align: int = 0):
+    def __init__(self, fileobj, manifest: dict, flags: int = 0, align: int = 0,
+                 resume_at: int | None = None, chunks: list | None = None):
+        """Start a new archive, or carry on writing an existing one.
+
+        `resume_at` is where the old chunk table began: everything from there
+        on -- table, manifest, footer -- is rebuilt, so appending costs the
+        tail of the file rather than the whole of it. The header is already
+        present in that case and is rewritten in place by close().
+        """
         self.f = fileobj
         self.manifest = manifest
-        self.chunks: list[Chunk] = []
-        self.offset = HEADER_SIZE
+        self.chunks: list[Chunk] = list(chunks or ())
         self.flags = flags
         self.align = align
         self.padding = 0
-        self.f.write(b"\0" * HEADER_SIZE)  # rewritten by close()
+        if resume_at is None:
+            self.offset = HEADER_SIZE
+            self.f.write(b"\0" * HEADER_SIZE)  # rewritten by close()
+        else:
+            self.offset = resume_at
+            self.f.seek(resume_at)
 
     def append(self, parts, dst: int, rlen: int, crc: int,
                codec: int, esize: int, flags: int) -> None:
@@ -187,6 +199,10 @@ class ArchiveWriter:
         self.offset += len(man_c)
         self.f.write(FOOTER.pack(table_off, len(table_c), man_off, len(man_c), TAIL))
 
+        # Where the archive really ends, recorded before the seek below moves
+        # the file position back to the header. An append truncates to this.
+        self.end = self.offset + FOOTER_SIZE
+
         self.f.seek(0)
         self.f.write(HEADER.pack(MAGIC, FORMAT_VERSION, self.flags,
                                  original_size, 0, 0))
@@ -222,6 +238,11 @@ class ArchiveReader:
                               (man_off, man_clen, "manifest")):
             if off < HEADER_SIZE or off + ln > self.file_size:
                 raise FormatError(f"{what} points outside the file")
+
+        # Where the payloads stop and the tail begins. An append rewrites
+        # everything from here on, so it must come from the footer rather than
+        # be inferred from the chunk records.
+        self.table_off = table_off
 
         self.f.seek(man_off)
         self.manifest = json.loads(_zstd_decompress(self.f.read(man_clen)))

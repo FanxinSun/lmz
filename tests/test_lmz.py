@@ -1026,6 +1026,128 @@ def test_aligned_archive_starts_blocks_on_page_boundaries():
             raise AssertionError("align without mapped should be rejected")
 
 
+def test_append_grows_an_archive_like_one_shot():
+    """A series grown one file at a time must match compressing it together.
+
+    This is the workflow the delta coding exists for: checkpoints appear over
+    hours, and recompressing every earlier one to add the next is not a thing
+    anybody would do.
+    """
+    steps = [weights_bf16(700000, 61)]
+    for i in range(3):
+        steps.append(nudged_bf16(steps[-1], 70 + i))
+    with tempfile.TemporaryDirectory() as d:
+        names = []
+        for i, blob in enumerate(steps):
+            p = os.path.join(d, f"ck{i}.safetensors")
+            write_safetensors(p, [("layer.0.weight", "BF16", [700000], blob)])
+            names.append(p)
+
+        grown = os.path.join(d, "grown.lmz")
+        lmz.compress(names[0], grown)
+        for p in names[1:]:
+            stats = lmz.append(grown, p)
+            assert stats.detail["appended"] is True
+
+        series = os.path.join(d, "series")
+        os.makedirs(series)
+        for p in names:
+            shutil.copy(p, series)
+        one = os.path.join(d, "one.lmz")
+        lmz.compress(series, one, workers=4)
+
+        # Within a rounding of each other: appending must not cost ratio.
+        g, o = os.path.getsize(grown), os.path.getsize(one)
+        assert abs(g - o) < max(4096, o // 200), (g, o)
+        assert g < sum(len(b) for b in steps) * 0.9
+
+        lmz.verify(grown)
+        out = os.path.join(d, "back")
+        lmz.decompress(grown, out)
+        for i, p in enumerate(names):
+            assert digest(p) == digest(os.path.join(out, f"ck{i}.safetensors"))
+
+        # and the appended members must be reachable one at a time
+        for i, p in enumerate(names):
+            got = os.path.join(d, f"got{i}.safetensors")
+            lmz.extract(grown, f"ck{i}.safetensors", got)
+            assert digest(got) == digest(p), i
+            _dt, _sh, raw = lmz.read_tensor(grown, "layer.0.weight",
+                                            member=f"ck{i}.safetensors")
+            assert raw == steps[i], i
+
+
+def test_append_rejects_a_name_already_present():
+    blob = weights_bf16(300000, 63)
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "m.safetensors")
+        write_safetensors(p, [("w", "BF16", [300000], blob)])
+        arc = os.path.join(d, "a.lmz")
+        lmz.compress(p, arc)
+        before = os.path.getsize(arc)
+        try:
+            lmz.append(arc, p)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("appending a duplicate member should fail")
+        assert os.path.getsize(arc) == before, "a rejected append must not write"
+        lmz.verify(arc)
+
+
+def test_append_keeps_the_archive_kind():
+    """Appending to a page-mapped archive must not silently un-map it."""
+    a = weights_bf16(700000, 65)
+    b = nudged_bf16(a, 67)
+    with tempfile.TemporaryDirectory() as d:
+        pa = os.path.join(d, "a.safetensors")
+        pb = os.path.join(d, "b.safetensors")
+        write_safetensors(pa, [("w", "BF16", [700000], a)])
+        write_safetensors(pb, [("w", "BF16", [700000], b)])
+        arc = os.path.join(d, "m.lmz")
+        lmz.compress(pa, arc, mapped=True)
+        lmz.append(arc, pb)
+        with lmz.MappedArchive(arc) as m:
+            assert m.page_mapped, "the flag must survive an append"
+            assert m.block_bytes <= lmz.api.DEFAULT_BLOCK_SIZE
+            assert m.tensor("w", "a.safetensors")[2] == a
+            assert m.tensor("w", "b.safetensors")[2] == b
+        lmz.verify(arc)
+        out = os.path.join(d, "back")
+        lmz.decompress(arc, out)
+        assert digest(pb) == digest(os.path.join(out, "b.safetensors"))
+
+
+def test_extract_one_member():
+    blobs = [weights_bf16(200000, 71), weights_bf16(200000, 73)]
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "pair")
+        os.makedirs(src)
+        for i, blob in enumerate(blobs):
+            write_safetensors(os.path.join(src, f"m{i}.safetensors"),
+                              [("w", "BF16", [200000], blob)])
+        arc = os.path.join(d, "a.lmz")
+        lmz.compress(src, arc)
+        got = os.path.join(d, "m1.out")
+        lmz.extract(arc, "m1.safetensors", got)
+        assert digest(os.path.join(src, "m1.safetensors")) == digest(got)
+
+        try:
+            lmz.extract(arc, "m1.safetensors", got)
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("extract must not clobber without overwrite")
+        lmz.extract(arc, "m1.safetensors", got, overwrite=True)
+
+        try:
+            lmz.extract(arc, "nope.safetensors", os.path.join(d, "x"))
+        except KeyError:
+            pass
+        else:
+            raise AssertionError("extracting a missing member should fail")
+
+
 def test_dedup_across_files():
     """A tensor shipped twice under different names must be stored once."""
     shared = weights_bf16(150000, 21)

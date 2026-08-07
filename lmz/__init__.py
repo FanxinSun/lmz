@@ -15,15 +15,15 @@ compressing the interleaved bytes.
 Output is byte-for-byte identical to the input.
 """
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 from .api import (DEFAULT_CHUNK_SIZE, DEFAULT_LEVEL, Stats, backends, compress,
                   decompress, info, read_tensor, verify)
-from .api import MappedArchive  # noqa: F401
+from .api import MappedArchive, append, extract  # noqa: F401
 from .format import FormatError
 
 __all__ = [
     "compress", "decompress", "verify", "info", "read_tensor", "backends",
-    "MappedArchive",
+    "MappedArchive", "append", "extract",
     "Stats", "FormatError", "DEFAULT_LEVEL", "DEFAULT_CHUNK_SIZE", "__version__",
 ]

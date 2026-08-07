@@ -180,6 +180,31 @@ def cmd_cat(args) -> int:
     return 0
 
 
+def cmd_append(args) -> int:
+    bar = Progress("appending", not args.quiet)
+    stats = api.append(args.archive, args.input, level=args.level,
+                       workers=args.threads, checksum=not args.no_checksum,
+                       delta=not args.no_delta, progress=bar)
+    bar.done()
+    if not args.quiet:
+        print(f"{args.input} -> {args.archive}")
+        print(f"  added {human(stats.input_bytes)}, archive now "
+              f"{human(stats.output_bytes)}  {stats.seconds:.2f}s")
+        d = stats.detail.get("delta_bytes", 0)
+        if d:
+            print(f"  {human(d)} coded as differences from what was already there")
+    return 0
+
+
+def cmd_extract(args) -> int:
+    stats = api.extract(args.archive, args.member, args.output,
+                        overwrite=args.force, workers=args.threads)
+    if not args.quiet:
+        print(f"{args.member} -> {args.output}  {human(stats.input_bytes)}  "
+              f"{stats.seconds:.2f}s")
+    return 0
+
+
 def cmd_doctor(args) -> int:
     b = api.backends()
     print(f"lmz {__version__}")
@@ -313,6 +338,24 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("-f", "--force", action="store_true", help="overwrite output")
     common(c)
     c.set_defaults(func=cmd_compress)
+
+    ap_ = sub.add_parser("append", help="add files to an existing archive")
+    ap_.add_argument("archive")
+    ap_.add_argument("input")
+    ap_.add_argument("-l", "--level", type=int, default=api.DEFAULT_LEVEL)
+    ap_.add_argument("--no-checksum", action="store_true")
+    ap_.add_argument("--no-delta", action="store_true",
+                     help="skip delta coding against what is already there")
+    common(ap_)
+    ap_.set_defaults(func=cmd_append)
+
+    e = sub.add_parser("extract", help="write one member out on its own")
+    e.add_argument("archive")
+    e.add_argument("member")
+    e.add_argument("output")
+    e.add_argument("-f", "--force", action="store_true", help="overwrite output")
+    common(e)
+    e.set_defaults(func=cmd_extract)
 
     d = sub.add_parser("decompress", aliases=["d", "x"], help="restore an archive")
     d.add_argument("input")

@@ -229,6 +229,30 @@ duplicate becomes a *ref chunk*: eight bytes naming the byte range it equals.
 Refs resolve by decoding the source's own chunks straight from the archive,
 so decompression stays a bag of independent jobs with no ordering.
 
+**Growing an archive.** The savings that matter most are between files, not
+inside them — duplicated tensors, and checkpoints that differ slightly — so
+they only appear when related files share an archive. But a training run
+produces checkpoints over hours, and recompressing every earlier one to add
+the next is not a workflow anybody would use. `lmz append` codes a new file
+against what the archive already holds, reading the base back by *decoding*
+rather than from the original files, which may be long gone. Only the tail is
+rewritten: payloads go where the old chunk table began, and the table,
+manifest and footer are rebuilt after them. Growing a four-checkpoint series
+one file at a time lands within a byte of compressing all four together
+(11 358 532 against 11 358 531, 69.19% either way).
+
+`lmz extract` pulls one member out without expanding the rest, which is the
+other half of making an archive a place to keep things rather than a thing to
+unpack.
+
+One limit is worth stating plainly: a delta may only name a plain chunk, so
+that resolving one stays a single hop. In a checkpoint series that leaves the
+first checkpoint as the only base, and the difference grows with the distance
+— measured 12.9 points at a 1000-step gap against 11.6 at 2000 — so later
+checkpoints gain slightly less than a fresh archive would give them. Chaining
+each to its predecessor would recover that at the cost of resolution walking
+the chain.
+
 **Delta coding.** Checkpoints from one training run are not duplicates, and
 not independent either: every weight is rewritten and almost every one moves a
 little, so dedup finds nothing while the difference is nearly all zeros. A
@@ -554,6 +578,8 @@ looked like it would:
 ```
 lmz compress    <input> [output]   -l LEVEL  -j N  --chunk-size N  --no-checksum
                                    --no-dedup  --no-delta  --mapped  --align  -f
+lmz append      <archive> <input>  -l LEVEL  -j N  --no-checksum  --no-delta
+lmz extract     <archive> <member> <output>  -f
 lmz decompress  <input> [output]   -j N  --no-verify  -f
 lmz verify      <archive>          -j N
 lmz info        <archive>          --tensors  --json  --limit N
@@ -607,8 +633,14 @@ Compression buys a cold load a third fewer bytes to move; it does not make
 inference faster, and a plain mmap of an uncompressed file still wins on
 random access.
 
+```python
+lmz.append("run.lmz", "checkpoint-9000.safetensors")   # code against what is there
+lmz.extract("run.lmz", "checkpoint-3000.safetensors", "ck3000.safetensors")
+```
+
 `compress` takes `level`, `workers`, `chunk_size`, `checksum`, `dedup`,
-`delta`, `mapped`, `align` and `progress`; `decompress` takes `workers`, `verify_checksums`, `overwrite` and
+`delta`, `mapped`, `align` and `progress`; `append` takes `level`, `workers`,
+`checksum`, `delta` and `progress`; `decompress` takes `workers`, `verify_checksums`, `overwrite` and
 `progress`. `progress` is called with `(bytes_done, total)`.
 
 ## Archive format
@@ -693,7 +725,7 @@ its destination directory.
 python3 tests/test_lmz.py          # also runs under pytest
 ```
 
-58 tests covering kernel equivalence across all backends, element sizes and
+62 tests covering kernel equivalence across all backends, element sizes and
 block periods,
 rANS round-trips over adversarial distributions (including single-symbol
 streams, which exposed a frequency-field overflow), rANS landing within 2% of
@@ -720,6 +752,9 @@ page-mapped random access (every byte range matching the original, a one-byte
 read expanding no more than one block, and the cache never changing what is
 returned), that aligned archives really do start every block on a page
 boundary and still decompress and verify by the ordinary paths,
+growing an archive with `append` (matching a one-shot compression, refusing a
+name already present, leaving a rejected append's bytes untouched, and keeping
+a page-mapped archive page-mapped), single-member `extract`,
 path-traversal rejection, and the CLI.
 
 `tests/make_model.py` generates synthetic checkpoints with per-channel

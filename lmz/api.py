@@ -24,8 +24,8 @@ from dataclasses import dataclass, field
 from . import codec as _codec
 from . import entropy, kernels
 from .format import (CODEC_DELTA, CODEC_REF, FLAG_ALIGNED, FLAG_PAGE_MAPPED,
-                     PAGE_ALIGN, ArchiveReader, ArchiveWriter, CorruptArchive,
-                     FormatError, Member)
+                     HEADER_SIZE, PAGE_ALIGN, ArchiveReader, ArchiveWriter,
+                     CorruptArchive, FormatError, Member)
 from .parallel import (default_workers, gil_enabled, ordered_map,
                         unordered_map)
 from .planner import KIND_DELTA, KIND_REF, chunkify, probe
@@ -316,6 +316,232 @@ def _find_duplicate_tensors(paths: list[str], members: list[Member],
             refs.setdefault(idx, []).append((s, e, src))
             saved += e - s
     return refs, saved
+
+
+def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
+           workers: int | None = None, checksum: bool = True,
+           delta: bool = True, progress=None) -> Stats:
+    """Add files to an existing archive, coded against what is already in it.
+
+    This is what makes the corpus-level savings reachable in practice. A
+    training run produces checkpoints over days, and the 65% that delta coding
+    finds between them is only available if they share an archive -- but
+    recompressing every earlier checkpoint to add one is not a workflow. Here
+    the new files are coded against the archive's own contents, which are read
+    back by decoding rather than from the original files, so the sources may
+    be long gone.
+
+    Only the tail is rewritten: payloads are appended where the old chunk
+    table began, and the table, manifest and footer are rebuilt after them.
+    """
+    workers = workers or default_workers()
+    started = time.perf_counter()
+
+    with open(archive, "rb") as fh:
+        reader = ArchiveReader(fh)
+    old_members = reader.members
+    old_chunks = reader.chunks
+    old_manifest = reader.manifest
+    chunk_size = max(int(old_manifest.get("chunk_size") or DEFAULT_CHUNK_SIZE),
+                     1 << 16)
+    table_off = reader.table_off
+    base_total = sum(m.size for m in old_members)
+
+    if os.path.isdir(src):
+        entries = list(_iter_files(src))
+        if not entries:
+            raise ValueError(f"{src} contains no regular files")
+    elif os.path.isfile(src):
+        entries = [(os.path.basename(src), src)]
+    else:
+        raise FileNotFoundError(src)
+
+    taken = {m.path for m in old_members}
+    members: list[Member] = []
+    paths: list[str] = []
+    layouts: list = []
+    sizes: list[int] = []
+    base = base_total
+    for rel, full in entries:
+        if rel in taken:
+            raise ValueError(f"{rel} is already in {archive}")
+        size = os.path.getsize(full)
+        with open(full, "rb") as fh:
+            layout = probe(fh, size)
+        members.append(Member(path=rel, size=size, dst=base, kind=layout.kind,
+                              mode=os.stat(full).st_mode & 0o777,
+                              tensors=layout.tensors))
+        paths.append(full)
+        layouts.append(layout)
+        sizes.append(size)
+        base += size
+    total_new = base - base_total
+
+    arc = MappedArchive(archive, verify=False, cache_blocks=8)
+    try:
+        deltas_by_member: dict[int, list] = {}
+        delta_bytes = 0
+        if delta:
+            deltas_by_member, delta_bytes = _find_append_deltas(
+                paths, members, layouts, old_members, arc, level)
+
+        plan: list[tuple] = []
+        for idx, layout in enumerate(layouts):
+            for task in chunkify(layout, sizes[idx], chunk_size,
+                                 deltas=deltas_by_member.get(idx)):
+                plan.append((idx,) + task)
+
+        pool = _FdPool(paths, os.O_RDONLY)
+        done = 0
+        stats = Stats(input_bytes=total_new, files=len(members),
+                      chunks=len(plan),
+                      detail={"delta_bytes": delta_bytes, "appended": True})
+
+        def work(task):
+            idx, start, end, esize, kind, src_off, btype, ikind = task
+            data = os.pread(pool.get(idx), end - start, start)
+            if len(data) != end - start:
+                raise IOError(f"short read on {members[idx].path} at {start}")
+            if kind == KIND_DELTA:
+                base_bytes = arc.read(src_off, end - start)
+                parts, flags, crc = _codec.encode_delta(
+                    data, base_bytes, esize, level, checksum, kind=ikind,
+                    btype=btype, src=src_off)
+                return (members[idx].dst + start, end - start, parts,
+                        CODEC_DELTA, esize, flags, crc)
+            parts, cid, flags, crc = _codec.encode_chunk(
+                data, esize, level, checksum, kind=kind, btype=btype)
+            return (members[idx].dst + start, end - start, parts, cid, esize,
+                    flags, crc)
+
+        def work_batch(batch):
+            return [work(t) for t in batch]
+
+        manifest = dict(old_manifest)
+        manifest["members"] = [m.to_json() for m in old_members + members]
+        manifest["total_size"] = base
+        if delta_bytes:
+            manifest["delta_bytes"] = (old_manifest.get("delta_bytes", 0)
+                                       + delta_bytes)
+
+        with open(archive, "r+b") as out:
+            writer = ArchiveWriter(out, manifest, flags=reader.flags,
+                                   align=PAGE_ALIGN if reader.aligned else 0,
+                                   resume_at=table_off, chunks=old_chunks)
+            nw = _worker_cap([e - s for _i, s, e, *_r in plan], workers)
+            for results in ordered_map(
+                    work_batch, _batches(plan, lambda t: t[2] - t[1]), nw,
+                    lookahead=nw * 2):
+                for dst_off, rlen, parts, cid, esize, flags, crc in results:
+                    writer.append(parts, dst_off, rlen, crc, cid, esize, flags)
+                    done += rlen
+                if progress:
+                    progress(done, total_new)
+            writer.close(base)
+            # An append can leave a shorter tail than the one it replaced.
+            out.truncate(writer.end)
+        pool.close()
+    finally:
+        arc.close()
+
+    stats.output_bytes = os.path.getsize(archive)
+    stats.seconds = time.perf_counter() - started
+    return stats
+
+
+def _find_append_deltas(paths, members, layouts, old_members, arc, level):
+    """New tensors that are close to one already in the archive.
+
+    Same rule as within a single job -- matched by name, dtype and size, and
+    decided by encoding a sample both ways -- except the base is decoded out
+    of the archive rather than read from a file that may no longer exist.
+    """
+    # A delta may only name a plain chunk -- resolution is a single hop by
+    # design -- so a tensor that is itself stored as a difference cannot be a
+    # base. In a checkpoint series that leaves the first checkpoint as the
+    # only base, and the difference grows with the gap: measured 12.9 points
+    # at a 1000-step distance against 11.6 at 2000. Later checkpoints
+    # therefore gain a little less than a fresh archive would give them.
+    coded = [(c.dst, c.dst + c.rlen) for c in arc._chunks
+             if c.codec in (CODEC_DELTA, CODEC_REF)]
+
+    def is_plain(lo, hi):
+        return not any(cs < hi and lo < ce for cs, ce in coded)
+
+    known: dict = {}
+    for m in old_members:
+        for name, meta in (m.tensors or {}).items():
+            s, e = meta["offsets"]
+            if e - s < DELTA_MIN_TENSOR or not is_plain(m.dst + s, m.dst + e):
+                continue
+            # Latest wins: the nearer the base, the smaller the difference.
+            known[(name, meta.get("dtype", ""), e - s)] = m.dst + s
+
+    deltas: dict[int, list] = {}
+    covered = 0
+    for idx, layout in enumerate(layouts):
+        region_at = {r.start: r for r in (layout.regions if layout else ())}
+        for name, meta in ((layout.tensors or {}) if layout else {}).items():
+            s, e = meta["offsets"]
+            key = (name, meta.get("dtype", ""), e - s)
+            src_off = known.get(key)
+            r = region_at.get(s)
+            if src_off is None or r is None or r.start != s or r.end != e:
+                continue
+            take = min(DELTA_SAMPLE, e - s)
+            take -= take % max(r.esize, 1)
+            if take <= 0:
+                continue
+            off = ((e - s - take) // 2 // max(r.esize, 1)) * max(r.esize, 1)
+            with open(paths[idx], "rb") as fh:
+                fh.seek(s + off)
+                b = fh.read(take)
+            a = arc.read(src_off + off, take)
+            if len(a) != take or len(b) != take or a == b:
+                # An identical sample still deltas to zeros, which codes for
+                # almost nothing; there is no separate ref path to take here.
+                if a != b:
+                    continue
+            diff = bytes(kernels.xor_bytes(b, a))
+
+            def coded(buf):
+                parts = _codec.encode_chunk(buf, r.esize, level, False,
+                                            kind=r.kind, btype=r.btype)[0]
+                return sum(len(p) for p in parts)
+
+            if coded(diff) < coded(b) * (1 - DELTA_MIN_GAIN):
+                deltas.setdefault(idx, []).append((s, e, src_off))
+                covered += e - s
+    for items in deltas.values():
+        items.sort()
+    return deltas, covered
+
+
+def extract(archive: str, member: str, dst: str, *, overwrite: bool = False,
+            workers: int | None = None) -> Stats:
+    """Write one member out without expanding the rest of the archive."""
+    started = time.perf_counter()
+    if os.path.exists(dst) and not overwrite:
+        raise FileExistsError(
+            f"{dst} already exists (pass overwrite=True to replace it)")
+    with MappedArchive(archive, cache_blocks=16, workers=workers) as arc:
+        target = next((m for m in arc.members if m.path == member), None)
+        if target is None:
+            raise KeyError(f"no member named {member!r} in {archive}")
+        parent = os.path.dirname(os.path.abspath(dst))
+        os.makedirs(parent, exist_ok=True)
+        with open(dst, "wb") as fh:
+            pos = 0
+            while pos < target.size:
+                n = min(8 << 20, target.size - pos)
+                fh.write(arc.read(target.dst + pos, n))
+                pos += n
+        try:
+            os.chmod(dst, target.mode or 0o644)
+        except OSError:
+            pass
+    return Stats(input_bytes=target.size, output_bytes=os.path.getsize(archive),
+                 seconds=time.perf_counter() - started, files=1)
 
 
 def _find_delta_candidates(paths, members, layouts, refs, workers, level):
