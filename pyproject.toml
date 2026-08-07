@@ -4,12 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lmz"
-version = "0.8.0"
-description = "Fast lossless compression for large model weights"
+version = "0.9.0"
+description = "Compressed model storage you can read through, without expanding it"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-keywords = ["compression", "safetensors", "gguf", "llm", "model-weights", "zstd"]
+keywords = ["compression", "safetensors", "gguf", "llm", "model-weights", "zstd",
+            "fuse", "model-store", "on-device"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: System :: Archiving :: Compression",

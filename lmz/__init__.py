@@ -13,17 +13,27 @@ compressing the interleaved bytes.
     lmz.decompress("model.lmz", "restored.safetensors")
 
 Output is byte-for-byte identical to the input.
+
+A model can also be kept in the store and read in place, so nothing is ever
+expanded onto disk:
+
+    import lmz
+    lmz.Store().add("./my-model", "my-model")   # compressed, once
+
+    lmz mount ~/models                          # every runtime reads it as
+                                                #   ordinary model files
 """
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 from .api import (DEFAULT_CHUNK_SIZE, DEFAULT_LEVEL, Stats, backends, compress,
                   decompress, info, read_tensor, verify)
 from .api import MappedArchive, append, extract  # noqa: F401
 from .format import FormatError
+from .store import Store, mount  # noqa: F401
 
 __all__ = [
     "compress", "decompress", "verify", "info", "read_tensor", "backends",
-    "MappedArchive", "append", "extract",
+    "MappedArchive", "append", "extract", "Store", "mount",
     "Stats", "FormatError", "DEFAULT_LEVEL", "DEFAULT_CHUNK_SIZE", "__version__",
 ]

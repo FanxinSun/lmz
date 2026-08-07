@@ -7,6 +7,7 @@ is that decompression reproduces the input exactly.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
@@ -16,6 +17,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -1708,21 +1710,295 @@ def test_v1_archives_still_read():
         assert digest(out) == digest(path)
 
 
+# ------------------------------------------------------- the store and mount
+
+
+def sample_model(root: str) -> str:
+    """A small two-file model directory, one file in a subdirectory."""
+    os.makedirs(os.path.join(root, "original"), exist_ok=True)
+    write_safetensors(
+        os.path.join(root, "model.safetensors"),
+        [("embed", "BF16", [512, 64], weights_bf16(512 * 64, 3)),
+         ("lm_head", "BF16", [512, 64], weights_bf16(512 * 64, 4))])
+    write_safetensors(
+        os.path.join(root, "original", "consolidated.safetensors"),
+        [("w", "BF16", [256, 64], weights_bf16(256 * 64, 5))])
+    with open(os.path.join(root, "config.json"), "w") as fh:
+        json.dump({"model_type": "llama", "hidden_size": 64}, fh)
+    return root
+
+
+def test_store_add_list_and_remove():
+    from lmz.store import Store
+
+    with tempfile.TemporaryDirectory() as d:
+        src = sample_model(os.path.join(d, "src"))
+        store = Store(os.path.join(d, "store"))
+        assert store.models() == []
+        entry = store.add(src, "demo")
+        assert entry.name == "demo" and entry.files == 3
+        assert entry.stored_size < entry.original_size
+        assert sorted(entry.members) == [
+            "config.json", "model.safetensors",
+            "original/consolidated.safetensors"]
+        assert [e.name for e in store.models()] == ["demo"]
+
+        # A second add under the same name needs force, and must not have
+        # damaged the first one when it refuses.
+        try:
+            store.add(src, "demo")
+            raise AssertionError("expected a refusal")
+        except ValueError:
+            pass
+        assert store.get("demo").original_size == entry.original_size
+
+        store.remove("demo")
+        assert store.models() == []
+        assert not os.path.exists(store.archive_path(entry))
+
+
+def test_store_names_are_normalised():
+    from lmz.store import normalise_name
+
+    assert normalise_name("meta-llama/Llama-3.1-8B") == "meta-llama-Llama-3.1-8B"
+    assert normalise_name("  spaced name  ") == "spaced-name"
+    assert normalise_name("../../etc/passwd") == "etc-passwd"
+    for bad in ("", "   ", "..", "/"):
+        try:
+            normalise_name(bad)
+            raise AssertionError(f"expected {bad!r} to be refused")
+        except ValueError:
+            pass
+
+
+def test_store_rebuild_recovers_the_index():
+    from lmz.store import Store
+
+    with tempfile.TemporaryDirectory() as d:
+        src = sample_model(os.path.join(d, "src"))
+        store = Store(os.path.join(d, "store"))
+        store.add(src, "demo")
+        os.unlink(store.index_path)
+        assert store.models() == []
+        rebuilt = store.rebuild()
+        assert [e.name for e in rebuilt] == ["demo"]
+        assert store.get("demo").files == 3
+
+
+def test_store_reads_tensors_without_expanding():
+    from lmz.store import Store
+
+    with tempfile.TemporaryDirectory() as d:
+        src = sample_model(os.path.join(d, "src"))
+        store = Store(os.path.join(d, "store"))
+        store.add(src, "demo")
+        with open(os.path.join(src, "model.safetensors"), "rb") as fh:
+            want = fh.read()
+        with store.open("demo") as arc:
+            assert arc.page_mapped, "a stored model must be page-mapped"
+            got = arc.read_member("model.safetensors")
+            assert got == want
+            dtype, shape, raw = arc.tensor("embed")
+            assert dtype == "BF16" and shape == [512, 64]
+            assert raw == weights_bf16(512 * 64, 3)
+
+
+def test_fuse_tree_builds_nested_paths():
+    from lmz.fuse import Tree
+
+    tree = Tree()
+    tree.add_file("m/config.json", 12, ("m", 0))
+    leaf = tree.add_file("m/original/w.safetensors", 34, ("m", 12))
+    root = tree.nodes[1]
+    assert set(root.children) == {"m"}
+    model = root.children["m"]
+    assert set(model.children) == {"config.json", "original"}
+    assert model.children["original"].children["w.safetensors"] is leaf
+    assert tree.total_size == 46
+    assert tree.nodes[leaf.parent].name == "original"
+    for bad in ("../escape", "m/../../etc/passwd", "", "."):
+        try:
+            tree.add_file(bad, 1, None)
+            raise AssertionError(f"expected {bad!r} to be refused")
+        except ValueError:
+            pass
+
+
+def test_coalesced_payload_reads_match():
+    """Reading a run of blocks in one pread must equal reading them singly."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "m.safetensors")
+        write_safetensors(path, [("w", "BF16", [1 << 17], weights_bf16(1 << 17, 9))])
+        archive = os.path.join(d, "a.lmz")
+        lmz.compress(path, archive, mapped=True)
+        with open(path, "rb") as fh:
+            want = fh.read()
+        with lmz.MappedArchive(archive, cache_blocks=1) as arc:
+            assert arc.read(0, len(want)) == want
+        # Defeat the coalescing and confirm the same answer.
+        with lmz.MappedArchive(archive, cache_blocks=1) as arc:
+            arc.COALESCE_MAX = 0
+            assert arc.read(0, len(want)) == want
+
+
+class Skip(Exception):
+    """Raised by a test that cannot run in this environment."""
+
+
+class MountedStore:
+    """Serve a store from a separate process, for the length of a `with`.
+
+    Separate because a thread that faults on its own mount blocks in the
+    kernel holding the GIL, so an in-process server can never answer it.
+    """
+
+    def __init__(self, store_root: str, point: str, *extra: str):
+        self.point = point
+        self.args = list(extra)
+        self.store_root = store_root
+        self.proc = None
+
+    def __enter__(self):
+        from lmz import fuse
+
+        ok, why = fuse.available()
+        if not ok:
+            raise Skip(why)
+        os.makedirs(self.point, exist_ok=True)
+        self.proc = subprocess.Popen(
+            CLI + ["mount", self.point, "--store", self.store_root, "-q"]
+            + self.args,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        for _ in range(200):
+            if os.path.ismount(self.point):
+                return self
+            if self.proc.poll() is not None:
+                err = self.proc.stderr.read().decode().strip()
+                raise Skip(f"mount exited: {err or self.proc.returncode}")
+            time.sleep(0.05)
+        self.__exit__(None, None, None)
+        raise AssertionError("mount did not come up within 10 s")
+
+    def __exit__(self, *_exc):
+        from lmz import fuse
+
+        fuse.unmount(self.point)
+        if self.proc is not None:
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+            if self.proc.stderr:
+                self.proc.stderr.close()
+
+
+def test_mount_serves_the_original_bytes():
+    from lmz.store import Store
+
+    with tempfile.TemporaryDirectory() as d:
+        src = sample_model(os.path.join(d, "src"))
+        root = os.path.join(d, "store")
+        Store(root).add(src, "demo")
+        point = os.path.join(d, "mnt")
+        with MountedStore(root, point):
+            assert os.listdir(point) == ["demo"]
+            served = os.path.join(point, "demo")
+            assert sorted(os.listdir(served)) == [
+                "config.json", "model.safetensors", "original"]
+            for rel in ("config.json", "model.safetensors",
+                        "original/consolidated.safetensors"):
+                a, b = os.path.join(src, rel), os.path.join(served, rel)
+                assert os.path.getsize(a) == os.path.getsize(b), rel
+                assert digest(a) == digest(b), rel
+
+            # Random access must not need the bytes before it.
+            big = os.path.join(served, "model.safetensors")
+            with open(os.path.join(src, "model.safetensors"), "rb") as fh:
+                want = fh.read()
+            with open(big, "rb") as fh:
+                for off in (0, 1, 4095, 4096, len(want) // 3, len(want) - 17):
+                    fh.seek(off)
+                    assert fh.read(64) == want[off:off + 64], off
+                fh.seek(0, os.SEEK_END)
+                assert fh.tell() == len(want)
+
+
+def test_mount_is_read_only():
+    from lmz.store import Store
+
+    with tempfile.TemporaryDirectory() as d:
+        src = sample_model(os.path.join(d, "src"))
+        root = os.path.join(d, "store")
+        Store(root).add(src, "demo")
+        point = os.path.join(d, "mnt")
+        with MountedStore(root, point):
+            served = os.path.join(point, "demo")
+            for attempt in (lambda: open(os.path.join(served, "new"), "wb"),
+                            lambda: open(os.path.join(served, "config.json"), "wb"),
+                            lambda: os.unlink(os.path.join(served, "config.json")),
+                            lambda: os.mkdir(os.path.join(served, "sub"))):
+                try:
+                    attempt()
+                    raise AssertionError("expected a read-only filesystem")
+                except OSError as exc:
+                    assert exc.errno in (errno.EROFS, errno.EACCES, errno.EPERM), exc
+
+
+def test_mount_serves_only_the_named_models():
+    from lmz.store import Store
+
+    with tempfile.TemporaryDirectory() as d:
+        src = sample_model(os.path.join(d, "src"))
+        root = os.path.join(d, "store")
+        store = Store(root)
+        store.add(src, "keep")
+        store.add(src, "hide")
+        point = os.path.join(d, "mnt")
+        with MountedStore(root, point, "--model", "keep"):
+            assert os.listdir(point) == ["keep"]
+
+
+def test_mount_matches_a_full_decompression():
+    """What the mount serves and what `decompress` writes must agree."""
+    from lmz.store import Store
+
+    with tempfile.TemporaryDirectory() as d:
+        src = sample_model(os.path.join(d, "src"))
+        root = os.path.join(d, "store")
+        store = Store(root)
+        store.add(src, "demo")
+        expanded = os.path.join(d, "expanded")
+        store.extract("demo", expanded)
+        point = os.path.join(d, "mnt")
+        with MountedStore(root, point):
+            served = os.path.join(point, "demo")
+            for dirpath, _dirs, files in os.walk(expanded):
+                for name in files:
+                    a = os.path.join(dirpath, name)
+                    rel = os.path.relpath(a, expanded)
+                    assert digest(a) == digest(os.path.join(served, rel)), rel
+
+
 def main() -> int:
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
-    failed = []
+    failed, skipped = [], []
     for name, fn in tests:
         try:
             fn()
             print(f"  PASS  {name}")
+        except Skip as exc:
+            skipped.append(name)
+            print(f"  SKIP  {name}: {exc}")
         except Exception as exc:
             failed.append(name)
             print(f"  FAIL  {name}: {type(exc).__name__}: {exc}")
             import traceback
 
             traceback.print_exc()
-    print(f"\n{len(tests) - len(failed)}/{len(tests)} passed")
+    tail = f", {len(skipped)} skipped" if skipped else ""
+    print(f"\n{len(tests) - len(failed) - len(skipped)}/{len(tests)} passed{tail}")
     return 1 if failed else 0
 
 

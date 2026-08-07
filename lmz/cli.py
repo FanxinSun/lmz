@@ -206,15 +206,147 @@ def cmd_extract(args) -> int:
 
 
 def cmd_doctor(args) -> int:
+    from . import fuse
+
     b = api.backends()
     print(f"lmz {__version__}")
     print(f"  python    {sys.version.split()[0]}")
     print(f"  kernel    {b['kernel']}")
     print(f"  entropy   {b['entropy']}")
     print(f"  threads   {b['workers']} (detected)")
+    ok, why = fuse.available()
+    print(f"  mount     {'available' if ok else 'unavailable -- ' + why}")
+    from .store import Store
+    store = Store()
+    print(f"  store     {store.root}"
+          f"{'' if os.path.isdir(store.root) else ' (not created yet)'}")
     if not b["kernel"].startswith("native"):
         print("  note: native kernel unavailable; using a slower fallback.")
         print("        a C compiler (cc/gcc/clang) enables the SIMD path.")
+    return 0
+
+
+# ------------------------------------------------------------------- the store
+
+
+def _store(args):
+    from .store import Store
+
+    return Store(getattr(args, "store", None))
+
+
+def cmd_add(args) -> int:
+    store = _store(args)
+    bar = Progress("compressing", not args.quiet)
+    entry = store.add(args.input, args.name, level=args.level,
+                      workers=args.threads, force=args.force, progress=bar)
+    bar.done()
+    if not args.quiet:
+        print(f"{args.input} -> {store.archive_path(entry)}")
+        print(f"  {entry.name}: {human(entry.original_size)} -> "
+              f"{human(entry.stored_size)}  ({entry.saved * 100:.1f}% smaller, "
+              f"{entry.files} file(s))")
+        print(f"  read it without expanding: lmz mount <dir>")
+    return 0
+
+
+def cmd_models(args) -> int:
+    store = _store(args)
+    entries = store.models()
+    if args.json:
+        print(json.dumps([e.to_json() for e in entries], indent=2))
+        return 0
+    if not entries:
+        print(f"no models in {store.root}\n  add one:  lmz add ./my-model")
+        return 0
+    print(f"{'NAME':<28s} {'ON DISK':>10s} {'RESTORES TO':>12s} {'SAVED':>7s}  FILES")
+    for e in entries:
+        print(f"{e.name:<28s} {human(e.stored_size):>10s} "
+              f"{human(e.original_size):>12s} {e.saved * 100:>6.1f}%  {e.files}")
+    original, stored = store.totals()
+    print(f"{'':<28s} {human(stored):>10s} {human(original):>12s} "
+          f"{(1 - stored / original) * 100 if original else 0:>6.1f}%")
+    return 0
+
+
+def cmd_rm(args) -> int:
+    store = _store(args)
+    entry = store.remove(args.name)
+    if not args.quiet:
+        print(f"removed {entry.name} ({human(entry.stored_size)} freed)")
+    return 0
+
+
+def cmd_mount(args) -> int:
+    from . import fuse
+    from .store import mount
+
+    ok, why = fuse.available()
+    if not ok:
+        print(f"lmz: cannot mount: {why}", file=sys.stderr)
+        return 1
+    os.makedirs(args.point, exist_ok=True)
+    if os.listdir(args.point):
+        print(f"lmz: {args.point} is not empty", file=sys.stderr)
+        return 1
+
+    server = mount(args.point, _store(args), names=args.model or None,
+                   threads=args.threads, allow_other=args.allow_other,
+                   cache_blocks=args.cache_blocks, verify=args.verify)
+    if not server.fs.entries:
+        print("lmz: the store is empty; add a model first with `lmz add`",
+              file=sys.stderr)
+        return 1
+    try:
+        server.mount()
+    except OSError as exc:
+        print(f"lmz: mount failed: {exc.strerror or exc}", file=sys.stderr)
+        return 1
+
+    if args.daemon:
+        # The mount is already live, so the fork below cannot lose a request:
+        # the kernel queues them on the descriptor until a thread reads it.
+        if os.fork():
+            print(f"{args.point}: serving {len(server.fs.entries)} model(s) "
+                  f"in the background")
+            print(f"  stop with: lmz unmount {args.point}")
+            # _exit skips the atexit and stdio teardown that would otherwise
+            # run twice over a forked pair of processes, so the flush is ours.
+            sys.stdout.flush()
+            os._exit(0)
+        os.setsid()
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+    elif not args.quiet:
+        total = sum(e.original_size for e in server.fs.entries.values())
+        stored = sum(e.stored_size for e in server.fs.entries.values())
+        print(f"{args.point}: {len(server.fs.entries)} model(s), "
+              f"{human(total)} of files served from {human(stored)} on disk")
+        for name in sorted(server.fs.entries):
+            print(f"  {args.point.rstrip('/')}/{name}/")
+        print("press ctrl-c to unmount")
+    try:
+        server.serve()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.close()
+        fuse.unmount(args.point)
+    if not args.quiet and not args.daemon:
+        s = server.fs.stats()
+        print(f"\nunmounted: {server.requests} requests, "
+              f"{human(server.bytes_served)} served, "
+              f"{human(s['decoded_bytes'])} decoded")
+    return 0
+
+
+def cmd_unmount(args) -> int:
+    from . import fuse
+
+    fuse.unmount(args.point)
+    if not args.quiet:
+        print(f"unmounted {args.point}")
     return 0
 
 
@@ -393,6 +525,55 @@ def build_parser() -> argparse.ArgumentParser:
 
     doc = sub.add_parser("doctor", help="report the active backends")
     doc.set_defaults(func=cmd_doctor)
+
+    # -- the store ---------------------------------------------------------
+    def with_store(sp):
+        sp.add_argument("--store", metavar="DIR",
+                        help="store root (default: $LMZ_HOME, else ~/.lmz)")
+        return sp
+
+    a = with_store(sub.add_parser(
+        "add", help="compress a model into the store, ready to be mounted"))
+    a.add_argument("input")
+    a.add_argument("--name", help="name in the store (default: the basename)")
+    a.add_argument("-l", "--level", type=int, default=api.DEFAULT_LEVEL)
+    a.add_argument("-f", "--force", action="store_true",
+                   help="replace a model of the same name")
+    common(a)
+    a.set_defaults(func=cmd_add)
+
+    m = with_store(sub.add_parser("models", help="list models in the store"))
+    m.add_argument("--json", action="store_true")
+    m.set_defaults(func=cmd_models)
+
+    r = with_store(sub.add_parser("rm", help="remove a model from the store"))
+    r.add_argument("name")
+    common(r, threads=False)
+    r.set_defaults(func=cmd_rm)
+
+    mo = with_store(sub.add_parser(
+        "mount", help="serve the store as ordinary model files"))
+    mo.add_argument("point", metavar="mountpoint")
+    mo.add_argument("--model", action="append", metavar="NAME",
+                    help="serve only this model (repeatable)")
+    mo.add_argument("-d", "--daemon", action="store_true",
+                    help="detach and serve in the background")
+    mo.add_argument("--allow-other", action="store_true",
+                    help="let other users read the mount (needs user_allow_other)")
+    mo.add_argument("--cache-blocks", type=int, default=64, metavar="N",
+                    help="decoded blocks held per reader thread (default: 64)")
+    mo.add_argument("--verify", action="store_true",
+                    help="check every block's crc32 as it is read")
+    mo.add_argument("-j", "--threads", type=int, default=None, metavar="N",
+                    help="server threads (default: 2 under the GIL, where "
+                         "more measure slower; the whole machine without it)")
+    mo.add_argument("-q", "--quiet", action="store_true")
+    mo.set_defaults(func=cmd_mount)
+
+    um = sub.add_parser("unmount", aliases=["umount"], help="detach a mount")
+    um.add_argument("point", metavar="mountpoint")
+    common(um, threads=False)
+    um.set_defaults(func=cmd_unmount)
     return p
 
 

@@ -1259,13 +1259,40 @@ class MappedArchive:
         c = self._chunks[i]
         return bytes(self._decode(c, self._payload_of(c), out=_scratch(c.rlen)))
 
+    # A run of blocks is fetched in one read when their payloads sit together.
+    # Payloads are written in destination order, so the blocks behind any
+    # sequential read are already adjacent on disk, and reading them one at a
+    # time asked the kernel for the same megabyte in sixteen separate calls.
+    # The span is allowed to exceed the payload bytes it covers, because an
+    # aligned archive pads between blocks and reading the padding is cheaper
+    # than skipping it.
+    COALESCE_MAX = 8 << 20
+    COALESCE_SLACK = 1.25
+
+    def _payload_run(self, chunks: list):
+        if len(chunks) > 1:
+            lo = min(c.off for c in chunks)
+            hi = max(c.off + c.clen for c in chunks)
+            span = hi - lo
+            if (span <= self.COALESCE_MAX
+                    and span <= sum(c.clen for c in chunks) * self.COALESCE_SLACK):
+                blob = os.pread(self._fh.fileno(), span, lo)
+                if len(blob) != span:
+                    raise FormatError("archive is truncated")
+                view = memoryview(blob)
+                return [view[c.off - lo:c.off - lo + c.clen] for c in chunks]
+        return [self._payload_of(c) for c in chunks]
+
     def _decode_run(self, idx: list) -> dict:
         """Decode a run of blocks, taking the cache lock once at the end.
 
         Locking per block instead put four threads *behind* two, because a
         bulk read acquires it twice per block and a decode is only ~70 us.
         """
-        got = {i: self._raw(i) for i in idx}
+        chunks = [self._chunks[i] for i in idx]
+        got = {i: bytes(self._decode(c, payload, out=_scratch(c.rlen)))
+               for i, c, payload in zip(idx, chunks,
+                                        self._payload_run(chunks))}
         self._store(got.items())
         return got
 

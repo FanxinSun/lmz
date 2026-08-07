@@ -1,8 +1,9 @@
 # lmz
 
-**Smaller checkpoints. Faster loads. Byte for byte.**
+**Smaller checkpoints. Read in place. Byte for byte.**
 
-Fast lossless compression for large model weights.
+Fast lossless compression for large model weights — and a store you can read
+a model out of without ever expanding it.
 
 On Llama-3.1-8B-Instruct's BF16 shards, lmz removes **34.7%** — better than
 any general-purpose compressor and better than the published state of the art
@@ -69,6 +70,13 @@ No installation, no dependencies:
 ./lmz-cli decompress model.safetensors.lmz       # -> model.safetensors
 ./lmz-cli compress  ./my-model/                  # a whole directory; duplicate
                                                  #    tensors are stored once
+```
+
+Or keep the model compressed and read it where it lies:
+
+```
+./lmz-cli add   ./my-model/                      # into the store
+./lmz-cli mount ~/models                         # ordinary files, decoded on read
 ```
 
 Python 3.9+ is the only requirement. On a **free-threaded build** (3.13+ with
@@ -573,6 +581,92 @@ looked like it would:
   was wrong, as the entry above records; the refill is not where the cycles
   go. What remains true is only the measurement: the branchless variant lost.
 
+## Reading a model without expanding it
+
+Compressing a model is only half of an answer. The other half is that
+something has to *read* it, and until now that meant expanding the archive
+back onto the disk you were trying to save — paying the full size again,
+transiently, before the first token.
+
+`lmz mount` removes that step. Models live in a store, compressed; the mount
+presents them as the ordinary files a runtime expects, and decodes the blocks
+a reader actually touches on the way out.
+
+```
+lmz add ./Llama-3.1-8B-Instruct        # compressed once, into the store
+lmz models                             # what is there, and what it costs
+lmz mount ~/models                     # served as ordinary files
+llama-cli -m ~/models/Llama-3.1-8B-Instruct/model.gguf
+```
+
+Nothing is patched and nothing links against lmz. `llama.cpp`, vLLM and
+`transformers` call `open()`, `read()` and `mmap()` and get the original
+bytes, because that is all the mount is: a filesystem the kernel talks to.
+
+There is no libfuse and nothing to install. `fusermount3` performs the
+privileged mount and passes back a descriptor over a Unix socket; after that
+the kernel's FUSE protocol is a sequence of fixed structs, so the whole
+server is `struct.pack` and `os.read` — the same standard-library-only rule
+the rest of the package follows.
+
+### What it costs
+
+Measured on the 1.74 GiB BF16 model above, AMD Ryzen 7 9800X3D, Python 3.14.
+
+| | MiB/s |
+|---|---|
+| lmz mount, one reader | 533 |
+| lmz mount, 4 concurrent readers | 677 |
+| lmz mount, page cache warm | 24135 |
+| plain file, one reader | 5846 |
+| plain file, warm | 35652 |
+
+**The mount is not faster than reading an uncompressed file on this
+machine, and the table says so.** Decoding runs at 533–677 MiB/s, and this
+NVMe delivers several times that. The same crossover the random-access
+reader already documents applies here: decoding beats phone flash, eMMC, an
+SD card and a network filesystem, and it loses to a fast local SSD. The
+`plain file` rows are also flattered — under WSL2 `posix_fadvise(DONTNEED)`
+does not reach the Windows host's own cache, so a genuinely cold read of that
+file would be slower than 5846 MiB/s.
+
+What the mount does win is the part that is not a throughput number:
+
+| | ready to read | disk needed |
+|---|---|---|
+| `lmz mount` | 15 ms | 1.19 GiB |
+| `lmz decompress` first | 2062 ms | 2.93 GiB |
+
+A model that is never expanded never costs its expanded size, and the second
+read of a tensor costs nothing at all: the kernel caches the *decoded* pages,
+which is where the 24 GB/s row comes from. Repeated loads — the normal case
+for a model you actually use — are served from that cache without decoding
+anything.
+
+### Threads
+
+Two, by default, and the measurement is emphatic:
+
+| server threads | 1 reader | 4 readers |
+|---|---|---|
+| 2 | 529 | **670** |
+| 4 | 516 | 349 |
+| 8 | 503 | 337 |
+
+This is the same inversion the decode path already documents. A 64 KiB block
+is a few microseconds of Python around its native decode, so a third server
+thread spends its time acquiring the GIL rather than decoding — and it is
+worse here than for plain decompression, because the server threads contend
+with the reader's threads as well as with each other. A free-threaded
+interpreter has no such point, so the cap lifts there automatically; lmz asks
+the interpreter rather than being told.
+
+Sequential reading through one file descriptor does not benefit from any of
+this, because the kernel waits for each reply before asking for the next, so
+that path measures one decode's latency and nothing else. Concurrency only
+pays when the reader is concurrent — which mmap-based loaders and sharded
+checkpoints both are.
+
 ## Command line
 
 ```
@@ -586,7 +680,19 @@ lmz info        <archive>          --tensors  --json  --limit N
 lmz cat         <archive> <tensor> -o FILE  --member FILE
 lmz bench       <file>             --bytes N
 lmz doctor
+
+lmz add         <path>             --name N  -l LEVEL  -j N  -f   --store DIR
+lmz models                         --json                        --store DIR
+lmz rm          <name>                                           --store DIR
+lmz mount       <mountpoint>       --model N  -d  --allow-other  --store DIR
+                                   --cache-blocks N  --verify  -j N
+lmz unmount     <mountpoint>
 ```
+
+The store lives at `$LMZ_HOME`, else `~/.lmz`: a directory of page-mapped
+archives plus a JSON index. The index exists only so that listing the store
+does not mean opening every archive in it, and `Store.rebuild()` reconstructs
+it from the archives alone if it is lost.
 
 `info` reports what the codec actually did, which is the quickest way to see
 why a file compressed the way it did:
@@ -637,6 +743,31 @@ random access.
 lmz.append("run.lmz", "checkpoint-9000.safetensors")   # code against what is there
 lmz.extract("run.lmz", "checkpoint-3000.safetensors", "ck3000.safetensors")
 ```
+
+The store is the same reader with a name attached, plus somewhere to put it:
+
+```python
+store = lmz.Store()                              # $LMZ_HOME, else ~/.lmz
+store.add("./Llama-3.1-8B-Instruct")             # compressed, page-mapped
+for e in store.models():
+    print(e.name, e.stored_size, f"{e.saved:.1%}")
+
+with store.open("Llama-3.1-8B-Instruct") as arc:   # no mount, no expansion
+    dtype, shape, raw = arc.tensor("model.embed_tokens.weight")
+```
+
+`mount` builds a server the caller runs; it must be its own process, because
+a thread that page-faults on its own mount blocks in the kernel while holding
+the GIL, and the thread that would answer the fault can never run:
+
+```python
+server = lmz.mount("/home/me/models")            # optionally names=[...]
+server.serve()                                   # blocks until unmounted
+```
+
+`Store` takes `root`; `add` takes `name`, `level`, `workers`, `force`,
+`block_size` and `progress`; `mount` takes `store`, `names`, `threads`,
+`allow_other`, `cache_blocks` and `verify`.
 
 `compress` takes `level`, `workers`, `chunk_size`, `checksum`, `dedup`,
 `delta`, `mapped`, `align` and `progress`; `append` takes `level`, `workers`,
@@ -715,6 +846,25 @@ its destination directory.
   that use case they win regardless of ratio.
 - **Decompressing to a file is I/O bound** on real storage. The gain there is
   that there are a third fewer bytes to move.
+- **The mount is slower than an uncompressed file on fast local storage.**
+  533–677 MiB/s of decoding against several GB/s of NVMe. It wins on the disk
+  it saves, on never expanding anything, and on repeat reads out of the page
+  cache — not on cold sequential throughput. Where the storage is slower than
+  the decoder, which is most on-device storage, it wins there too.
+- **Mounting is Linux-only and needs `fuse3`.** `fusermount3` must be on PATH
+  and `/dev/fuse` readable; `lmz doctor` reports whether it is. The store and
+  its random-access reader work everywhere, mount or no mount. Serving mmap
+  page faults directly through `userfaultfd` would avoid FUSE entirely, but
+  it needs `vm.unprivileged_userfaultfd=1`, which is off on most distributions.
+- **The mount must be its own process.** A thread that page-faults on an mmap
+  of its own mount blocks inside the kernel while still holding the GIL, so
+  the thread that would answer the fault never runs. `lmz mount` is a separate
+  process by construction; embedding the server in a process that also reads
+  the mount will deadlock.
+- **A large store costs memory to mount.** The chunk table is parsed into
+  Python objects at open: 305 bytes per 64 KiB block, which is 8 MiB for the
+  1.74 GiB model here and extrapolates to ~0.6 GiB for a 70B one, taking
+  about 11 s. That is the next thing to fix and it is a real limit today.
 - GGUF block-quantised tensors are split on their ggml struct layout, which
   covers Q4_0 through Q8_1, every k-quant, the IQ types and the ternary ones.
   A layout this build does not recognise falls back to opaque bytes.
@@ -725,7 +875,7 @@ its destination directory.
 python3 tests/test_lmz.py          # also runs under pytest
 ```
 
-62 tests covering kernel equivalence across all backends, element sizes and
+72 tests covering kernel equivalence across all backends, element sizes and
 block periods,
 rANS round-trips over adversarial distributions (including single-symbol
 streams, which exposed a frequency-field overflow), rANS landing within 2% of
@@ -755,7 +905,18 @@ boundary and still decompress and verify by the ordinary paths,
 growing an archive with `append` (matching a one-shot compression, refusing a
 name already present, leaving a rejected append's bytes untouched, and keeping
 a page-mapped archive page-mapped), single-member `extract`,
-path-traversal rejection, and the CLI.
+that coalescing a run of block payloads into one read returns what reading
+them one at a time returns,
+the store (add, list, remove, a refused overwrite leaving the first copy
+intact, name normalisation rejecting empty and traversing names, rebuilding a
+lost index from the archives, and reading a tensor out of a stored model),
+the mount's node tree over nested member paths and its refusal of `..`,
+and the mount itself, served from a separate process and compared against the
+source directory file by file — every member's sha256, random reads at page
+boundaries and at the end of a file, serving only the named models, agreement
+with a full `decompress`, and that writes, unlinks and mkdirs are all refused.
+Mount tests skip themselves where FUSE is unavailable rather than failing.
+Also path-traversal rejection, and the CLI.
 
 `tests/make_model.py` generates synthetic checkpoints with per-channel
 lognormal scaling, which reproduces the exponent skew of trained weights —
