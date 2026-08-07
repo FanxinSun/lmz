@@ -62,6 +62,19 @@ CODEC_BLK = 6  # v3 Q8_0 block split; still decoded, no longer written
 CODEC_GBLK = 7  # block split whose field grouping is described in the payload
 CODEC_DELTA = 8  # payload names an earlier output range plus a coded difference
 
+# Header flags. Both are advisory: the chunk table already addresses every
+# payload by explicit (offset, length), so a reader that ignores these still
+# decodes the archive correctly. They exist so a reader can tell whether
+# random access will be cheap before it starts.
+FLAG_PAGE_MAPPED = 1 << 0  # blocks are small enough to decode one at a time
+FLAG_ALIGNED = 1 << 1  # payloads start on PAGE_ALIGN boundaries
+
+# What a page-mapped archive aligns to, when it aligns at all. Storage below
+# this is indivisible: filesystems allocate whole 4 KiB blocks and flash reads
+# a page at a time, so a payload that starts mid-page makes the device fetch a
+# page nobody asked for.
+PAGE_ALIGN = 4096
+
 
 class FormatError(ValueError):
     """Raised when an archive is malformed, truncated, or not an archive."""
@@ -128,16 +141,28 @@ def _zstd_decompress(data: bytes) -> bytes:
 class ArchiveWriter:
     """Streams chunk payloads out, then writes the table, manifest and footer."""
 
-    def __init__(self, fileobj, manifest: dict):
+    def __init__(self, fileobj, manifest: dict, flags: int = 0, align: int = 0):
         self.f = fileobj
         self.manifest = manifest
         self.chunks: list[Chunk] = []
         self.offset = HEADER_SIZE
+        self.flags = flags
+        self.align = align
+        self.padding = 0
         self.f.write(b"\0" * HEADER_SIZE)  # rewritten by close()
 
     def append(self, parts, dst: int, rlen: int, crc: int,
                codec: int, esize: int, flags: int) -> None:
         """Append one chunk. `parts` is a sequence of buffers written in order."""
+        if self.align:
+            # Pad ahead of the payload, not after it, so the recorded offset is
+            # the aligned one. The gap is addressed by nothing and skipped by
+            # every reader, which is what keeps this backward compatible.
+            pad = -self.offset % self.align
+            if pad:
+                self.f.write(b"\0" * pad)
+                self.offset += pad
+                self.padding += pad
         clen = 0
         for part in parts:
             self.f.write(part)
@@ -163,7 +188,8 @@ class ArchiveWriter:
         self.f.write(FOOTER.pack(table_off, len(table_c), man_off, len(man_c), TAIL))
 
         self.f.seek(0)
-        self.f.write(HEADER.pack(MAGIC, FORMAT_VERSION, 0, original_size, 0, 0))
+        self.f.write(HEADER.pack(MAGIC, FORMAT_VERSION, self.flags,
+                                 original_size, 0, 0))
         self.f.flush()
 
 
@@ -211,3 +237,12 @@ class ArchiveReader:
     def payload_end(self) -> int:
         """First byte after the chunk payloads."""
         return min((c.off for c in self.chunks), default=self.file_size)
+
+    @property
+    def page_mapped(self) -> bool:
+        """Whether blocks are small enough that random access is cheap."""
+        return bool(self.flags & FLAG_PAGE_MAPPED)
+
+    @property
+    def aligned(self) -> bool:
+        return bool(self.flags & FLAG_ALIGNED)

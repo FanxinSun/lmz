@@ -48,7 +48,7 @@ def _load_native():
                 return None
             lib = ctypes.CDLL(path)
             lib.lmz_abi_version.restype = ctypes.c_int
-            if lib.lmz_abi_version() != 9:
+            if lib.lmz_abi_version() != 10:
                 _state = "abi-mismatch"
                 return None
             lib.lmz_isa.restype = ctypes.c_char_p
@@ -83,6 +83,10 @@ def _load_native():
             lib.lmz_bucket_unpartition.argtypes = [v, ctypes.POINTER(ctypes.c_void_p),
                                                    ctypes.c_size_t, v,
                                                    ctypes.c_size_t, v]
+            lib.lmz_decode_planes.restype = ctypes.c_int
+            lib.lmz_decode_planes.argtypes = [
+                v, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+                ctypes.c_uint32, ctypes.c_int, v, v, ctypes.c_size_t]
             lib.lmz_xor.restype = ctypes.c_int
             lib.lmz_xor.argtypes = [v, v, ctypes.c_size_t, v]
             lib.lmz_k4_scales.restype = ctypes.c_int
@@ -524,6 +528,47 @@ def bucket_unpartition(ctx, streams, lut: bytes, k: int, out=None):
         dst[i] = views[b][cur[b]]
         cur[b] += 1
     return memoryview(dst)[:n]
+
+
+# Working area for whole-chunk decodes: the planes, then whatever the merge
+# needs. Reused per thread so the hot path allocates nothing.
+_planes_scratch = threading.local()
+
+
+def _planes_buf(nbytes: int):
+    buf = getattr(_planes_scratch, "buf", None)
+    if buf is None or len(buf) < nbytes:
+        buf = _planes_scratch.buf = bytearray(nbytes)
+    return buf
+
+
+def decode_planes(payload, nplanes: int, nelem: int, methods: int,
+                  bf16: bool, out=None):
+    """Decode and merge every plane of a split chunk in one native call.
+
+    Returns a memoryview of the merged bytes, or None when the kernel will not
+    take it -- a plane coded with zstd or deflate, a malformed payload, or no
+    native kernel at all. The caller then runs the Python path, which stays
+    the single place that decides what a bad chunk means.
+
+    The point is not the arithmetic, which is identical, but the GIL: crossing
+    once per plane and again to merge hands the interpreter three chances to
+    hold up every other thread, and that is what made threaded reads slower
+    than serial ones.
+    """
+    lib = _load_native()
+    n = nplanes * nelem
+    if lib is None or n == 0 or nplanes > 16:
+        return None
+    dst = out if (out is not None and len(out) >= n) else bytearray(n)
+    need = n + lib.lmz_scratch_size(nelem, nplanes)
+    scr = _planes_buf(need)
+    pa, _a = _ptr(payload)
+    da, _b = _ptr(dst)
+    sa, _c = _ptr(scr)
+    rc = lib.lmz_decode_planes(pa, len(payload), nplanes, nelem, methods,
+                               1 if bf16 else 0, da, sa, need)
+    return memoryview(dst)[:n] if rc == 0 else None
 
 
 def xor_bytes(a, b, out=None):

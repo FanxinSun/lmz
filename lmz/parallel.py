@@ -14,8 +14,24 @@ from __future__ import annotations
 
 import os
 import queue
+import sys
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+
+
+def gil_enabled() -> bool:
+    """Whether this interpreter still serialises threads on the GIL.
+
+    False on a free-threaded build (3.13+ with the GIL disabled), where the
+    thread counts that pay change completely: lmz's decode path is native work
+    with a little Python between the calls, and it is that Python, not the
+    coder, that caps threaded reads at two here.
+    """
+    fn = getattr(sys, "_is_gil_enabled", None)
+    try:
+        return bool(fn()) if fn is not None else True
+    except Exception:
+        return True
 
 
 def default_workers() -> int:

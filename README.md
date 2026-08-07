@@ -1,5 +1,7 @@
 # lmz
 
+**Smaller checkpoints. Faster loads. Byte for byte.**
+
 Fast lossless compression for large model weights.
 
 On Llama-3.1-8B-Instruct's BF16 shards, lmz removes **34.7%** — better than
@@ -69,7 +71,11 @@ No installation, no dependencies:
                                                  #    tensors are stored once
 ```
 
-Python 3.9+ is the only requirement. On Python 3.14+ zstd comes from the
+Python 3.9+ is the only requirement. On a **free-threaded build** (3.13+ with
+the GIL disabled) lmz lifts its own thread caps and decoding scales across the
+whole machine — measured 8.84 GB/s against 1.73 on sixteen threads, verified
+on CPython 3.14.7t with the full test suite. Nothing needs configuring; it
+asks the interpreter. On Python 3.14+ zstd comes from the
 standard library; on older versions `pip install zstandard` gets it, and
 without either the tool falls back to deflate. A C compiler, if present, is
 used once to build the SIMD kernel into the package directory — nothing is
@@ -278,6 +284,25 @@ JSON headers, config files, unrecognised formats — goes to zstd, where LZ
 matching genuinely pays. A stream that zstd barely dents gets a second look
 from rANS, which is what catches quantised INT8 tensors.
 
+**Page-mapped archives.** The default 8 MiB chunk is right for compressing a
+model once and restoring it once, and wrong for everything else: reading a
+200-byte bias out of one decodes 8.39 MB, 32768 times what was asked for.
+`--mapped` cuts the archive into 64 KiB blocks instead, which the chunk table
+already indexes by destination offset, so `MappedArchive` answers any byte
+range by decoding the one or two blocks it touches. 64 KiB is where the two
+curves cross — 33.1% against 34.3% at 8 MiB, one point, while a block decodes
+in 74 us instead of 14 ms. Below it the ratio falls away fast, and at 4 KiB
+every block is stored raw because the frequency tables cost more than the data
+saves. That last fact is not lmz's alone: a filesystem cannot compress a 4 KiB
+cluster either, because it allocates whole 4 KiB blocks, so 4 KiB is the floor
+for any compressed storage scheme, in the kernel or out of it.
+
+`--align` additionally starts every block on a 4 KiB boundary. It costs the
+padding it writes — measured 1.6 points on real BF16 weights — and repays it
+only where reads bypass the page cache, so it is off by default. Both flags
+are backward compatible: padding sits between payloads that the chunk table
+addresses explicitly, so an older build reads these archives unchanged.
+
 **Parallelism.** Each chunk records where it belongs in the output, so
 decompression is a set of wholly independent jobs: N threads decode N chunks
 and place them with positional writes, with no ordering and no locks.
@@ -424,17 +449,111 @@ looked like it would:
   `FIRST_COMPLETED` re-installs a waiter on every outstanding future each time
   one finishes; at a few dozen in flight that alone held decompression to
   roughly single-threaded speed. Completions now arrive on a queue.
-- **Two plausible rANS optimisations did not pay.** Making renormalisation
-  branchless made decoding *slower*; the real serialisation is the shared
-  output cursor, which forces each stream's refill load to wait on the
-  previous one. Giving each state its own byte stream would fix it and is the
-  obvious next step.
+- **Threading a decoder written in two languages goes backwards.** Decoding a
+  block is 48 us of work against 1 us of pread, so a read is compute-bound and
+  the rANS kernel releases the GIL. It still got *slower* with threads: 0.81
+  GB/s on one, 1.60 on two, 0.70 on four. `decode_chunk` crossed into the
+  kernel once per plane and again to merge, so a 64 KiB block handed the GIL
+  round three times, and past two threads the interpreter spent its time on
+  the handoff rather than on decoding. That glue is only 8.6% of a block --
+  what mattered was not its cost but that it was *serialised*. Folding a whole
+  chunk into one crossing (`lmz_decode_planes`) removed the inversion and is
+  worth 9% single-threaded, but it did not buy a third or fourth thread: two
+  is still the ceiling, at 0.90 / 1.73 / 1.69 / 0.85 GB/s on one, two, four
+  and eight. Four *does* pay under `sys.setswitchinterval(50us)` against the
+  5 ms default -- 1.69 to 2.05 -- which says the rest is handoff latency, not
+  work. That setting is process-wide, so it belongs to whoever embeds lmz.
+- **The lock came back as the next bottleneck, one level down.** With a chunk
+  decoding in ~70 us, taking the block cache's lock twice per block put four
+  threads *behind* two again. Reading it once for a whole run and writing it
+  once at the end fixed that; a bulk read now touches the lock twice, not 256
+  times.
+- **How work reaches the pool mattered more than the pool.** Handing one
+  future per 64 KiB block costs about what decoding the block costs, so the
+  first attempt at parallel reads landed at 0.36 GB/s against 0.68
+  single-threaded -- a 2x pessimisation dressed as an optimisation. Giving
+  each thread a contiguous *run* of blocks instead turned the same two
+  threads into 1.13 GB/s. Also worth 45%: a single-block read now slices the
+  cached block directly, where assembling an output buffer for it had copied
+  every byte twice for nothing.
+- **The "obvious next step" was worth nothing, and measuring it cost less
+  than building it.** This list used to end by saying that the shared output
+  cursor serialises the eight interleaved states, and that giving each its own
+  byte stream was the obvious fix. It is not. An isolated loop with one cursor
+  per state runs at 4.89 cycles per symbol against 4.71 for the shared one --
+  a hair *worse* -- and deleting the refill machinery altogether only reaches
+  3.40, so the entire mechanism is a 1.4x ceiling rather than the 3-6x the
+  argument assumed. That would have been a breaking change to the stream
+  format in exchange for nothing. Two neighbouring ideas failed the same way:
+  splitting the 16 KiB decode table into 4 KiB of slot-to-symbol plus 1 KiB of
+  symbol-to-frequency costs 0.72x, because the second dependent load is dearer
+  than the cache footprint it saves, and writing the output with non-temporal
+  stores costs 0.94x, because the output is not what evicts the table.
+- **The GIL was the whole ceiling, and a free-threaded interpreter removes it
+  entirely.** Every thread cap in lmz exists because decoding is native work
+  with a little Python between the calls, and that little is serialised. On
+  CPython 3.14 free-threaded it simply is not. Cold 64 KiB blocks, one to
+  sixteen threads:
+
+  | | 1 | 2 | 4 | 8 | 16 |
+  |---|---|---|---|---|---|
+  | with the GIL | 0.90 | 1.71 | 1.59 | 0.83 | 0.83 |
+  | free-threaded | 0.88 | 1.73 | **3.08** | **5.37** | **8.84** |
+
+  Near-linear to sixteen: 9.8x over one thread and 5.1x over the best the GIL
+  allows. It carries through the real paths -- `MappedArchive` reads go from
+  0.69 to 2.87 GB/s, and a page-mapped archive decompresses at 2.24 against
+  0.95 -- and all 58 tests pass there, so the caps lift themselves when
+  `sys._is_gil_enabled()` says they can. This also puts the earlier dead ends
+  in proportion: SIMD and per-state streams were chasing about 2x on one core
+  while the interpreter was giving away 10x across the machine.
+- **Two fixes that each did nothing, and together were worth 3x.** Small
+  blocks made decompression six times slower -- 16k chunks through the
+  pipeline where the default has 119. Grouping them into 4 MiB tasks looked
+  like the obvious answer and moved nothing, because the interpreter's share
+  is per *chunk*, not per task. Capping the worker count, once that was
+  understood, also moved almost nothing on its own. On a 64 KiB-block archive,
+  best of three at twelve threads:
+
+  | | one chunk per task | batched into 4 MiB |
+  |---|---|---|
+  | **-j12** | 0.33 GB/s | 0.34 |
+  | **capped at 2** | 0.40 | **1.04** |
+
+  Batching gives each thread a run long enough to be worth holding the GIL
+  for; the cap stops the threads fighting over it. Either alone leaves the
+  other's bottleneck in place, which is why the first two attempts each read
+  as a failure. Encoding has the same shape and takes the same pair --
+  compressing to 64 KiB blocks went from 0.17 to 0.41 GB/s at twelve threads,
+  while the 8 MiB default is untouched at 1.35.
+- **The right thread count is a property of the chunk size, and the boundary
+  is sharp.** A chunk costs a few microseconds of interpreter around whatever
+  native decoding it carries, so at 8 MiB the Python is a rounding error and
+  threads scale, while at 64 KiB it is a few percent and they collapse. The
+  worker count now comes from the average chunk rather than from `-j`. Capped,
+  256 KiB and 1 MiB chunks run at 1.31 and 1.39 GB/s; uncapped, at 1.23 and
+  **4.29**. The first attempt put the threshold at 1 MiB and so capped the
+  size that scales best, costing exactly the 3x it was meant to win. Single
+  runs hid it: this measurement swings 30% run to run, and only best-of-three
+  is stable enough to place a boundary with.
+- **A decoder that looks three times faster is usually measuring cache.** The
+  same kernel reports 4.65 cycles per symbol on a 32 KiB plane and 13.2 on a
+  2 MiB one, which reads like a cliff worth chasing. It is not: the small case
+  re-decodes one resident buffer thousands of times. Cold, on data streamed
+  once -- which is the only case a decompressor ever sees -- it is flat at
+  0.37-0.39 GB/s from 8 KiB to 4 MiB. This measurement fooled two separate
+  attempts here before the cold version settled it.
+- **Making rANS renormalisation branchless made decoding *slower*.** The
+  explanation offered here for a long time was that the shared output cursor
+  serialises each stream's refill behind the previous one. That explanation
+  was wrong, as the entry above records; the refill is not where the cycles
+  go. What remains true is only the measurement: the branchless variant lost.
 
 ## Command line
 
 ```
 lmz compress    <input> [output]   -l LEVEL  -j N  --chunk-size N  --no-checksum
-                                   --no-dedup  --no-delta  -f
+                                   --no-dedup  --no-delta  --mapped  --align  -f
 lmz decompress  <input> [output]   -j N  --no-verify  -f
 lmz verify      <archive>          -j N
 lmz info        <archive>          --tensors  --json  --limit N
@@ -471,8 +590,25 @@ meta = lmz.info("model.lmz")                       # members, tensors, codecs
 dtype, shape, raw = lmz.read_tensor("model.lmz", "model.embed_tokens.weight")
 ```
 
+`MappedArchive` is the random-access reader:
+
+```python
+with lmz.MappedArchive("model.lmz") as arc:      # written with mapped=True
+    head = arc.read(0, 4096)                     # any byte range
+    dtype, shape, raw = arc.tensor("model.embed_tokens.weight")
+    print(arc.decoded_bytes)                     # what it actually expanded
+```
+
+On a 942 MiB BF16 model, 200 random 4 KiB reads take 20 ms against 3.9 s from
+an 8 MiB-chunk archive, and expand 17x what was asked for rather than 2025x.
+Reading runs at 1.22 GB/s, which is the honest ceiling and worth
+being precise about: it beats phone flash, and it does not beat an NVMe drive.
+Compression buys a cold load a third fewer bytes to move; it does not make
+inference faster, and a plain mmap of an uncompressed file still wins on
+random access.
+
 `compress` takes `level`, `workers`, `chunk_size`, `checksum`, `dedup`,
-`delta` and `progress`; `decompress` takes `workers`, `verify_checksums`, `overwrite` and
+`delta`, `mapped`, `align` and `progress`; `decompress` takes `workers`, `verify_checksums`, `overwrite` and
 `progress`. `progress` is called with `(bytes_done, total)`.
 
 ## Archive format
@@ -557,7 +693,7 @@ its destination directory.
 python3 tests/test_lmz.py          # also runs under pytest
 ```
 
-55 tests covering kernel equivalence across all backends, element sizes and
+58 tests covering kernel equivalence across all backends, element sizes and
 block periods,
 rANS round-trips over adversarial distributions (including single-symbol
 streams, which exposed a frequency-field overflow), rANS landing within 2% of
@@ -580,6 +716,10 @@ archive compatibility, file and directory round-trips compared by hash,
 deterministic output across thread counts, tensor extraction, corruption and
 truncation detection (damage to a block payload is either rejected or lands
 on a byte no decoder consults — never silently wrong output),
+page-mapped random access (every byte range matching the original, a one-byte
+read expanding no more than one block, and the cache never changing what is
+returned), that aligned archives really do start every block on a page
+boundary and still decompress and verify by the ordinary paths,
 path-traversal rejection, and the CLI.
 
 `tests/make_model.py` generates synthetic checkpoints with per-channel

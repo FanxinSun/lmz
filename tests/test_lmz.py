@@ -931,6 +931,101 @@ def test_delta_corruption_rejected():
             raise AssertionError(f"damage at delta byte {off} was accepted")
 
 
+def test_mapped_archive_random_access():
+    """A page-mapped archive must serve any byte range from one small block."""
+    blob = weights_bf16(900000, 51)
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "m.safetensors")
+        write_safetensors(src, [("a.weight", "BF16", [900000], blob)])
+        raw = open(src, "rb").read()
+
+        plain = os.path.join(d, "plain.lmz")
+        mapped = os.path.join(d, "mapped.lmz")
+        lmz.compress(src, plain)
+        lmz.compress(src, mapped, mapped=True)
+
+        with lmz.MappedArchive(mapped) as a:
+            assert a.page_mapped and not a.aligned
+            assert a.block_bytes <= lmz.api.DEFAULT_BLOCK_SIZE
+            assert a.size == len(raw)
+            # every read must match the original file exactly
+            for off, ln in ((0, 1), (len(raw) - 1, 1), (5, 100000),
+                            (len(raw) // 3, 70000), (0, len(raw))):
+                assert a.read(off, ln) == raw[off:off + ln], (off, ln)
+            # reading past the end clamps rather than failing
+            assert a.read(len(raw) - 10, 999) == raw[-10:]
+            assert a.read(len(raw), 10) == b""
+
+        # a one-byte read must not expand more than one block
+        with lmz.MappedArchive(mapped) as a:
+            a.read(len(raw) // 2, 1)
+            assert a.decoded_bytes <= lmz.api.DEFAULT_BLOCK_SIZE, a.decoded_bytes
+        with lmz.MappedArchive(plain) as a:
+            a.read(len(raw) // 2, 1)
+            big = a.decoded_bytes
+        assert big > lmz.api.DEFAULT_BLOCK_SIZE * 8, big
+
+        # neither the cache nor the read pool may change what is returned
+        for kw in ({"cache_blocks": 1}, {"workers": 1}, {"workers": 2},
+                   {"workers": 2, "cache_blocks": 1}):
+            with lmz.MappedArchive(mapped, **kw) as a:
+                assert a.read(1000, 200000) == raw[1000:201000], kw
+                assert a.read(0, len(raw)) == raw, kw
+        assert lmz.info(mapped)["manifest"]["mapped"] is True
+
+
+def test_mapped_archive_still_decompresses_whole():
+    """Small blocks and padding must not disturb the ordinary paths."""
+    blob = weights_bf16(400000, 53)
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "m.safetensors")
+        write_safetensors(src, [("a.weight", "BF16", [400000], blob)])
+        for name, kw in (("mapped.lmz", {"mapped": True}),
+                         ("aligned.lmz", {"mapped": True, "align": True})):
+            arc = os.path.join(d, name)
+            lmz.compress(src, arc, **kw)
+            lmz.verify(arc)
+            out = os.path.join(d, "out-" + name)
+            lmz.decompress(arc, out)
+            assert digest(src) == digest(out), name
+            _dt, _sh, got = lmz.read_tensor(arc, "a.weight")
+            assert got == blob, name
+
+
+def test_aligned_archive_starts_blocks_on_page_boundaries():
+    """--align must actually align, and cost only the padding it writes."""
+    blob = weights_bf16(600000, 55)
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "m.safetensors")
+        write_safetensors(src, [("a.weight", "BF16", [600000], blob)])
+        loose = os.path.join(d, "loose.lmz")
+        tight = os.path.join(d, "tight.lmz")
+        lmz.compress(src, loose, mapped=True)
+        stats = lmz.compress(src, tight, mapped=True, align=True)
+
+        with open(tight, "rb") as fh:
+            reader = ArchiveReader(fh)
+        assert reader.aligned and reader.page_mapped
+        for c in reader.chunks:
+            assert c.off % lmzformat.PAGE_ALIGN == 0, c.off
+        # Padding accounts for the growth. Not to the byte: larger offsets
+        # make the chunk table compress slightly differently.
+        pad = stats.detail["padding_bytes"]
+        grew = os.path.getsize(tight) - os.path.getsize(loose)
+        assert 0 < pad <= lmzformat.PAGE_ALIGN * len(reader.chunks), pad
+        assert abs(grew - pad) < (1 << 16), (grew, pad)
+
+        with open(loose, "rb") as fh:
+            assert not ArchiveReader(fh).aligned
+
+        try:
+            lmz.compress(src, os.path.join(d, "x.lmz"), align=True)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("align without mapped should be rejected")
+
+
 def test_dedup_across_files():
     """A tensor shipped twice under different names must be stored once."""
     shared = weights_bf16(150000, 21)

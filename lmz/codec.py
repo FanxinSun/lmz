@@ -952,6 +952,19 @@ def decode_chunk(payload, codec: int, esize: int, flags: int, rlen: int,
             raise ValueError("a bf16 chunk must have 2-byte elements")
         nplanes = 2 if codec == CODEC_BF16 else esize
         nelem = rlen // nplanes
+        # One crossing for the whole chunk. Identical arithmetic to the path
+        # below, which still runs whenever the kernel declines -- a plane
+        # coded with zstd, a damaged payload, or no native build -- so error
+        # reporting and the fallback backends are unchanged.
+        fast = kernels.decode_planes(payload, nplanes, nelem, flags,
+                                     codec == CODEC_BF16, out)
+        if fast is not None:
+            result = fast
+            if verify and crc:
+                if (zlib.crc32(result) & 0xFFFFFFFF) != crc:
+                    raise CorruptArchive(
+                        "chunk failed its checksum; the archive is corrupt")
+            return result
         hdr = _plane_header(nplanes)
         if len(payload) < hdr.size:
             raise ValueError("split chunk is truncated")

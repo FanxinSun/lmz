@@ -18,17 +18,29 @@ import sys
 import threading
 import time
 from bisect import bisect_right
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 from . import codec as _codec
 from . import entropy, kernels
-from .format import (CODEC_DELTA, CODEC_REF, ArchiveReader, ArchiveWriter,
-                     CorruptArchive, FormatError, Member)
-from .parallel import default_workers, ordered_map, unordered_map
+from .format import (CODEC_DELTA, CODEC_REF, FLAG_ALIGNED, FLAG_PAGE_MAPPED,
+                     PAGE_ALIGN, ArchiveReader, ArchiveWriter, CorruptArchive,
+                     FormatError, Member)
+from .parallel import (default_workers, gil_enabled, ordered_map,
+                        unordered_map)
 from .planner import KIND_DELTA, KIND_REF, chunkify, probe
 
 DEFAULT_CHUNK_SIZE = 8 << 20
 DEFAULT_LEVEL = 1
+
+# Block size for page-mapped archives. Measured on real BF16 weights, this is
+# where the two curves cross: 64 KiB keeps 33.14% against 34.34% at 8 MiB --
+# 1.2 points -- while a block decodes in 74 us instead of 14 ms. 74 us is
+# faster than the flash read it replaces on any phone or NVMe drive, so
+# decompression stops being a cost and hides behind I/O. Below this it falls
+# away fast: 16 KiB gives 30.65%, and at 4 KiB the frequency tables cost more
+# than the data saves and every block is stored raw.
+DEFAULT_BLOCK_SIZE = 64 << 10
 
 # Tensors below this size are not worth deduplicating: the bookkeeping and
 # hashing outweigh a few kilobytes of norm weights.
@@ -402,12 +414,23 @@ def _locate_output(members, off: int):
 
 
 def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
-             workers: int | None = None, chunk_size: int = DEFAULT_CHUNK_SIZE,
+             workers: int | None = None, chunk_size: int | None = None,
              checksum: bool = True, dedup: bool = True, delta: bool = True,
-             progress=None) -> Stats:
-    """Compress a file or directory into the archive at `dst`."""
+             mapped: bool = False, align: bool = False, progress=None) -> Stats:
+    """Compress a file or directory into the archive at `dst`.
+
+    `mapped` cuts the archive into small blocks so any byte range can be
+    decoded on its own, which is what `MappedArchive` needs and what a
+    demand-paging loader needs underneath it. `align` additionally starts
+    every payload on a 4 KiB boundary; it costs the padding it writes and only
+    repays it where reads bypass the page cache, so it is off by default.
+    """
     workers = workers or default_workers()
+    if chunk_size is None:
+        chunk_size = DEFAULT_BLOCK_SIZE if mapped else DEFAULT_CHUNK_SIZE
     chunk_size = max(chunk_size, 1 << 16)
+    if align and not mapped:
+        raise ValueError("align only makes sense for a page-mapped archive")
     started = time.perf_counter()
 
     if os.path.isdir(src):
@@ -463,6 +486,8 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
         "tool": f"lmz {_version()}",
         "level": level,
         "chunk_size": chunk_size,
+        "mapped": bool(mapped),
+        "aligned": bool(align),
         "entropy": entropy.BACKEND,
         "checksum": "crc32" if checksum else "none",
         "total_size": total_in,
@@ -504,14 +529,27 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
                                                      kind=kind, btype=btype)
         return members[idx].dst + start, end - start, parts, cid, esize, flags, crc
 
+    def work_batch(batch):
+        return [work(task) for task in batch]
+
     tmp = dst + ".part"
     try:
         with open(tmp, "wb", buffering=1 << 20) as out:
-            writer = ArchiveWriter(out, manifest)
-            for dst_off, rlen, parts, cid, esize, flags, crc in ordered_map(
-                    work, plan, workers, lookahead=workers * 2):
-                writer.append(parts, dst_off, rlen, crc, cid, esize, flags)
-                done += rlen
+            hflags = (FLAG_PAGE_MAPPED if mapped else 0) | \
+                     (FLAG_ALIGNED if align else 0)
+            writer = ArchiveWriter(out, manifest, flags=hflags,
+                                   align=PAGE_ALIGN if align else 0)
+            # Encoding has the same granularity problem as decoding, and the
+            # same two-part answer: a 64 KiB chunk is a few microseconds of
+            # interpreter around its native work, so twelve threads spend
+            # their time on the GIL rather than on coding.
+            nw = _worker_cap([e - s for _i, s, e, *_r in plan], workers)
+            for results in ordered_map(
+                    work_batch, _batches(plan, lambda t: t[2] - t[1]), nw,
+                    lookahead=nw * 2):
+                for dst_off, rlen, parts, cid, esize, flags, crc in results:
+                    writer.append(parts, dst_off, rlen, crc, cid, esize, flags)
+                    done += rlen
                 if progress:
                     progress(done, total_in)
             writer.close(total_in)
@@ -525,6 +563,7 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
     finally:
         pool.close()
 
+    stats.detail["padding_bytes"] = writer.padding
     stats.output_bytes = os.path.getsize(dst)
     stats.seconds = time.perf_counter() - started
     return stats
@@ -643,19 +682,24 @@ def decompress(src: str, dst: str, *, workers: int | None = None,
 
     decode = _chunk_decoder(chunks, payload_of, verify_checksums)
 
-    def work(chunk):
-        payload = payload_of(chunk)
-        data = decode(chunk, payload, out=_scratch(chunk.rlen))
-        i = bisect_right(starts, chunk.dst) - 1
-        if i < 0 or chunk.dst + chunk.rlen > members[i].dst + members[i].size:
-            raise FormatError(f"chunk at {chunk.dst} does not fit any member")
-        written = os.pwrite(out_pool.get(i), data, chunk.dst - members[i].dst)
-        if written != len(data):
-            raise IOError(f"short write to {out_paths[i]}")
-        return chunk.rlen
+    def work(batch):
+        done_bytes = 0
+        for chunk in batch:
+            payload = payload_of(chunk)
+            data = decode(chunk, payload, out=_scratch(chunk.rlen))
+            i = bisect_right(starts, chunk.dst) - 1
+            if i < 0 or chunk.dst + chunk.rlen > members[i].dst + members[i].size:
+                raise FormatError(f"chunk at {chunk.dst} does not fit any member")
+            written = os.pwrite(out_pool.get(i), data, chunk.dst - members[i].dst)
+            if written != len(data):
+                raise IOError(f"short write to {out_paths[i]}")
+            done_bytes += chunk.rlen
+        return done_bytes
 
     try:
-        for rlen in unordered_map(work, chunks, workers, lookahead=workers * 3):
+        nw = _decode_workers(chunks, workers)
+        for rlen in unordered_map(work, _batches(chunks, lambda c: c.rlen), nw,
+                                  lookahead=nw * 3):
             done += rlen
             if progress:
                 progress(done, total_out)
@@ -672,6 +716,66 @@ def decompress(src: str, dst: str, *, workers: int | None = None,
     return Stats(input_bytes=total_out, output_bytes=os.path.getsize(src),
                  seconds=time.perf_counter() - started, chunks=len(chunks),
                  files=len(members), detail={"manifest": manifest})
+
+
+# How much decoded output one pool task should carry. A task's dispatch costs
+# roughly what decoding a 64 KiB block costs, so a page-mapped archive -- 16k
+# blocks where a default one has 119 -- spent most of decompression feeding
+# the pool rather than decoding, and ran 6x slower for it. Grouping restores
+# the ratio without changing a byte of what is decoded, and leaves the default
+# archive alone: at 8 MiB a chunk already exceeds this on its own.
+DECODE_BATCH = 4 << 20
+
+
+# Chunk size at which decoding stops being Python-bound. A chunk costs about
+# 4 us of interpreter around however much native decoding it carries, so a
+# 64 KiB block is ~5% Python and a 1 MiB one is a fraction of a percent.
+# Measured at twelve threads, best of three, on a 1 GiB BF16 model:
+#
+#   chunk    threads capped    uncapped
+#    64 KiB       1.05 GB/s    0.34 GB/s
+#   256 KiB       1.31         1.23
+#     1 MiB       1.39         4.29
+#
+# so the boundary is between 256 KiB and 1 MiB, and it is sharp. A first
+# attempt put it at 1 MiB, which capped the row that scales best and cost 3x
+# -- single runs had hidden it, because this measurement swings 30% run to run
+# and only best-of-three is stable.
+THREADS_SCALE_ABOVE = 512 << 10
+GIL_DECODE_WORKERS = 2
+
+
+def _worker_cap(sizes, workers: int) -> int:
+    """How many threads work of this granularity is actually worth.
+
+    Capping is the opposite of what a thread pool usually wants, and it is
+    what the measurement says: with small chunks the GIL handoff between one
+    chunk's native calls and the next costs more than another core brings.
+    A free-threaded interpreter has no such point, so the cap lifts there.
+    """
+    if not sizes or workers <= GIL_DECODE_WORKERS or not gil_enabled():
+        return workers
+    if sum(sizes) / len(sizes) >= THREADS_SCALE_ABOVE:
+        return workers
+    return GIL_DECODE_WORKERS
+
+
+def _decode_workers(chunks, workers: int) -> int:
+    return _worker_cap([c.rlen for c in chunks], workers)
+
+
+def _batches(items, size_of, target: int = DECODE_BATCH):
+    """Group consecutive items so each task carries a worthwhile amount."""
+    out, cur, acc = [], [], 0
+    for it in items:
+        cur.append(it)
+        acc += size_of(it)
+        if acc >= target:
+            out.append(cur)
+            cur, acc = [], 0
+    if cur:
+        out.append(cur)
+    return out
 
 
 def _check_coverage(chunks, total: int) -> None:
@@ -733,28 +837,35 @@ def verify(src: str, *, workers: int | None = None, progress=None) -> Stats:
 
     resolve = _range_resolver(chunks, payload_of, True)
 
-    def work(chunk):
-        payload = payload_of(chunk)
-        if chunk.codec == CODEC_REF:
-            if len(payload) != 8:
-                raise CorruptArchive("ref chunk payload must be 8 bytes")
-            (src,) = struct.unpack("<Q", bytes(payload))
-            check_source(src, chunk.rlen, "ref target")
-        elif chunk.codec == CODEC_DELTA:
-            # A delta carries real data, so it is decoded and checksummed in
-            # full -- unlike a ref, nothing else in this pass would catch a
-            # damaged difference.
-            src, _inner, _off = _codec.delta_source(payload)
-            check_source(src, chunk.rlen, "delta source")
-            _codec.decode_delta(payload, chunk.esize, chunk.flags, chunk.rlen,
-                                resolve(src, chunk.rlen), chunk.crc, True)
-        else:
-            _codec.decode_chunk(payload, chunk.codec, chunk.esize, chunk.flags,
-                                chunk.rlen, chunk.crc, True, out=_scratch(chunk.rlen))
-        return chunk.rlen
+    def work(batch):
+        done_bytes = 0
+        for chunk in batch:
+            payload = payload_of(chunk)
+            if chunk.codec == CODEC_REF:
+                if len(payload) != 8:
+                    raise CorruptArchive("ref chunk payload must be 8 bytes")
+                (src,) = struct.unpack("<Q", bytes(payload))
+                check_source(src, chunk.rlen, "ref target")
+            elif chunk.codec == CODEC_DELTA:
+                # A delta carries real data, so it is decoded and checksummed
+                # in full -- unlike a ref, nothing else in this pass would
+                # catch a damaged difference.
+                src, _inner, _off = _codec.delta_source(payload)
+                check_source(src, chunk.rlen, "delta source")
+                _codec.decode_delta(payload, chunk.esize, chunk.flags,
+                                    chunk.rlen, resolve(src, chunk.rlen),
+                                    chunk.crc, True)
+            else:
+                _codec.decode_chunk(payload, chunk.codec, chunk.esize,
+                                    chunk.flags, chunk.rlen, chunk.crc, True,
+                                    out=_scratch(chunk.rlen))
+            done_bytes += chunk.rlen
+        return done_bytes
 
     try:
-        for rlen in unordered_map(work, chunks, workers, lookahead=workers * 3):
+        nw = _decode_workers(chunks, workers)
+        for rlen in unordered_map(work, _batches(chunks, lambda c: c.rlen), nw,
+                                  lookahead=nw * 3):
             done += rlen
             if progress:
                 progress(done, total)
@@ -794,49 +905,257 @@ def info(src: str) -> dict:
         }
 
 
+class MappedArchive:
+    """Random access into an archive without expanding it.
+
+    The chunk table is already an index: every block records where it lands in
+    the output and where its payload sits in the archive, so reading a byte
+    range is a binary search plus a decode of the blocks it touches. What
+    decides whether that is cheap is the block size. At the 8 MiB default,
+    reading a 200-byte bias decodes 8.39 MB -- 32768 times what was asked for.
+    At the 64 KiB blocks `compress(mapped=True)` writes, the same read decodes
+    64 KiB in 74 us, which is quicker than the flash read it replaces.
+
+    Decoded blocks are cached, so walking a tensor decodes each block once and
+    a second read inside one costs nothing. `decoded_bytes` records what was
+    actually expanded, which is the honest way to see the amplification.
+
+    Not thread-safe: give each thread its own instance.
+    """
+
+    # Decoding a block is 48 us of work against 1 us of pread, so reads are
+    # compute-bound and the kernel releases the GIL for the whole of a chunk.
+    # Two is still the measured optimum: 0.90 GB/s on one thread, 1.73 on
+    # two, 1.69 on four and 0.85 on eight. Folding a chunk into one native
+    # call removed the old inversion -- four threads used to be *slower* than
+    # one -- but it did not buy a third and fourth thread, because what little
+    # Python is left between decodes turns into GIL contention.
+    #
+    # Four does pay at sys.setswitchinterval(50us) instead of the 5 ms
+    # default: 1.69 -> 2.05 GB/s. That is a process-wide setting and belongs
+    # to whoever embeds this, not to a library, so the default stays at two.
+    MAX_READ_WORKERS = 2
+
+    # Below this many blocks the pool costs more to feed than it saves.
+    PARALLEL_MIN_BLOCKS = 4
+
+    def __init__(self, path: str, *, verify: bool = True,
+                 cache_blocks: int = 32, workers: int | None = None):
+        self.path = path
+        self._fh = open(path, "rb")
+        try:
+            self._reader = ArchiveReader(self._fh)
+        except BaseException:
+            self._fh.close()
+            raise
+        self._chunks = sorted(self._reader.chunks, key=lambda c: c.dst)
+        self._starts = [c.dst for c in self._chunks]
+        self._decode = _chunk_decoder(self._chunks, self._payload_of, verify)
+        self._cache: "OrderedDict[int, bytes]" = OrderedDict()
+        self._cap = max(1, cache_blocks)
+        self._lock = threading.Lock()
+        self._pool = None
+        self._workers = (self._auto_workers() if workers is None
+                         else max(1, workers))
+        self.decoded_bytes = 0
+        self.blocks_decoded = 0
+        self.cache_hits = 0
+
+    # -- introspection ----------------------------------------------------
+    @property
+    def members(self):
+        return self._reader.members
+
+    @property
+    def size(self) -> int:
+        """Total size of everything the archive restores to."""
+        return sum(m.size for m in self._reader.members)
+
+    @property
+    def page_mapped(self) -> bool:
+        return self._reader.page_mapped
+
+    @property
+    def aligned(self) -> bool:
+        return self._reader.aligned
+
+    @property
+    def block_bytes(self) -> int:
+        """Largest block in the archive: what a one-byte read can cost."""
+        return max((c.rlen for c in self._chunks), default=0)
+
+    # -- reading ----------------------------------------------------------
+    def _payload_of(self, c):
+        payload = os.pread(self._fh.fileno(), c.clen, c.off)
+        if len(payload) != c.clen:
+            raise FormatError("archive is truncated")
+        return payload
+
+    @classmethod
+    def _auto_workers(cls) -> int:
+        """Threads for reads: two under the GIL, as many as there are without.
+
+        The cap exists only because the Python between native calls is
+        serialised. A free-threaded build has no such point, so the limit is
+        the machine. Untested here -- this box has no free-threaded
+        interpreter -- so the cap is lifted only where the interpreter itself
+        says the GIL is gone.
+        """
+        if not gil_enabled():
+            return default_workers()
+        return min(default_workers(), cls.MAX_READ_WORKERS)
+
+    def _lookup(self, idx: list) -> list:
+        """Cache hits for every index, under one lock rather than one each."""
+        with self._lock:
+            out = []
+            for i in idx:
+                got = self._cache.get(i)
+                if got is not None:
+                    self._cache.move_to_end(i)
+                    self.cache_hits += 1
+                out.append(got)
+            return out
+
+    def _store(self, items) -> None:
+        with self._lock:
+            for i, data in items:
+                self.decoded_bytes += len(data)
+                self.blocks_decoded += 1
+                self._cache[i] = data
+            while len(self._cache) > self._cap:
+                self._cache.popitem(last=False)
+
+    def _raw(self, i: int) -> bytes:
+        # Decode into a per-thread buffer and copy out for the cache: a fresh
+        # 64 KiB bytearray per block has to be allocated and zeroed with the
+        # GIL held, which cost 1.69 against 1.40 GB/s across four threads.
+        c = self._chunks[i]
+        return bytes(self._decode(c, self._payload_of(c), out=_scratch(c.rlen)))
+
+    def _decode_run(self, idx: list) -> dict:
+        """Decode a run of blocks, taking the cache lock once at the end.
+
+        Locking per block instead put four threads *behind* two, because a
+        bulk read acquires it twice per block and a decode is only ~70 us.
+        """
+        got = {i: self._raw(i) for i in idx}
+        self._store(got.items())
+        return got
+
+    def _block(self, i: int) -> bytes:
+        got = self._lookup([i])[0]
+        if got is None:
+            got = self._raw(i)
+            self._store(((i, got),))
+        return got
+
+    def _blocks(self, idx: list) -> list:
+        """Decode every block in `idx`, using the pool when it is worth feeding."""
+        got = self._lookup(idx)
+        missing = [i for i, d in zip(idx, got) if d is None]
+        if len(missing) >= self.PARALLEL_MIN_BLOCKS and self._workers > 1:
+            if self._pool is None:
+                from concurrent.futures import ThreadPoolExecutor
+
+                self._pool = ThreadPoolExecutor(
+                    self._workers, thread_name_prefix="lmz-read")
+            # One task per run of blocks, never one per block: handing a
+            # future to the pool costs about what decoding a 64 KiB block
+            # costs, so per-block dispatch spends the parallelism on its own
+            # bookkeeping and lands slower than a plain loop.
+            step = -(-len(missing) // self._workers)
+            runs = [missing[j:j + step] for j in range(0, len(missing), step)]
+            done = {}
+            for part in self._pool.map(self._decode_run, runs):
+                done.update(part)
+        else:
+            done = self._decode_run(missing)
+        return [d if d is not None else done[i] for i, d in zip(idx, got)]
+
+    def _locate(self, pos: int) -> int:
+        i = bisect_right(self._starts, pos) - 1
+        if not 0 <= i < len(self._chunks):
+            raise CorruptArchive(f"byte {pos} is not covered by any chunk")
+        c = self._chunks[i]
+        if not (c.dst <= pos < c.dst + c.rlen):
+            raise CorruptArchive(f"byte {pos} is not covered by any chunk")
+        return i
+
+    def read(self, offset: int, length: int) -> bytes:
+        """Bytes [offset, offset+length) of the restored output."""
+        if offset < 0 or length < 0:
+            raise ValueError("offset and length must not be negative")
+        end = min(offset + length, self.size)
+        if offset >= end:
+            return b""
+
+        first = self._locate(offset)
+        c = self._chunks[first]
+        # The common case by count -- a small read inside one block -- takes
+        # nothing but a slice. Assembling a buffer for it copied every byte
+        # twice over for no reason.
+        if end <= c.dst + c.rlen:
+            a = offset - c.dst
+            return bytes(self._block(first)[a:a + (end - offset)])
+
+        idx, pos = [], offset
+        i = first
+        while pos < end:
+            i = self._locate(pos)
+            idx.append(i)
+            pos = self._chunks[i].dst + self._chunks[i].rlen
+
+        out = bytearray(end - offset)
+        for i, data in zip(idx, self._blocks(idx)):
+            c = self._chunks[i]
+            a = max(offset, c.dst) - c.dst
+            b = min(end, c.dst + c.rlen) - c.dst
+            out[c.dst + a - offset:c.dst + b - offset] = data[a:b]
+        return bytes(out)
+
+    def read_member(self, member: str, offset: int = 0,
+                    length: int | None = None) -> bytes:
+        for m in self._reader.members:
+            if m.path == member:
+                n = m.size - offset if length is None else length
+                return self.read(m.dst + offset, max(0, min(n, m.size - offset)))
+        raise KeyError(f"no member named {member!r}")
+
+    def tensor(self, name: str, member: str | None = None):
+        """One tensor as (dtype, shape, raw little-endian bytes)."""
+        for m in self._reader.members:
+            if member is not None and m.path != member:
+                continue
+            if m.tensors and name in m.tensors:
+                meta = m.tensors[name]
+                start, end = meta["offsets"]
+                raw = self.read(m.dst + start, end - start)
+                return meta.get("dtype", ""), meta.get("shape", []), raw
+        where = f" in {member}" if member else ""
+        raise KeyError(f"no tensor named {name!r}{where}")
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
+            self._pool = None
+        self._cache.clear()
+        self._fh.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+
 def read_tensor(src: str, name: str, member: str | None = None) -> tuple[str, list, bytes]:
     """Extract one tensor without decompressing the rest of the archive.
 
     Returns (dtype, shape, raw little-endian bytes).
     """
-    with open(src, "rb") as fh:
-        reader = ArchiveReader(fh)
-        target = None
-        for m in reader.members:
-            if member is not None and m.path != member:
-                continue
-            if m.tensors and name in m.tensors:
-                target = (m, m.tensors[name])
-                break
-        if target is None:
-            where = f" in {member}" if member else ""
-            raise KeyError(f"no tensor named {name!r}{where}")
-
-        m, meta = target
-        start, end = meta["offsets"]
-        lo, hi = m.dst + start, m.dst + end
-
-        def payload_of(c):
-            fh.seek(c.off)
-            payload = fh.read(c.clen)
-            if len(payload) != c.clen:
-                raise FormatError("archive is truncated")
-            return payload
-
-        decode = _chunk_decoder(reader.chunks, payload_of, True)
-        starts = [c.dst for c in reader.chunks]
-        i = max(0, bisect_right(starts, lo) - 1)
-        out = bytearray()
-        for c in reader.chunks[i:]:
-            if c.dst >= hi:
-                break
-            if c.dst + c.rlen <= lo:
-                continue
-            data = decode(c, payload_of(c))
-            a = max(lo, c.dst) - c.dst
-            b = min(hi, c.dst + c.rlen) - c.dst
-            out += data[a:b]
-        return meta.get("dtype", ""), meta.get("shape", []), bytes(out)
+    with MappedArchive(src, cache_blocks=4) as arc:
+        return arc.tensor(name, member)
 
 
 def _version() -> str:

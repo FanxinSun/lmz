@@ -197,7 +197,7 @@ LMZ_API const char *lmz_isa(void)
 #endif
 }
 
-LMZ_API int lmz_abi_version(void) { return 9; }
+LMZ_API int lmz_abi_version(void) { return 10; }
 
 /*
  * out = a ^ b, the whole of a delta chunk's arithmetic.
@@ -976,4 +976,72 @@ LMZ_API int lmz_rans_decode(const uint8_t *src, size_t src_len, uint8_t *dst, si
             return -1;
     }
     return 0;
+}
+
+/* ------------------------------------------------- whole-chunk plane decode */
+
+/*
+ * Decode every plane of a split chunk and merge them, in one call.
+ *
+ * The Python path crosses into the kernel once per plane and once more to
+ * merge, so a 64 KiB block hands the GIL back and forth three times inside
+ * 40 us of work. Alone that is only ~9% of the time, but under threads it is
+ * ruinous: measured 0.81 GB/s on one thread, 1.60 on two and 0.70 on four --
+ * more threads made it *slower*, because the interpreter spent its time
+ * passing the GIL around rather than decoding. Holding one call for the whole
+ * block leaves the GIL released from start to finish.
+ *
+ * `methods` packs two bits per plane, matching the chunk record's flags: 0 is
+ * stored, 3 is rANS. A plane coded any other way returns -2 so the caller can
+ * fall back; a malformed payload returns -1 and the caller falls back too, so
+ * the Python path stays the one place that decides what a bad chunk means.
+ *
+ * `scratch` holds the decoded planes followed by whatever lmz_merge_planes
+ * needs, so nothing is allocated here.
+ */
+LMZ_API int lmz_decode_planes(const uint8_t *payload, size_t plen,
+                              size_t nplanes, size_t nelem, uint32_t methods,
+                              int bf16, uint8_t *dst, uint8_t *scratch,
+                              size_t scratch_len)
+{
+    if (nplanes == 0 || nplanes > 16 || nelem == 0) return -1;
+    if (bf16 && nplanes != 2) return -1;
+
+    const size_t hdr = 4 * nplanes;
+    if (plen < hdr) return -1;
+    if (scratch_len < nplanes * nelem) return -1;
+
+    uint32_t lens[16];
+    size_t total = hdr;
+    for (size_t k = 0; k < nplanes; k++) {
+        const uint8_t *h = payload + 4 * k;
+        lens[k] = (uint32_t)h[0] | ((uint32_t)h[1] << 8)
+                | ((uint32_t)h[2] << 16) | ((uint32_t)h[3] << 24);
+        total += lens[k];
+        if (total > plen) return -1;   /* truncated */
+    }
+
+    const uint8_t *p = payload + hdr;
+    const uint8_t *planes[16];
+    for (size_t k = 0; k < nplanes; k++) {
+        const uint32_t m = (methods >> (2 * k)) & 3u;
+        if (m == 0) {                              /* stored */
+            if (lens[k] != nelem) return -1;
+            planes[k] = p;
+        } else if (m == 3) {                       /* rANS */
+            uint8_t *d = scratch + k * nelem;
+            if (lmz_rans_decode(p, lens[k], d, nelem) != 0) return -1;
+            planes[k] = d;
+        } else {
+            return -2;                             /* zstd/deflate: not here */
+        }
+        p += lens[k];
+    }
+
+    if (bf16) return lmz_merge_bf16(planes[0], planes[1], dst, nelem);
+
+    uint8_t *mscratch = scratch + nplanes * nelem;
+    const size_t need = lmz_scratch_size(nelem, nplanes);
+    if (scratch_len < nplanes * nelem + need) return -1;
+    return lmz_merge_planes(planes, dst, nelem, nplanes, mscratch);
 }

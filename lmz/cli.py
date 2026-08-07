@@ -79,7 +79,7 @@ def cmd_compress(args) -> int:
     stats = api.compress(src, dst, level=args.level, workers=args.threads,
                          chunk_size=args.chunk_size, checksum=not args.no_checksum,
                          dedup=not args.no_dedup, delta=not args.no_delta,
-                         progress=bar)
+                         mapped=args.mapped, align=args.align, progress=bar)
     bar.done()
     if not args.quiet:
         print(f"{src} -> {dst}")
@@ -295,8 +295,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("-l", "--level", type=int, default=api.DEFAULT_LEVEL,
                    help="entropy coder level (default: 1, the fastest and, on "
                         "weight data, usually the smallest too)")
-    c.add_argument("--chunk-size", type=parse_size, default=api.DEFAULT_CHUNK_SIZE,
-                   metavar="N", help="chunk size (default: 8MiB)")
+    c.add_argument("--chunk-size", type=parse_size, default=None,
+                   metavar="N",
+                   help="chunk size (default: 8MiB, or 64KiB with --mapped)")
     c.add_argument("--no-checksum", action="store_true",
                    help="skip per-chunk crc32")
     c.add_argument("--no-dedup", action="store_true",
@@ -304,6 +305,11 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--no-delta", action="store_true",
                    help="skip delta coding against matching tensors in an "
                         "earlier file")
+    c.add_argument("--mapped", action="store_true",
+                   help="small blocks, so any byte range can be decoded on its "
+                        "own (default 64KiB; costs ~1 point of ratio)")
+    c.add_argument("--align", action="store_true",
+                   help="with --mapped, start every block on a 4KiB boundary")
     c.add_argument("-f", "--force", action="store_true", help="overwrite output")
     common(c)
     c.set_defaults(func=cmd_compress)
