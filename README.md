@@ -2,10 +2,7 @@
 
 [![tests](https://github.com/FanxinSun/lmz/actions/workflows/tests.yml/badge.svg)](https://github.com/FanxinSun/lmz/actions/workflows/tests.yml)
 [![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://github.com/FanxinSun/lmz/actions/workflows/tests.yml)
-<!-- Restore once `lmzip` is on PyPI; until then shields renders a red
-     "package or version not found", which reads as a broken project:
 [![PyPI](https://img.shields.io/pypi/v/lmzip)](https://pypi.org/project/lmzip/)
--->
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **Smaller checkpoints. Byte for byte.**
