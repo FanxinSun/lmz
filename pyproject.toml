@@ -8,7 +8,7 @@ version = "0.10.0"
 description = "Compressed model storage you can read through, without expanding it"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = { file = "LICENSE" }
 keywords = ["compression", "safetensors", "gguf", "llm", "model-weights", "zstd",
             "fuse", "model-store", "on-device"]
 classifiers = [
