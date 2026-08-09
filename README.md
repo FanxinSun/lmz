@@ -1,8 +1,8 @@
 # lmz
 
 [![tests](https://github.com/FanxinSun/lmz/actions/workflows/tests.yml/badge.svg)](https://github.com/FanxinSun/lmz/actions/workflows/tests.yml)
-[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://github.com/FanxinSun/lmz/actions/workflows/tests.yml)
-[![PyPI](https://img.shields.io/pypi/v/lmzip)](https://pypi.org/project/lmzip/)
+[![Python](https://img.shields.io/pypi/pyversions/lmzip?cacheSeconds=3600)](https://pypi.org/project/lmzip/)
+[![PyPI](https://img.shields.io/pypi/v/lmzip?cacheSeconds=3600)](https://pypi.org/project/lmzip/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **Smaller checkpoints. Byte for byte.**
