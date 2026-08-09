@@ -1,19 +1,40 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "lmz"
+# Distribution name only: the import and the command are both `lmz`. The bare
+# name on PyPI belongs to an unrelated package (listmapzip), so the tin says
+# lmzip and everything inside it does not.
+name = "lmzip"
 version = "0.10.0"
-description = "Compressed model storage you can read through, without expanding it"
+description = "Lossless compression for model weights: 34.7% off BF16, byte for byte, with a store you can read through"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { file = "LICENSE" }
-keywords = ["compression", "safetensors", "gguf", "llm", "model-weights", "zstd",
-            "fuse", "model-store", "on-device"]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Fanxin Sun" }]
+keywords = [
+    "compression", "lossless", "safetensors", "gguf", "llm", "model-weights",
+    "bfloat16", "fp8", "quantization", "zstd", "rans", "entropy-coding",
+    "fuse", "filesystem", "model-store", "checkpoint", "machine-learning",
+]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: C",
     "Topic :: System :: Archiving :: Compression",
+    "Topic :: System :: Filesystems",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
@@ -25,11 +46,20 @@ dependencies = []
 [project.optional-dependencies]
 zstd = ["zstandard>=0.21"]
 
+[project.urls]
+Homepage = "https://github.com/FanxinSun/lmz"
+Repository = "https://github.com/FanxinSun/lmz"
+Issues = "https://github.com/FanxinSun/lmz/issues"
+Funding = "https://buymeacoffee.com/fanxinsun"
+
 [project.scripts]
 lmz = "lmz.cli:main"
 
 [tool.setuptools]
 packages = ["lmz", "lmz.native"]
 
+# Only the C source ships. The shared library is built on first use into the
+# installed package directory, so the wheel stays pure Python and portable
+# and nothing platform-specific is ever uploaded.
 [tool.setuptools.package-data]
 "lmz.native" = ["*.c"]

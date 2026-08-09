@@ -63,21 +63,29 @@ lossless coder of any kind can pass:
 
 ## Quick start
 
-No installation, no dependencies:
+```
+pip install lmzip
+```
+
+The distribution is `lmzip` because the bare name was already taken on PyPI by
+an unrelated package; the command and the import are both `lmz`.
 
 ```
-./lmz-cli compress  model.safetensors            # also .gguf, .bin, .pth
-./lmz-cli decompress model.safetensors.lmz       # -> model.safetensors
-./lmz-cli compress  ./my-model/                  # a whole directory; duplicate
-                                                 #    tensors are stored once
+lmz compress    model.safetensors            # also .gguf, .bin, .pth
+lmz decompress  model.safetensors.lmz        # -> model.safetensors, byte for byte
+lmz compress    ./my-model/                  # a whole directory; duplicate
+                                             #    tensors are stored once
 ```
 
 Or keep the model compressed and read it where it lies:
 
 ```
-./lmz-cli add   ./my-model/                      # into the store
-./lmz-cli mount ~/models                         # ordinary files, decoded on read
+lmz add   ./my-model/                        # into the store
+lmz mount ~/models                           # ordinary files, decoded on read
 ```
+
+There is nothing to install if you would rather not: the repository runs
+straight from a checkout with `./lmz-cli`, on the standard library alone.
 
 Python 3.9+ is the only requirement. On a **free-threaded build** (3.13+ with
 the GIL disabled) lmz lifts its own thread caps and decoding scales across the
@@ -895,6 +903,16 @@ being decoded elsewhere is waited on rather than decoded twice.
 `delta`, `mapped`, `align` and `progress`; `append` takes `level`, `workers`,
 `checksum`, `delta` and `progress`; `decompress` takes `workers`, `verify_checksums`, `overwrite` and
 `progress`. `progress` is called with `(bytes_done, total)`.
+
+## The LMZ protocol
+
+The container is a specification, not an implementation detail: a versioned
+format with numbered codecs, where every chunk records its own codec, element
+width and destination, so any reader that understands the codec ids can
+decode an archive without knowing which version wrote it. That is what makes
+it worth calling a protocol rather than a file format — the same bytes are
+read by the CLI, by `MappedArchive`, by the FUSE mount and by the filesystem,
+and a v1 archive still opens today.
 
 ## Archive format
 
