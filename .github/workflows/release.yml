@@ -1,0 +1,84 @@
+name: release
+
+# Publishing is a tag push and nothing else. There is no API token anywhere --
+# not in the repository, not on a laptop, not in a secret. PyPI's trusted
+# publishing verifies a short-lived OIDC identity issued by GitHub for this
+# exact repository, workflow and environment, so there is no long-lived
+# credential to leak, rotate or accidentally commit.
+#
+# One-time setup, on pypi.org -> Your projects -> Publishing -> Add a pending
+# publisher:
+#
+#     PyPI project name : lmzip
+#     Owner             : FanxinSun
+#     Repository        : lmz
+#     Workflow name     : release.yml
+#     Environment       : pypi
+#
+# After that:  git tag v1.0.0 && git push origin v1.0.0
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The tag and the packaged version must agree, or the release is a lie
+      # about which code it contains -- and PyPI will not let it be corrected
+      # afterwards, because a version number can never be reused.
+      - name: Tag must match the packaged version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(python -c "import re;print(re.search(r'^version = \"(.+)\"', open('pyproject.toml').read(), re.M).group(1))")
+          echo "tag=$TAG packaged=$PKG"
+          test "$TAG" = "$PKG" || { echo "::error::tag v$TAG != version $PKG"; exit 1; }
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check dist/*
+
+      - name: The wheel must work away from the source tree
+        run: |
+          python -m venv /tmp/v
+          /tmp/v/bin/pip install --quiet dist/*.whl
+          cd /tmp && /tmp/v/bin/python -c "
+          import hashlib, lmz, os, tempfile
+          d = tempfile.mkdtemp(); src = os.path.join(d, 'w.bin')
+          open(src, 'wb').write(bytes(range(256)) * 8192)
+          lmz.compress(src, src + '.lmz'); lmz.decompress(src + '.lmz', src + '.out')
+          h = lambda p: hashlib.sha256(open(p, 'rb').read()).hexdigest()
+          assert h(src) == h(src + '.out'), 'the wheel did not round-trip'
+          print('round-trip OK', lmz.__version__, lmz.backends())
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write        # the only thing trusted publishing needs
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
