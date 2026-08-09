@@ -6,6 +6,16 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Nothing here writes anything back, so the token gets read access and no more.
+permissions:
+  contents: read
+
+# A push that supersedes an in-flight run cancels it rather than paying for
+# both; the older answer is worthless the moment a newer commit exists.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 # A lossless compressor's only real claim is that the bytes come back. These
 # jobs exist so that claim is checked on every push rather than asserted in a
 # README, across every interpreter the package says it supports -- including
