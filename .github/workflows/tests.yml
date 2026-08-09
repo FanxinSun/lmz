@@ -1,0 +1,85 @@
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# A lossless compressor's only real claim is that the bytes come back. These
+# jobs exist so that claim is checked on every push rather than asserted in a
+# README, across every interpreter the package says it supports -- including
+# the free-threaded builds, where lmz lifts its own thread caps and therefore
+# runs genuinely different code.
+jobs:
+  test:
+    name: python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.13t", "3.14", "3.14t"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Without fuse3 the mount and filesystem tests skip themselves rather
+      # than fail, which would quietly hide the half of the suite that
+      # exercises the read path.
+      - name: Install fuse3
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fuse3
+          ls -l /dev/fuse
+
+      - name: Report the active backends
+        run: python -m lmz doctor
+
+      - name: Run the suite
+        run: python tests/test_lmz.py
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+
+      - name: Check the metadata PyPI will render
+        run: python -m twine check dist/*
+
+      # The wheel has to work on its own, away from the source tree: the
+      # native kernel is compiled into the installed package on first use,
+      # and that path is easy to break without noticing.
+      - name: Install the wheel and round-trip through it
+        run: |
+          python -m venv /tmp/v
+          /tmp/v/bin/pip install --quiet dist/*.whl
+          /tmp/v/bin/lmz --version
+          cd /tmp && /tmp/v/bin/python -c "
+          import hashlib, lmz, os, tempfile
+          d = tempfile.mkdtemp()
+          src = os.path.join(d, 'weights.bin')
+          open(src, 'wb').write(bytes(range(256)) * 8192)
+          lmz.compress(src, src + '.lmz')
+          lmz.decompress(src + '.lmz', src + '.out')
+          a = hashlib.sha256(open(src, 'rb').read()).hexdigest()
+          b = hashlib.sha256(open(src + '.out', 'rb').read()).hexdigest()
+          assert a == b, 'the installed wheel did not round-trip'
+          print('round-trip OK,', lmz.backends())
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/*

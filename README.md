@@ -1,5 +1,10 @@
 # lmz
 
+[![tests](https://github.com/FanxinSun/lmz/actions/workflows/tests.yml/badge.svg)](https://github.com/FanxinSun/lmz/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/lmzip)](https://pypi.org/project/lmzip/)
+[![Python](https://img.shields.io/pypi/pyversions/lmzip)](https://pypi.org/project/lmzip/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 **Smaller checkpoints. Read in place. Byte for byte.**
 
 Fast lossless compression for large model weights — and a store you can read
@@ -87,7 +92,7 @@ lmz mount ~/models                           # ordinary files, decoded on read
 There is nothing to install if you would rather not: the repository runs
 straight from a checkout with `./lmz-cli`, on the standard library alone.
 
-Python 3.9+ is the only requirement. On a **free-threaded build** (3.13+ with
+Python 3.10+ is the only requirement. On a **free-threaded build** (3.13+ with
 the GIL disabled) lmz lifts its own thread caps and decoding scales across the
 whole machine — measured 8.84 GB/s against 1.73 on sixteen threads, verified
 on CPython 3.14.7t with the full test suite. Nothing needs configuring; it
