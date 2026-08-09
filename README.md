@@ -695,6 +695,84 @@ Bigger blocks were tried and rejected. They compress slightly better, but a
 | 256 KiB | 32.54% | 263 | 1898 | 64x |
 | 1 MiB | 32.66% | 92 | 750 | 256x |
 
+## A filesystem that compresses what you put in it
+
+`lmz mount` serves a store you filled ahead of time. `lmz fs` is the other
+half: a read-write filesystem where anything you write is compressed on the
+way down and decoded on the way back up. Nothing has to be registered, and
+the files are just files.
+
+```
+lmz fs ~/.lmz/data ~/data       # ~/data behaves normally; ~/.lmz/data holds it compressed
+cp model.safetensors ~/data/    # 1.74 GiB in, 1.19 GiB on disk
+```
+
+The codec is chosen per file by the same planner the command line uses:
+safetensors and GGUF get the field-split and block-split coders, everything
+else falls through to the generic entropy coder, which is zstd. So the fair
+question is whether it loses anywhere, and the answer is measured below.
+
+### Against a compressing filesystem
+
+btrfs and ZFS compress fixed-size extents independently and store whole 4 KiB
+blocks, so that — not a single zstd of the whole file — is what they actually
+achieve. Same corpus, same machine:
+
+| file | raw | lmzfs | btrfs-style 128 KiB | delta |
+|---|---|---|---|---|
+| allsrc.py | 241 KB | 68.5% | 67.8% | +0.7 |
+| binary.so | 2.19 MB | 51.3% | 50.4% | +0.9 |
+| code.c | 38 KB | 67.6% | 67.9% | −0.3 |
+| data.json | 1.77 MB | 83.0% | 81.3% | +1.7 |
+| **model.safetensors** | 1.87 GB | **32.0%** | 18.8% | **+13.2** |
+| text.md | 56 KB | 57.8% | 56.5% | +1.3 |
+| **whole corpus** | 1.88 GB | **32.1%** | **18.9%** | **+13.2** |
+
+An f2fs-style 16 KiB extent — the Android default — saves **0.1%** on the same
+corpus and **0.0%** on the model, because zstd in a 16 KiB window finds almost
+nothing in float weights and block rounding eats the rest. On this corpus
+lmzfs writes **237 MiB less than btrfs would**.
+
+The general-file rows are within a point or two either way, which is the
+point: lmzfs is not worse at the things zstd is already good at, because on
+those files it *is* zstd. Ordinary files are coded at level 3 to match what a
+filesystem uses; weights stay at level 1, where the README's own measurements
+put the smallest output anyway.
+
+### How it is stored
+
+The backing directory mirrors the mount, with one suffix saying how each file
+is held:
+
+```
+backing/model.safetensors.lmz    compressed
+backing/photo.jpg.lmr            stored raw, compression declined
+backing/subdir/                  a directory, as itself
+```
+
+The suffix keeps the mapping unambiguous — a file genuinely called `a.lmz`
+lands at `a.lmz.lmz` and still reads back under its own name. Nothing needs a
+sidecar index: mode, owner and times are the backing file's own, and the
+logical size is read from a fixed offset in the archive's 32-byte header, so a
+stat costs one short read. Every file is independent, so an interrupted write
+can damage one file and never the store.
+
+Files below 4 KiB, and files where compression fails to win 2%, are stored raw
+rather than wrapped in a container whose header would cost more than the coder
+saves.
+
+### What it is not good at
+
+Writes are buffered: a file opened for writing is materialised into a scratch
+copy, written there, and compressed once on the last close. The coder needs
+whole chunks to measure a histogram, and no archive can have a byte rewritten
+in the middle, so this is the shape rather than a compromise. It suits files
+written once and read many times, which is what model files are, and it suits
+a database file badly.
+
+Reading is the same trade as the model mount: **572 MiB/s against 2961 for the
+plain file** on this NVMe. You are buying a third of the disk back, not speed.
+
 ## Command line
 
 ```
@@ -714,6 +792,8 @@ lmz models                         --json                        --store DIR
 lmz rm          <name>                                           --store DIR
 lmz mount       <mountpoint>       --model N  -d  --allow-other  --store DIR
                                    --cache-blocks N  --verify  -j N  --readahead N
+lmz fs          <backing> <mountpoint>   -d  -l LEVEL  -j N  --block-size N
+                                         --allow-other
 lmz unmount     <mountpoint>
 ```
 
@@ -922,7 +1002,7 @@ its destination directory.
 python3 tests/test_lmz.py          # also runs under pytest
 ```
 
-76 tests covering kernel equivalence across all backends, element sizes and
+81 tests covering kernel equivalence across all backends, element sizes and
 block periods,
 rANS round-trips over adversarial distributions (including single-symbol
 streams, which exposed a frequency-field overflow), rANS landing within 2% of
@@ -968,6 +1048,13 @@ and the mount itself, served from a separate process and compared against the
 source directory file by file — every member's sha256, random reads at page
 boundaries and at the end of a file, serving only the named models, agreement
 with a full `decompress`, and that writes, unlinks and mkdirs are all refused.
+and the read-write filesystem: that a model written through it comes back
+byte for byte and really is stored compressed, that writing and immediately
+reading a file wins the race against the kernel's asynchronous release,
+that modes, sizes, directories, rename and unlink all survive, that
+incompressible and tiny files are stored raw instead of being wrapped in a
+container, and that a rewrite replaces the contents and leaves exactly one
+backing form behind.
 Mount tests skip themselves where FUSE is unavailable rather than failing.
 Also path-traversal rejection, and the CLI.
 

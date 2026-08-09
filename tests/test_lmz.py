@@ -13,6 +13,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -2080,6 +2081,163 @@ def test_mount_matches_a_full_decompression():
                     a = os.path.join(dirpath, name)
                     rel = os.path.relpath(a, expanded)
                     assert digest(a) == digest(os.path.join(served, rel)), rel
+
+
+class MountedFS:
+    """A compressed read-write filesystem, served from its own process."""
+
+    def __init__(self, backing: str, point: str, *extra: str):
+        self.backing, self.point = backing, point
+        self.args = list(extra)
+        self.proc = None
+
+    def __enter__(self):
+        from lmz import fuse
+
+        ok, why = fuse.available()
+        if not ok:
+            raise Skip(why)
+        os.makedirs(self.point, exist_ok=True)
+        os.makedirs(self.backing, exist_ok=True)
+        self.proc = subprocess.Popen(
+            CLI + ["fs", self.backing, self.point, "-q"] + self.args,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        for _ in range(200):
+            if os.path.ismount(self.point):
+                return self
+            if self.proc.poll() is not None:
+                raise Skip(f"fs exited: {self.proc.stderr.read().decode().strip()}")
+            time.sleep(0.05)
+        self.__exit__(None, None, None)
+        raise AssertionError("filesystem did not come up within 10 s")
+
+    def settle(self, timeout=60):
+        """Wait for every pending commit to land in the backing store."""
+        scratch = os.path.join(self.backing, ".lmz-scratch")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            busy = [f for f in os.listdir(scratch)] if os.path.isdir(scratch) else []
+            if not busy:
+                return
+            time.sleep(0.05)
+        raise AssertionError("commits did not settle")
+
+    def __exit__(self, *_exc):
+        from lmz import fuse
+
+        fuse.unmount(self.point)
+        if self.proc is not None:
+            try:
+                self.proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+            if self.proc.stderr:
+                self.proc.stderr.close()
+
+
+def test_fs_writes_are_compressed_and_read_back():
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "model.safetensors")
+        write_safetensors(src, [("w", "BF16", [1 << 16], weights_bf16(1 << 16, 21))])
+        back, point = os.path.join(d, "back"), os.path.join(d, "mnt")
+        with MountedFS(back, point) as fs:
+            dst = os.path.join(point, "model.safetensors")
+            shutil.copyfile(src, dst)
+            fs.settle()
+            assert digest(dst) == digest(src), "bytes changed through the mount"
+            assert os.path.getsize(dst) == os.path.getsize(src)
+            stored = os.path.join(back, "model.safetensors.lmz")
+            assert os.path.exists(stored), "was not stored as an archive"
+            assert os.path.getsize(stored) < os.path.getsize(src) * 0.9, \
+                "a bf16 model should compress well through the filesystem"
+
+
+def test_fs_write_then_immediately_read():
+    """close() returns before the kernel delivers RELEASE, so this races."""
+    with tempfile.TemporaryDirectory() as d:
+        back, point = os.path.join(d, "back"), os.path.join(d, "mnt")
+        with MountedFS(back, point):
+            for i in range(12):
+                p = os.path.join(point, f"f{i}.txt")
+                body = f"contents number {i}\n" * 40
+                with open(p, "w") as fh:
+                    fh.write(body)
+                with open(p) as fh:          # no sync, no settle: on purpose
+                    assert fh.read() == body, f"f{i} read back wrong"
+
+
+def test_fs_preserves_metadata_and_namespace():
+    with tempfile.TemporaryDirectory() as d:
+        back, point = os.path.join(d, "back"), os.path.join(d, "mnt")
+        with MountedFS(back, point) as fs:
+            os.makedirs(os.path.join(point, "a", "b"))
+            deep = os.path.join(point, "a", "b", "deep.txt")
+            with open(deep, "w") as fh:
+                fh.write("x" * 9000)
+            fs.settle()
+            os.chmod(deep, 0o640)
+            assert stat.S_IMODE(os.stat(deep).st_mode) == 0o640
+            assert os.path.getsize(deep) == 9000
+
+            assert sorted(os.listdir(point)) == ["a"]
+            assert sorted(os.listdir(os.path.join(point, "a", "b"))) == ["deep.txt"]
+
+            moved = os.path.join(point, "a", "moved.txt")
+            os.rename(deep, moved)
+            assert os.path.getsize(moved) == 9000
+            assert not os.path.exists(deep)
+
+            os.unlink(moved)
+            assert not os.path.exists(moved)
+            os.rmdir(os.path.join(point, "a", "b"))
+            os.rmdir(os.path.join(point, "a"))
+            assert os.listdir(point) == []
+
+
+def test_fs_declines_to_compress_what_will_not_shrink():
+    """Random bytes must not be inflated by being stored."""
+    with tempfile.TemporaryDirectory() as d:
+        back, point = os.path.join(d, "back"), os.path.join(d, "mnt")
+        with MountedFS(back, point) as fs:
+            blob = rand(400 << 10, 5)
+            p = os.path.join(point, "noise.bin")
+            with open(p, "wb") as fh:
+                fh.write(blob)
+            fs.settle()
+            assert os.path.exists(os.path.join(back, "noise.bin.lmr")), \
+                "incompressible data should be stored raw, not in a container"
+            with open(p, "rb") as fh:
+                assert fh.read() == blob
+            # Tiny files skip the container too: its header would dwarf them.
+            tiny = os.path.join(point, "tiny.txt")
+            with open(tiny, "w") as fh:
+                fh.write("hi")
+            fs.settle()
+            assert os.path.exists(os.path.join(back, "tiny.txt.lmr"))
+            with open(tiny) as fh:
+                assert fh.read() == "hi"
+
+
+def test_fs_rewrite_replaces_contents():
+    with tempfile.TemporaryDirectory() as d:
+        back, point = os.path.join(d, "back"), os.path.join(d, "mnt")
+        with MountedFS(back, point) as fs:
+            p = os.path.join(point, "w.safetensors")
+            write_safetensors(p, [("w", "BF16", [1 << 15], weights_bf16(1 << 15, 3))])
+            fs.settle()
+            first = digest(p)
+            write_safetensors(p, [("w", "BF16", [1 << 15], weights_bf16(1 << 15, 9))])
+            fs.settle()
+            assert digest(p) != first, "rewrite did not take"
+            # Exactly one backing form survives; a stale twin would shadow it.
+            assert os.path.exists(os.path.join(back, "w.safetensors.lmz"))
+            assert not os.path.exists(os.path.join(back, "w.safetensors.lmr"))
+
+            with open(p, "r+b") as fh:      # truncate through the mount
+                fh.truncate(1024)
+            fs.settle()
+            assert os.path.getsize(p) == 1024
 
 
 def main() -> int:

@@ -57,9 +57,30 @@ READ_IN = struct.Struct("<QQIIQII")
 DIRENT = struct.Struct("<QQII")             # + name, padded to 8
 KSTATFS = struct.Struct("<QQQQQIIII24s")
 
+# Writable ops.
+SETATTR_IN = struct.Struct("<IIQQQQQQIIIIIIII")
+MKDIR_IN = struct.Struct("<II")             # mode, umask, + name
+MKNOD_IN = struct.Struct("<IIII")           # mode, rdev, umask, pad, + name
+CREATE_IN = struct.Struct("<IIII")          # flags, mode, umask, open_flags
+WRITE_IN = struct.Struct("<QQIIQII")
+WRITE_OUT = struct.Struct("<II")
+RENAME_IN = struct.Struct("<Q")             # newdir, + old\0new\0
+RENAME2_IN = struct.Struct("<QII")          # newdir, flags, pad
+RELEASE_IN = struct.Struct("<QIIQ")
+FSYNC_IN = struct.Struct("<QII")
+FALLOCATE_IN = struct.Struct("<QQQII")
+
 assert (IN_HDR.size, OUT_HDR.size, ATTR.size) == (40, 16, 88)
 assert (ENTRY_OUT.size + ATTR.size, ATTR_OUT.size + ATTR.size) == (128, 104)
 assert (INIT_OUT.size, OPEN_OUT.size, READ_IN.size) == (64, 16, 40)
+assert (SETATTR_IN.size, CREATE_IN.size, WRITE_IN.size) == (88, 16, 40)
+assert (RELEASE_IN.size, FALLOCATE_IN.size) == (24, 32)
+
+# Which fields a setattr actually carries.
+(FATTR_MODE, FATTR_UID, FATTR_GID, FATTR_SIZE) = 1, 2, 4, 8
+(FATTR_ATIME, FATTR_MTIME, FATTR_FH) = 16, 32, 64
+(FATTR_ATIME_NOW, FATTR_MTIME_NOW) = 128, 256
+FATTR_CTIME = 1024
 
 (LOOKUP, FORGET, GETATTR, SETATTR, READLINK, SYMLINK) = 1, 2, 3, 4, 5, 6
 (MKNOD, MKDIR, UNLINK, RMDIR, RENAME, LINK) = 8, 9, 10, 11, 12, 13
@@ -67,10 +88,10 @@ assert (INIT_OUT.size, OPEN_OUT.size, READ_IN.size) == (64, 16, 40)
 (FSYNC, SETXATTR, GETXATTR, LISTXATTR, REMOVEXATTR) = 20, 21, 22, 23, 24
 (FLUSH, INIT, OPENDIR, READDIR, RELEASEDIR) = 25, 26, 27, 28, 29
 (FSYNCDIR, ACCESS, CREATE, INTERRUPT, DESTROY) = 30, 34, 35, 36, 38
-(BATCH_FORGET, READDIRPLUS, LSEEK) = 42, 44, 46
+(BATCH_FORGET, FALLOCATE, READDIRPLUS, RENAME2, LSEEK) = 42, 43, 44, 45, 46
 
-S_IFDIR, S_IFREG = 0o040000, 0o100000
-DT_DIR, DT_REG = 4, 8
+S_IFDIR, S_IFREG, S_IFLNK = 0o040000, 0o100000, 0o120000
+DT_DIR, DT_REG, DT_LNK = 4, 8, 10
 
 FUSE_MAJOR = 7
 # The highest minor whose fuse_init_out this build packs. The kernel takes the
@@ -179,7 +200,8 @@ class Node:
     (model, member) pair -- so this class stays ignorant of archives.
     """
 
-    __slots__ = ("ino", "name", "mode", "size", "children", "source", "parent")
+    __slots__ = ("ino", "name", "mode", "size", "children", "source", "parent",
+                 "mtime", "uid", "gid", "target")
 
     def __init__(self, ino: int, name: str, mode: int, size: int = 0,
                  source=None, parent: int = 1):
@@ -187,13 +209,22 @@ class Node:
         self.name = name
         self.mode = mode
         self.size = size
-        self.children: dict[str, Node] | None = {} if mode & S_IFDIR else None
+        self.children: dict[str, Node] | None = (
+            {} if (mode & 0o170000) == S_IFDIR else None)
         self.source = source
         self.parent = parent
+        self.mtime = 0
+        self.uid = os.getuid()
+        self.gid = os.getgid()
+        self.target = None  # symlink destination
 
     @property
     def is_dir(self) -> bool:
-        return self.children is not None
+        return (self.mode & 0o170000) == S_IFDIR
+
+    @property
+    def is_link(self) -> bool:
+        return (self.mode & 0o170000) == S_IFLNK
 
 
 class Tree:
@@ -256,6 +287,15 @@ class FuseServer:
         self._stop = threading.Event()
         self._opts = ["nosuid", "nodev", "default_permissions",
                       f"max_read={MAX_READ}"]
+        # A read-only tree never changes, so the kernel may trust attributes
+        # and cached pages indefinitely. A writable one must not: an entry can
+        # be replaced or resized under it, and stale pages would be served as
+        # real data. This is the whole difference in cache policy between the
+        # two, and getting it wrong shows up as a file that reads as its
+        # previous contents.
+        self.read_only = read_only
+        self.attr_ttl = FOREVER if read_only else 1
+        self.open_flags = FOPEN_KEEP_CACHE if read_only else 0
         if read_only:
             self._opts.append("ro")
         if allow_other:
@@ -345,11 +385,67 @@ class FuseServer:
     def _error(self, unique: int, err: int) -> None:
         os.write(self.fd, OUT_HDR.pack(OUT_HDR.size, -err, unique))
 
+    # -- what a writable subclass overrides --------------------------------
+    #
+    # A read-only tree is fully materialised up front, so these defaults just
+    # walk it. A filesystem backed by a real directory cannot do that -- the
+    # contents change underneath it -- so it fills them in from the backing
+    # store instead. Everything above this line is the wire protocol and does
+    # not care which it is talking to.
+
+    def resolve(self, node: Node, name: str):
+        return node.children.get(name) if node.is_dir else None
+
+    def refresh(self, node: Node) -> None:
+        """Bring a node's attributes up to date before they are reported."""
+
+    def entries(self, node: Node):
+        return sorted(node.children.items()) if node.is_dir else []
+
+    def fs_setattr(self, node, valid, size, mode, atime, mtime, uid, gid):
+        raise OSError(errno.EROFS, "read-only")
+
+    def fs_create(self, parent, name, mode, flags):
+        raise OSError(errno.EROFS, "read-only")
+
+    def fs_open(self, node, flags) -> int:
+        return 0
+
+    def fs_write(self, node, fh, offset, data) -> int:
+        raise OSError(errno.EROFS, "read-only")
+
+    def fs_release(self, node, fh) -> None:
+        pass
+
+    def fs_fsync(self, node, fh) -> None:
+        pass
+
+    def fs_unlink(self, parent, name) -> None:
+        raise OSError(errno.EROFS, "read-only")
+
+    def fs_mkdir(self, parent, name, mode):
+        raise OSError(errno.EROFS, "read-only")
+
+    def fs_rmdir(self, parent, name) -> None:
+        raise OSError(errno.EROFS, "read-only")
+
+    def fs_rename(self, parent, name, newparent, newname) -> None:
+        raise OSError(errno.EROFS, "read-only")
+
+    def fs_symlink(self, parent, name, target):
+        raise OSError(errno.EROFS, "read-only")
+
+    def fs_statfs(self):
+        total = self.tree.total_size
+        return (total // 4096, 0, 0, len(self.tree.nodes), 0)
+
+    # ----------------------------------------------------------------------
     def _attr(self, node: Node) -> bytes:
         nlink = 2 if node.is_dir else 1
+        t = node.mtime
         return ATTR.pack(node.ino, node.size, (node.size + 511) // 512,
-                         0, 0, 0, 0, 0, 0, node.mode, nlink,
-                         os.getuid(), os.getgid(), 0, 4096, 0)
+                         t, t, t, 0, 0, 0, node.mode, nlink,
+                         node.uid, node.gid, 0, 4096, 0)
 
     def _dispatch(self, req: memoryview):
         ln, op, unique, nodeid, _uid, _gid, _pid, _ext, _pad = \
@@ -373,41 +469,115 @@ class FuseServer:
         if node is None:
             return self._error(unique, errno.ENOENT)
 
-        if op == LOOKUP:
-            name = bytes(body).split(b"\0", 1)[0].decode("utf-8", "replace")
-            child = node.children.get(name) if node.is_dir else None
-            if child is None:
-                return self._error(unique, errno.ENOENT)
-            return self._reply(unique, self._entry(child))
-        if op == GETATTR:
-            return self._reply(unique,
-                               ATTR_OUT.pack(FOREVER, 0, 0) + self._attr(node))
-        if op == OPEN:
-            if node.is_dir:
-                return self._error(unique, errno.EISDIR)
-            return self._reply(unique, OPEN_OUT.pack(0, FOPEN_KEEP_CACHE, 0))
-        if op == OPENDIR:
-            if not node.is_dir:
-                return self._error(unique, errno.ENOTDIR)
-            return self._reply(unique, OPEN_OUT.pack(0, FOPEN_CACHE_DIR, 0))
-        if op == READ:
-            return self._read(unique, node, body)
-        if op in (READDIR, READDIRPLUS):
-            return self._readdir(unique, node, body, op == READDIRPLUS)
-        if op in (RELEASE, RELEASEDIR, FLUSH, FSYNC, FSYNCDIR, ACCESS):
-            return self._reply(unique)
-        if op == STATFS:
-            total = self.tree.total_size
-            return self._reply(unique, KSTATFS.pack(
-                total // 4096, 0, 0, len(self.tree.nodes), 0,
-                4096, 255, 4096, 0, b""))
+        def name_of(view, off=0):
+            return bytes(view[off:]).split(b"\0", 1)[0].decode("utf-8", "replace")
+
+        try:
+            if op == LOOKUP:
+                child = self.resolve(node, name_of(body))
+                if child is None:
+                    return self._error(unique, errno.ENOENT)
+                return self._reply(unique, self._entry(child))
+            if op == GETATTR:
+                self.refresh(node)
+                return self._reply(
+                    unique, ATTR_OUT.pack(self.attr_ttl, 0, 0) + self._attr(node))
+            if op == OPEN:
+                if node.is_dir:
+                    return self._error(unique, errno.EISDIR)
+                flags = struct.unpack_from("<I", body)[0]
+                fh = self.fs_open(node, flags)
+                return self._reply(unique, OPEN_OUT.pack(fh, self.open_flags, 0))
+            if op == OPENDIR:
+                if not node.is_dir:
+                    return self._error(unique, errno.ENOTDIR)
+                return self._reply(unique, OPEN_OUT.pack(0, 0, 0))
+            if op == READ:
+                return self._read(unique, node, body)
+            if op in (READDIR, READDIRPLUS):
+                return self._readdir(unique, node, body, op == READDIRPLUS)
+            if op == READLINK:
+                if not node.is_link:
+                    return self._error(unique, errno.EINVAL)
+                return self._reply(unique, (node.target or "").encode())
+            if op == RELEASE:
+                fh = RELEASE_IN.unpack_from(body)[0]
+                self.fs_release(node, fh)
+                return self._reply(unique)
+            if op == FLUSH:
+                return self._reply(unique)
+            if op in (FSYNC, FSYNCDIR):
+                self.fs_fsync(node, FSYNC_IN.unpack_from(body)[0])
+                return self._reply(unique)
+            if op in (RELEASEDIR, ACCESS):
+                return self._reply(unique)
+            if op == STATFS:
+                blocks, bfree, bavail, files, ffree = self.fs_statfs()
+                return self._reply(unique, KSTATFS.pack(
+                    blocks, bfree, bavail, files, ffree, 4096, 255, 4096, 0, b""))
+
+            # -- mutating ops ----------------------------------------------
+            if op == SETATTR:
+                (valid, _p, _fh, size, _lo, atime, mtime, _ct,
+                 _an, _mn, _cn, mode, _u4, uid, gid, _u5) = \
+                    SETATTR_IN.unpack_from(body)
+                self.fs_setattr(node, valid, size, mode, atime, mtime, uid, gid)
+                self.refresh(node)
+                return self._reply(
+                    unique, ATTR_OUT.pack(self.attr_ttl, 0, 0) + self._attr(node))
+            if op == CREATE:
+                flags, mode, _umask, _of = CREATE_IN.unpack_from(body)
+                child, fh = self.fs_create(node, name_of(body, CREATE_IN.size),
+                                           mode, flags)
+                return self._reply(unique, self._entry(child)
+                                   + OPEN_OUT.pack(fh, self.open_flags, 0))
+            if op == MKNOD:
+                mode, _rdev, _umask, _p = MKNOD_IN.unpack_from(body)
+                child, fh = self.fs_create(node, name_of(body, MKNOD_IN.size),
+                                           mode, 0)
+                self.fs_release(child, fh)
+                return self._reply(unique, self._entry(child))
+            if op == WRITE:
+                fh, offset, size, _wf, _lo, _fl, _p = WRITE_IN.unpack_from(body)
+                data = body[WRITE_IN.size:WRITE_IN.size + size]
+                return self._reply(
+                    unique, WRITE_OUT.pack(self.fs_write(node, fh, offset, data), 0))
+            if op == MKDIR:
+                mode, _umask = MKDIR_IN.unpack_from(body)
+                child = self.fs_mkdir(node, name_of(body, MKDIR_IN.size), mode)
+                return self._reply(unique, self._entry(child))
+            if op == UNLINK:
+                self.fs_unlink(node, name_of(body))
+                return self._reply(unique)
+            if op == RMDIR:
+                self.fs_rmdir(node, name_of(body))
+                return self._reply(unique)
+            if op in (RENAME, RENAME2):
+                head = RENAME_IN if op == RENAME else RENAME2_IN
+                newdir = head.unpack_from(body)[0]
+                names = bytes(body[head.size:]).split(b"\0")
+                target = self.tree.nodes.get(newdir)
+                if target is None:
+                    return self._error(unique, errno.ENOENT)
+                self.fs_rename(node, names[0].decode("utf-8", "replace"),
+                               target, names[1].decode("utf-8", "replace"))
+                return self._reply(unique)
+            if op == SYMLINK:
+                parts = bytes(body).split(b"\0")
+                child = self.fs_symlink(node, parts[0].decode("utf-8", "replace"),
+                                        parts[1].decode("utf-8", "replace"))
+                return self._reply(unique, self._entry(child))
+        except OSError as exc:
+            return self._error(unique, exc.errno or errno.EIO)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            return self._error(unique, errno.EIO)
+
         if op == LSEEK:
             # SEEK_DATA/SEEK_HOLE: declining leaves the kernel's own handling,
             # which is right for a filesystem with no holes.
             return self._error(unique, errno.ENOSYS)
-        if op in (WRITE, SETATTR, MKDIR, MKNOD, CREATE, UNLINK, RMDIR,
-                  RENAME, LINK, SYMLINK, SETXATTR, REMOVEXATTR):
-            return self._error(unique, errno.EROFS)
         return self._error(unique, errno.ENOSYS)
 
     def _init(self, unique: int, body: memoryview) -> None:
@@ -421,7 +591,7 @@ class FuseServer:
             12, 10, MAX_READ, 1, MAX_PAGES, 0, b""))
 
     def _entry(self, node: Node) -> bytes:
-        return (ENTRY_OUT.pack(node.ino, 1, FOREVER, FOREVER, 0, 0)
+        return (ENTRY_OUT.pack(node.ino, 1, self.attr_ttl, self.attr_ttl, 0, 0)
                 + self._attr(node))
 
     def _read(self, unique: int, node: Node, body: memoryview) -> None:
@@ -457,14 +627,15 @@ class FuseServer:
         _fh, offset, size, *_rest = READ_IN.unpack_from(body)
         parent = self.tree.nodes.get(node.parent, node)
         entries = [(".", node), ("..", parent)]
-        entries += sorted(node.children.items())
+        entries += list(self.entries(node))
 
         out = bytearray()
         for index, (name, child) in enumerate(entries, start=1):
             if index <= offset:
                 continue
             raw = name.encode()
-            kind = DT_DIR if child.is_dir else DT_REG
+            kind = (DT_DIR if child.is_dir
+                    else DT_LNK if child.is_link else DT_REG)
             rec = DIRENT.pack(child.ino, index, len(raw), kind) + raw
             rec += b"\0" * (-len(rec) % 8)
             # "." and ".." must not enter the dentry cache under their own

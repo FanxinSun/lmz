@@ -348,6 +348,59 @@ def cmd_mount(args) -> int:
     return 0
 
 
+def cmd_fs(args) -> int:
+    from . import fuse
+    from .lmzfs import LmzFS
+
+    ok, why = fuse.available()
+    if not ok:
+        print(f"lmz: cannot mount: {why}", file=sys.stderr)
+        return 1
+    os.makedirs(args.point, exist_ok=True)
+    if os.listdir(args.point):
+        print(f"lmz: {args.point} is not empty", file=sys.stderr)
+        return 1
+
+    server = LmzFS(args.backing, args.point, threads=args.threads,
+                   allow_other=args.allow_other, level=args.level,
+                   block_size=args.block_size)
+    try:
+        server.mount()
+    except OSError as exc:
+        print(f"lmz: mount failed: {exc.strerror or exc}", file=sys.stderr)
+        return 1
+
+    if args.daemon:
+        if os.fork():
+            print(f"{args.backing} -> {args.point}  (compressing, background)")
+            print(f"  stop with: lmz unmount {args.point}")
+            sys.stdout.flush()
+            os._exit(0)
+        os.setsid()
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+    elif not args.quiet:
+        print(f"{args.backing} -> {args.point}")
+        print("  files written here are compressed; reads decode transparently")
+        print("  press ctrl-c to unmount")
+
+    s = {}
+    try:
+        server.serve()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        s = server.stats()
+        server.close()
+        fuse.unmount(args.point)
+    if not args.quiet and not args.daemon and s.get("files_written"):
+        print(f"\nunmounted: {s['files_written']} file(s) written, "
+              f"{human(s['bytes_in'])} -> {human(s['bytes_out'])} "
+              f"({s['saved'] * 100:.1f}% smaller, {s['stored_raw']} stored raw)")
+    return 0
+
+
 def cmd_unmount(args) -> int:
     from . import fuse
 
@@ -579,6 +632,21 @@ def build_parser() -> argparse.ArgumentParser:
                          "more measure slower; the whole machine without it)")
     mo.add_argument("-q", "--quiet", action="store_true")
     mo.set_defaults(func=cmd_mount)
+
+    fs = sub.add_parser(
+        "fs", help="mount a compressed read-write filesystem over a directory")
+    fs.add_argument("backing", help="directory holding the compressed form")
+    fs.add_argument("point", metavar="mountpoint")
+    fs.add_argument("-d", "--daemon", action="store_true",
+                    help="detach and serve in the background")
+    fs.add_argument("--allow-other", action="store_true")
+    fs.add_argument("-l", "--level", type=int, default=api.DEFAULT_LEVEL)
+    fs.add_argument("--block-size", type=parse_size, default=64 << 10,
+                    metavar="N", help="block size for stored files "
+                                      "(default: 64KiB)")
+    fs.add_argument("-j", "--threads", type=int, default=None, metavar="N")
+    fs.add_argument("-q", "--quiet", action="store_true")
+    fs.set_defaults(func=cmd_fs)
 
     um = sub.add_parser("unmount", aliases=["umount"], help="detach a mount")
     um.add_argument("point", metavar="mountpoint")
