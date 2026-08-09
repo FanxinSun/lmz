@@ -107,6 +107,7 @@ byte-identical:
 | bge-m3 directory (FP32 `.bin` + onnx) | 4.59 GB | 2.45 GB | **46.48%** |
 | Llama-3-8B NF4-quantised (bitsandbytes) | 5.70 GB | 4.87 GB | **14.55%** |
 | Llama-3.1-8B-Instruct Q8_0 GGUF | 8.54 GB | 7.97 GB | **6.66%** |
+| Qwen3.6-27B-FP8, one shard (99.7% F8_E4M3) | 366.1 MiB | 303.3 MiB | **17.10%** |
 | Pythia-160m, 2 consecutive checkpoints | 1.21 GiB | 450.8 MiB | **63.60%** |
 | Pythia-160m, 3 consecutive checkpoints | 1.81 GiB | 644.0 MiB | **65.30%** |
 | 2 consecutive AdamW optimizer states | 161.3 MiB | 119.3 MiB | **26.10%** |
@@ -946,8 +947,17 @@ its destination directory.
   a C compiler exists. Without one, compression falls back to zstd (~31%
   instead of ~34%) and archives already written with rANS cannot be read —
   `./lmz-cli doctor` reports which backend is live.
-- **Already-quantised weights are mostly entropy.** Raw INT8/FP8 checkpoints
-  are detected and stored unchanged. Block-quantised GGUF keeps a few percent
+- **Already-quantised weights are mostly entropy — with one exception.**
+  Raw INT8 checkpoints are detected and stored unchanged. **FP8 is not one of
+  them**: `F8_E4M3` is a float, 1 sign + 4 exponent + 3 mantissa, and trained
+  weights skew its exponent just as they skew BF16's. Measured on a real
+  Qwen3.6-27B-FP8 shard (99.7% `F8_E4M3`), lmz removes **17.1%**, byte-exact.
+  There is almost nothing left after that: the order-0 bound is 17.7%, and
+  zstd -3 and zstd -19 both reach 17.1% too — the same ratio, but lmz takes
+  0.7s where zstd -19 takes 57.7s. Context does not rescue it either; block
+  magnitude class is worth 1.0 point, position within a block exactly zero,
+  and the previous code 0.1. So FP8 is worth compressing and lmz holds no
+  real advantage in doing it. Block-quantised GGUF keeps a few percent
   in its scale and sub-scale fields, which the block codec collects, but 5–7%
   is the honest ceiling on the weights themselves and it is measured, not
   estimated: Q8_0's quant payload sits at 7.64 of 8 bits, and lmz lands within
