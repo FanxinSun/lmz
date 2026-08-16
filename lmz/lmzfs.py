@@ -206,6 +206,15 @@ class Handle:
         self.dirty = False
         self.refs = 1
 
+    def close(self) -> None:
+        """Drop the scratch descriptor. Idempotent, and safe to call twice."""
+        fd, self.fd = self.fd, -1
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
 
 class LmzFS(FuseServer):
     """Compressed storage behind an ordinary filesystem interface."""
@@ -292,11 +301,14 @@ class LmzFS(FuseServer):
             return node
         with self._lock:
             handle = self._open_writes.get(rel)
-        if handle is not None:
-            try:
-                node.size = os.fstat(handle.fd).st_size
-            except OSError:
-                pass
+            if handle is not None:
+                # Measured under the lock: the descriptor is closed in the same
+                # critical section that unregisters the handle, so an fstat
+                # outside it can size whatever file inherited the number.
+                try:
+                    node.size = os.fstat(handle.fd).st_size
+                except OSError:
+                    pass
         return node
 
     def resolve(self, node: Node, name: str):
@@ -339,8 +351,12 @@ class LmzFS(FuseServer):
         rel = self._rel(node)
         with self._lock:
             live = self._open_writes.get(rel)
-        if live is not None:                       # being written: read scratch
-            return os.pread(live.fd, size, offset)
+            if live is not None:                   # being written: read scratch
+                # Held across the pread deliberately. fs_release closes this
+                # descriptor in the same critical section that unregisters the
+                # handle, so reading outside the lock can land on a number that
+                # has already been freed -- and handed to the next open().
+                return os.pread(live.fd, size, offset)
         path, is_arc = self.btree.stored(rel)
         if path is None:
             raise OSError(errno.ENOENT, rel)
@@ -436,8 +452,12 @@ class LmzFS(FuseServer):
         try:
             self._commit(handle)
         finally:
+            # Unregister and close together, under the lock: past this point no
+            # reader can still be holding the handle, and until it no reader
+            # can find a closed descriptor.
             with self._lock:
                 self._open_writes.pop(handle.rel, None)
+                handle.close()
 
     def fs_fsync(self, node: Node, fh: int) -> None:
         with self._lock:
@@ -518,12 +538,12 @@ class LmzFS(FuseServer):
                 except OSError:
                     pass
         finally:
-            # Closed only now: reads racing the commit use this descriptor,
-            # and an open fd survives the rename that puts the result in place.
-            try:
-                os.close(handle.fd)
-            except OSError:
-                pass
+            # The descriptor outlives this function on purpose: reads racing the
+            # commit are served from it, and an open fd survives the rename that
+            # puts the result in place. Closing it here would free the number
+            # while `_open_writes` still hands the handle out, and the next
+            # open() is then given it -- so the caller closes it instead, in the
+            # same critical section that unregisters the handle.
             for leftover in (handle.path, tmp):
                 if os.path.lexists(leftover):
                     try:
@@ -540,14 +560,19 @@ class LmzFS(FuseServer):
         if valid & FATTR_SIZE:
             with self._lock:
                 handle = self._open_writes.get(rel)
+                if handle is not None:             # same rule as read_file
+                    os.ftruncate(handle.fd, size)
+                    handle.dirty = True
             if handle is None:
+                # Never registered, so nothing else can reach this one and the
+                # close is ours to make as soon as the commit is done.
                 handle = self._scratch_for(rel, False)
                 handle.dirty = True
                 os.ftruncate(handle.fd, size)
-                self._commit(handle)
-            else:
-                os.ftruncate(handle.fd, size)
-                handle.dirty = True
+                try:
+                    self._commit(handle)
+                finally:
+                    handle.close()
         target = self.btree.stored(rel)[0] or self.btree.real(rel)
         if valid & FATTR_MODE:
             os.chmod(target, mode & 0o7777)
@@ -633,12 +658,14 @@ class LmzFS(FuseServer):
             self._open_writes.clear()
             readers, self._readers = list(self._readers.values()), OrderedDict()
         for handle in handles:
-            if handle.writable and handle.refs > 0:
-                handle.refs = 0
-                try:
+            try:
+                if handle.writable and handle.refs > 0:
+                    handle.refs = 0
                     self._commit(handle)
-                except Exception:
-                    pass
+            except Exception:
+                pass
+            finally:
+                handle.close()
         for arc in readers:
             try:
                 arc.close()

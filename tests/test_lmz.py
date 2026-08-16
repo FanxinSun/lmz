@@ -2167,6 +2167,48 @@ def test_fs_write_then_immediately_read():
                     assert fh.read() == body, f"f{i} read back wrong"
 
 
+def test_fs_scratch_fd_closes_only_once_unreachable():
+    """The commit must not free the descriptor while a reader can still find it.
+
+    fs_release commits with the file still registered in _open_writes, so a read
+    arriving mid-commit is served from the scratch copy. Freeing the descriptor
+    before unregistering leaves that reader preading a number the kernel has
+    already handed to the next open(), and it gets an unrelated file's bytes
+    back. That is what turned `write, close, read` into wrong contents on the
+    free-threaded build, where the server lifts its cap from 2 threads to 16 and
+    the window is wide enough to land in.
+
+    Driven through the handlers directly rather than through a mount, so it
+    checks the ordering itself instead of trying to win a race.
+    """
+    from lmz import lmzfs
+
+    with tempfile.TemporaryDirectory() as d:
+        fs = lmzfs.LmzFS(os.path.join(d, "back"), os.path.join(d, "mnt"))
+        closes = []
+        original = lmzfs.Handle.close
+
+        def watched(handle):
+            with fs._lock:
+                closes.append((handle.rel,
+                               fs._open_writes.get(handle.rel) is handle))
+            original(handle)
+
+        lmzfs.Handle.close = watched
+        try:
+            node, fh = fs.fs_create(fs.btree.root, "w.bin", 0o644, os.O_WRONLY)
+            fs.fs_write(node, fh, 0, b"weights" * 20000)
+            fs.fs_release(node, fh)
+        finally:
+            lmzfs.Handle.close = original
+            fs.close()
+
+        assert closes, "the scratch descriptor was never closed"
+        for rel, reachable in closes:
+            assert not reachable, \
+                f"{rel}: descriptor closed while still listed in _open_writes"
+
+
 def test_fs_preserves_metadata_and_namespace():
     with tempfile.TemporaryDirectory() as d:
         back, point = os.path.join(d, "back"), os.path.join(d, "mnt")
