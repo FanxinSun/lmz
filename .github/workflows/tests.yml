@@ -30,18 +30,28 @@ jobs:
       matrix:
         os: [ubuntu-latest]
         python: ["3.10", "3.11", "3.12", "3.13", "3.13t", "3.14", "3.14t"]
-        # Two extra combinations, not a second dimension: the interpreter
-        # sweep is about Python, so it only needs one machine, while these two
-        # are about the machine and only need one interpreter. macos-latest is
-        # Apple Silicon, which makes it the only job that ever compiles the
-        # NEON kernels or the -dynamiclib link line -- both shipped, neither
-        # previously built anywhere. ubuntu-24.04-arm holds the OS fixed so a
-        # failure says "arm64" or "Darwin" rather than leaving it ambiguous.
+        # Extra combinations, not a second dimension: the interpreter sweep is
+        # about Python, so it only needs one machine, while these are about the
+        # machine and only need one interpreter. macos-latest is Apple Silicon,
+        # which makes it the only job that ever compiles the NEON kernels or the
+        # -dynamiclib link line -- both shipped, neither previously built
+        # anywhere. ubuntu-24.04-arm holds the OS fixed so a failure says
+        # "arm64" or "Darwin" rather than leaving it ambiguous.
+        #
+        # The free-threaded arm64 entry is the only one that crosses the two
+        # axes. Every other no-GIL job runs on x86, which is total-store-order
+        # and therefore the forgiving case; arm64 reorders far more, so a race
+        # that is benign there can be real here. It is also the only place the
+        # threaded FUSE server runs under both conditions at once, because those
+        # tests need a Linux kernel -- and that server is where the one race
+        # found so far actually lived.
         include:
           - os: macos-latest
             python: "3.14"
           - os: ubuntu-24.04-arm
             python: "3.14"
+          - os: ubuntu-24.04-arm
+            python: "3.14t"
     steps:
       - uses: actions/checkout@v4
 
