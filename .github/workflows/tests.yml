@@ -23,12 +23,25 @@ concurrency:
 # runs genuinely different code.
 jobs:
   test:
-    name: python ${{ matrix.python }}
-    runs-on: ubuntu-latest
+    name: python ${{ matrix.python }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python: ["3.10", "3.11", "3.12", "3.13", "3.13t", "3.14", "3.14t"]
+        # Two extra combinations, not a second dimension: the interpreter
+        # sweep is about Python, so it only needs one machine, while these two
+        # are about the machine and only need one interpreter. macos-latest is
+        # Apple Silicon, which makes it the only job that ever compiles the
+        # NEON kernels or the -dynamiclib link line -- both shipped, neither
+        # previously built anywhere. ubuntu-24.04-arm holds the OS fixed so a
+        # failure says "arm64" or "Darwin" rather than leaving it ambiguous.
+        include:
+          - os: macos-latest
+            python: "3.14"
+          - os: ubuntu-24.04-arm
+            python: "3.14"
     steps:
       - uses: actions/checkout@v4
 
@@ -38,8 +51,10 @@ jobs:
 
       # Without fuse3 the mount and filesystem tests skip themselves rather
       # than fail, which would quietly hide the half of the suite that
-      # exercises the read path.
+      # exercises the read path. macOS has no /dev/fuse and lmz declines to
+      # mount there at all, so on that job the same tests skip by design.
       - name: Install fuse3
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq fuse3
@@ -47,6 +62,20 @@ jobs:
 
       - name: Report the active backends
         run: python -m lmz doctor
+
+      # A kernel that fails to build is silent on purpose: lmz falls back to
+      # Python and keeps working. That is right for users and useless for CI --
+      # without this, the two jobs added to cover NEON would go green while
+      # running the same fallback bytes as every other job.
+      - name: Require the NEON kernel
+        if: runner.arch == 'ARM64'
+        run: |
+          python -c "
+          from lmz import kernels
+          isa = kernels.backend()
+          print('kernel backend:', isa)
+          assert isa == 'native:neon', isa
+          "
 
       - name: Run the suite
         run: python tests/test_lmz.py
