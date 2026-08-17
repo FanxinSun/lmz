@@ -835,28 +835,6 @@ static inline void rans_dec_init(uint32_t *r, const uint8_t **pptr)
     *pptr = p + 4;
 }
 
-/*
- * Branchless step. Whether a symbol needs a refill depends on how many bits
- * it consumed, which for a near-uniform plane is close to a coin flip -- as
- * a branch it mispredicts about half the time and dominates the decode. So
- * the refill word is always loaded and then applied conditionally, which
- * compiles to a conditional move and a pointer add.
- *
- * The unconditional load reads up to two bytes beyond the cursor, so callers
- * must only use this while a margin of readable input remains.
- */
-static inline uint32_t rans_dec_advance_fast(uint32_t x, const uint8_t **pptr,
-                                             uint32_t start, uint32_t freq)
-{
-    x = freq * (x >> RANS_PROB_BITS) + (x & (RANS_PROB_SCALE - 1)) - start;
-    const uint8_t *p = *pptr;
-    uint32_t word = (uint32_t)p[0] | ((uint32_t)p[1] << 8);
-    uint32_t need = (x < RANS_L);
-    x = need ? ((x << 16) | word) : x;
-    *pptr = p + (need << 1);
-    return x;
-}
-
 /* Bounds-checked equivalent, for the last few symbols. */
 static inline int rans_dec_advance_safe(uint32_t *r, const uint8_t **pptr,
                                         const uint8_t *limit,
@@ -1284,9 +1262,36 @@ LMZ_API int lmz_rans_decode(const uint8_t *src, size_t src_len, uint8_t *dst, si
             e[k] = lut[state[k] & (RANS_PROB_SCALE - 1)];
         for (int k = 0; k < RANS_STREAMS; k++)
             dst[i + k] = (uint8_t)(e[k] & 0xff);
+
+        /*
+         * The refills the same way. Whether a lane needs one depends on how
+         * many bits its symbol consumed and on nothing else -- not on the
+         * cursor, and not on any other lane. Deciding all eight first turns
+         * the cursor into a prefix sum of small integers, so the eight refill
+         * loads are independent; written one at a time each waits on the one
+         * before it just to learn its own address.
+         *
+         * Each load is unconditional and reads up to two bytes past its own
+         * offset, the furthest being fifteen bytes beyond the cursor, which
+         * the loop's guard has already established is readable. A lane that
+         * did not need its word simply does not use it, and the branch that
+         * would have decided is not taken: on a near-uniform plane it is a
+         * coin flip and mispredicts about half the time.
+         */
+        uint32_t x[RANS_STREAMS], need[RANS_STREAMS], off[RANS_STREAMS];
         for (int k = 0; k < RANS_STREAMS; k++)
-            state[k] = rans_dec_advance_fast(state[k], &ptr,
-                                             (e[k] >> 8) & 0xfff, (e[k] >> 20) + 1);
+            x[k] = ((e[k] >> 20) + 1) * (state[k] >> RANS_PROB_BITS)
+                 + (state[k] & (RANS_PROB_SCALE - 1)) - ((e[k] >> 8) & 0xfff);
+        for (int k = 0; k < RANS_STREAMS; k++) need[k] = (x[k] < RANS_L);
+        off[0] = 0;
+        for (int k = 1; k < RANS_STREAMS; k++)
+            off[k] = off[k - 1] + (need[k - 1] << 1);
+        for (int k = 0; k < RANS_STREAMS; k++) {
+            const uint8_t *p = ptr + off[k];
+            uint32_t word = (uint32_t)p[0] | ((uint32_t)p[1] << 8);
+            state[k] = need[k] ? ((x[k] << 16) | word) : x[k];
+        }
+        ptr += off[RANS_STREAMS - 1] + (need[RANS_STREAMS - 1] << 1);
     }
     for (; i < n; i++) {
         uint32_t k = (uint32_t)(i & (RANS_STREAMS - 1));
