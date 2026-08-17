@@ -398,6 +398,41 @@ def test_rans_matches_entropy():
         assert len(enc) < bound * 1.02, (name, len(enc), bound)
 
 
+def test_rans_vector_path_writes_the_same_bytes():
+    """The vector coder is a speed change, not a format change.
+
+    It steps the same eight interleaved states eight at a time, so it has to
+    write byte for byte what the portable loop writes -- otherwise an archive
+    would depend on which machine produced it, and a build without the vector
+    path could not reproduce one that had it.
+
+    Sizes straddle the length the vector path starts at and the eight-symbol
+    group boundary either side of it, so the ragged tail and the handover from
+    scalar to vector are both exercised.
+    """
+    if not kernels.have_rans():
+        return
+    sizes = (4088, 4095, 4096, 4097, 4103, 4104, 4111, 8192, 65537)
+    shapes = {
+        "weights": lambda n: weights_bf16(n // 2 + 1)[:n],
+        "noise": lambda n: rand(n, n + 3),
+        "few symbols": lambda n: bytes((i * i) % 7 for i in range(n)),
+        # Drives one frequency past half the scale, which is where the vector
+        # path's reciprocal stops being exact and it must decline.
+        "one dominant": lambda n: bytes(5 if i % 8 else (i & 0xFF)
+                                        for i in range(n)),
+        "single symbol": lambda n: bytes([200]) * n,
+    }
+    for n in sizes:
+        for name, make in shapes.items():
+            data = make(n)
+            assert len(data) == n, (name, n)
+            portable = kernels.rans_encode(data, portable=True)
+            vector = kernels.rans_encode(data)
+            assert vector == portable, f"{name}, n={n}"
+            assert bytes(kernels.rans_decode(vector, n)) == data, f"{name}, n={n}"
+
+
 def test_rans_accepts_a_precomputed_histogram():
     """Handing the coder counts it would otherwise take must change nothing.
 

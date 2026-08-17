@@ -104,6 +104,9 @@ def _load_native():
             lib.lmz_rans_encode_h.restype = ctypes.c_long
             lib.lmz_rans_encode_h.argtypes = [v, ctypes.c_size_t, v,
                                               ctypes.c_size_t, v]
+            lib.lmz_rans_encode_portable.restype = ctypes.c_long
+            lib.lmz_rans_encode_portable.argtypes = [v, ctypes.c_size_t, v,
+                                                     ctypes.c_size_t, v]
             lib.lmz_rans_decode.restype = ctypes.c_int
             lib.lmz_rans_decode.argtypes = [v, ctypes.c_size_t, v, ctypes.c_size_t]
             _lib = lib
@@ -820,12 +823,17 @@ def rans_freqs(hist) -> list[int] | None:
     return list(freqs)
 
 
-def rans_encode(src, hist=None) -> bytes | None:
+def rans_encode(src, hist=None, portable: bool = False) -> bytes | None:
     """Order-0 rANS encode. Returns None if unavailable or the input is empty.
 
     `hist` is this buffer's histogram if the caller already took one. The coder
     is picked from a histogram, so by the time it runs the counts usually exist;
     handing them over saves the encoder a second pass over the stream.
+
+    `portable` keeps the kernel off its vector path. The two write the same
+    bytes -- an archive does not depend on the machine that wrote it -- so this
+    exists to hold them side by side, in the tests and when a stream needs
+    explaining.
     """
     lib = _load_native()
     if lib is None or len(src) == 0:
@@ -837,8 +845,8 @@ def rans_encode(src, hist=None) -> bytes | None:
         buf = _rans_scratch.buf = bytearray(cap)
     src_addr, _a = _ptr(src)
     dst_addr, _b = _ptr(buf)
-    written = lib.lmz_rans_encode_h(src_addr, n, dst_addr, cap,
-                                    _counts_arg(hist))
+    enc = lib.lmz_rans_encode_portable if portable else lib.lmz_rans_encode_h
+    written = enc(src_addr, n, dst_addr, cap, _counts_arg(hist))
     if written < 0:
         return None
     return bytes(memoryview(buf)[:written])
