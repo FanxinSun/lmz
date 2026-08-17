@@ -239,22 +239,25 @@ static int dec_offsets(const uint8_t *src, size_t src_len, uint8_t *dst,
     DEC_TAIL
 }
 
-/* Two independent streams in one loop. If the loop is waiting rather than
- * working, the second rides along nearly free. */
-static int dec_two(const uint8_t *src, size_t src_len, uint8_t *d0,
-                   uint8_t *d1, size_t n, const uint32_t *lut)
+/* Two chunks decoded together: different bytes, different coded streams,
+ * and a frequency table each, because that is what two chunks are. Decoding
+ * one stream twice instead would let the second ride on cache lines the first
+ * had just pulled in, and reports a speedup that does not exist. */
+static int dec_two(const uint8_t *sa, size_t la, const uint32_t *lua, uint8_t *d0,
+                   const uint8_t *sb, size_t lb, const uint32_t *lub, uint8_t *d1,
+                   size_t n)
 {
-    const uint8_t *p0=src+HDR, *p1=src+HDR, *limit=src+src_len;
+    const uint8_t *p0=sa+HDR, *p1=sb+HDR, *enda=sa+la, *endb=sb+lb;
     uint32_t s0[8], s1[8];
     for (int k=0;k<8;k++){ s0[k]=(uint32_t)p0[0]|((uint32_t)p0[1]<<8)
         |((uint32_t)p0[2]<<16)|((uint32_t)p0[3]<<24); p0+=4; }
     for (int k=0;k<8;k++){ s1[k]=(uint32_t)p1[0]|((uint32_t)p1[1]<<8)
         |((uint32_t)p1[2]<<16)|((uint32_t)p1[3]<<24); p1+=4; }
     size_t i=0;
-    for (; i+8<=n && p0+16<=limit && p1+16<=limit; i+=8){
+    for (; i+8<=n && p0+16<=enda && p1+16<=endb; i+=8){
         uint32_t e0[8], e1[8];
-        for (int k=0;k<8;k++) e0[k]=lut[s0[k]&(PROB_SCALE-1)];
-        for (int k=0;k<8;k++) e1[k]=lut[s1[k]&(PROB_SCALE-1)];
+        for (int k=0;k<8;k++) e0[k]=lua[s0[k]&(PROB_SCALE-1)];
+        for (int k=0;k<8;k++) e1[k]=lub[s1[k]&(PROB_SCALE-1)];
         for (int k=0;k<8;k++) d0[i+k]=(uint8_t)(e0[k]&0xff);
         for (int k=0;k<8;k++) d1[i+k]=(uint8_t)(e1[k]&0xff);
         for (int k=0;k<8;k++){
@@ -269,6 +272,41 @@ static int dec_two(const uint8_t *src, size_t src_len, uint8_t *d0,
             const uint8_t *p=p1; uint32_t w=(uint32_t)p[0]|((uint32_t)p[1]<<8);
             uint32_t nd=(x<RANS_L); x=nd?((x<<16)|w):x; p1=p+(nd<<1); s1[k]=x;
         }
+    }
+    return (int)i;
+}
+
+/* Sixteen interleaved states in one stream: the format change that a "more
+ * chains would help" reading of the two-chunk figure appears to argue for.
+ * It does not survive being measured. */
+static int dec16(const uint8_t *src, size_t src_len, uint8_t *dst, size_t n,
+                 const uint32_t *lut)
+{
+    const uint8_t *ptr=src+HDR, *limit=src+src_len;
+    uint32_t state[16];
+    for (int k=0;k<16;k++){ state[k]=(uint32_t)ptr[0]|((uint32_t)ptr[1]<<8)
+        |((uint32_t)ptr[2]<<16)|((uint32_t)ptr[3]<<24); ptr+=4; }
+    size_t i=0;
+    for (; i+16<=n && ptr+32<=limit; i+=16){
+        uint32_t e[16];
+        for (int k=0;k<16;k++) e[k]=lut[state[k]&(PROB_SCALE-1)];
+        for (int k=0;k<16;k++) dst[i+k]=(uint8_t)(e[k]&0xff);
+        for (int k=0;k<16;k++){
+            uint32_t x=state[k];
+            x=((e[k]>>20)+1)*(x>>PROB_BITS)+(x&(PROB_SCALE-1))-((e[k]>>8)&0xfff);
+            const uint8_t *p=ptr; uint32_t w=(uint32_t)p[0]|((uint32_t)p[1]<<8);
+            uint32_t nd=(x<RANS_L); x=nd?((x<<16)|w):x; ptr=p+(nd<<1); state[k]=x;
+        }
+    }
+    for (; i<n; i++){
+        uint32_t k=(uint32_t)(i&15);
+        uint32_t e=lut[state[k]&(PROB_SCALE-1)];
+        dst[i]=(uint8_t)(e&0xff);
+        uint32_t x=state[k], st2=(e>>8)&0xfff, fq=(e>>20)+1;
+        x=fq*(x>>PROB_BITS)+(x&(PROB_SCALE-1))-st2;
+        if (x<RANS_L){ if(ptr+2>limit) return -1;
+            x=(x<<16)|(uint32_t)ptr[0]|((uint32_t)ptr[1]<<8); ptr+=2; }
+        state[k]=x;
     }
     return 0;
 }
@@ -349,18 +387,45 @@ int main(int argc, char **argv)
         row("decode, offsets up front", b, n, base,
             (rc==0 && !memcmp(o0,buf,n)) ? "as it ships" : "!! WRONG");
         b = 1e9;
+        for (int r=0;r<7;r++){ memset(o0,0,n); double s=now();
+            rc=dec16(enc16,(size_t)l16,o0,n,lut); double e=now()-s; if(e<b)b=e; }
+        row("decode, 16 states", b, n, base,
+            (rc==0 && !memcmp(o0,buf,n)) ? "the format change" : "!! WRONG");
+
+        /* Two chunks together. Each half of the plane is its own stream with
+         * its own table, which is what pairing chunks would really mean. */
+        size_t h = n / 2;
+        uint64_t ca[256], cb[256]; uint16_t fa[256], fb[256];
+        hist(buf, h, ca); normalize(ca, fa);
+        hist(buf + h, h, cb); normalize(cb, fb);
+        uint8_t *ea = malloc(cap), *eb = malloc(cap);
+        long la = encode8(buf, h, ea, cap, fa);
+        long lb = encode8(buf + h, h, eb, cap, fb);
+        uint32_t *lua = malloc(PROB_SCALE*4), *lub = malloc(PROB_SCALE*4);
+        build_lut(fa, lua); build_lut(fb, lub);
+        b = 1e9;
         for (int r=0;r<7;r++){ double s=now();
-            dec_two(enc,(size_t)l8,o0,o1,n,lut); double e=now()-s; if(e<b)b=e; }
-        printf("    %-26s %8.2f ms  %7.0f MiB/s  two streams in %.2fx the "
-               "time of one\n", "decode, two at once", b*1e3,
-               2*n/b/1048576.0, b/base);
+            dec_shared(ea,(size_t)la,o0,h,lua);
+            dec_shared(eb,(size_t)lb,o1,h,lub);
+            double e=now()-s; if(e<b)b=e; }
+        double apart = b;
+        row("two chunks, one at a time", b, n, base, "");
+        b = 1e9;
+        for (int r=0;r<7;r++){ double s=now();
+            dec_two(ea,(size_t)la,lua,o0,eb,(size_t)lb,lub,o1,h);
+            double e=now()-s; if(e<b)b=e; }
+        row("two chunks, interleaved", b, n, apart, "against the line above");
+        free(ea); free(eb); free(lua); free(lub);
 
         free(enc); free(enc16); free(lut); free(o0); free(o1);
         (void)l16;
     }
-    printf("\nIf the last line of each block is near 1.00x, the decoder is "
-           "waiting rather than\nworking, and only more interleaved states "
-           "will help it -- not wider ones.\n");
+    printf("\nWhat the last three lines are for. Sixteen states is the format\n"
+           "change; if it is below 1.00x the register file, not the dependency\n"
+           "chains, is what the decoder is short of. Interleaving two chunks is\n"
+           "the same idea without a format change, and the honest version of it:\n"
+           "two different streams with a table each, not one stream decoded\n"
+           "twice, which only measures the second one reusing the first's cache.\n");
     free(expp); free(smp);
     return 0;
 }
