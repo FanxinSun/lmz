@@ -1,0 +1,64 @@
+name: bench
+
+# Not a gate and not on every push: benchmarks on shared runners are noisy, and
+# a number nobody asked for is a number nobody reads. Dispatch it when the
+# question is "what does this cost on a machine I do not own", which for arm64
+# and Darwin is the only way to ask at all.
+on:
+  workflow_dispatch:
+  push:
+    branches: ["bench**"]
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      # Only the generator needs numpy; lmz itself still has no dependencies.
+      - name: Install the generator's numpy
+        run: python -m pip install --quiet numpy
+
+      - name: Report the machine and the kernel it built
+        run: |
+          python -c "import platform, os; print('machine :', platform.machine()); print('cpus    :', os.cpu_count())"
+          python -m lmz doctor
+
+      # Same seed, so every machine measures byte-identical input. The digest is
+      # printed rather than trusted: a cross-system comparison of different
+      # inputs is worse than no comparison, because it looks like a result.
+      - name: Generate the input
+        run: |
+          python tests/make_model.py --dtype bf16 --layers 3 --hidden 1024 \
+              --seed 1 model.safetensors
+          python -c "
+          import hashlib
+          h = hashlib.sha256(open('model.safetensors','rb').read()).hexdigest()
+          print('input sha256:', h[:32])
+          assert h.startswith('d7d4b790266b72d2'), h
+          "
+
+      # Three passes: the runners are shared, so a single number is a guess and
+      # the best of several is the closest thing to the machine's real rate.
+      - name: Bench, three passes
+        run: |
+          for i in 1 2 3; do
+            echo "--- pass $i ---"
+            python -m lmz bench model.safetensors --bytes 64MiB
+          done
+
+      - name: Which coder did the work here
+        run: |
+          python -m lmz bench model.safetensors --bytes 64MiB --methods
