@@ -239,42 +239,62 @@ static int dec_offsets(const uint8_t *src, size_t src_len, uint8_t *dst,
     DEC_TAIL
 }
 
-/* Two chunks decoded together: different bytes, different coded streams,
- * and a frequency table each, because that is what two chunks are. Decoding
- * one stream twice instead would let the second ride on cache lines the first
- * had just pulled in, and reports a speedup that does not exist. */
-static int dec_two(const uint8_t *sa, size_t la, const uint32_t *lua, uint8_t *d0,
-                   const uint8_t *sb, size_t lb, const uint32_t *lub, uint8_t *d1,
-                   size_t n)
-{
-    const uint8_t *p0=sa+HDR, *p1=sb+HDR, *enda=sa+la, *endb=sb+lb;
-    uint32_t s0[8], s1[8];
-    for (int k=0;k<8;k++){ s0[k]=(uint32_t)p0[0]|((uint32_t)p0[1]<<8)
-        |((uint32_t)p0[2]<<16)|((uint32_t)p0[3]<<24); p0+=4; }
-    for (int k=0;k<8;k++){ s1[k]=(uint32_t)p1[0]|((uint32_t)p1[1]<<8)
-        |((uint32_t)p1[2]<<16)|((uint32_t)p1[3]<<24); p1+=4; }
-    size_t i=0;
-    for (; i+8<=n && p0+16<=enda && p1+16<=endb; i+=8){
-        uint32_t e0[8], e1[8];
-        for (int k=0;k<8;k++) e0[k]=lua[s0[k]&(PROB_SCALE-1)];
-        for (int k=0;k<8;k++) e1[k]=lub[s1[k]&(PROB_SCALE-1)];
-        for (int k=0;k<8;k++) d0[i+k]=(uint8_t)(e0[k]&0xff);
-        for (int k=0;k<8;k++) d1[i+k]=(uint8_t)(e1[k]&0xff);
-        for (int k=0;k<8;k++){
-            uint32_t x=s0[k];
-            x=((e0[k]>>20)+1)*(x>>PROB_BITS)+(x&(PROB_SCALE-1))-((e0[k]>>8)&0xfff);
-            const uint8_t *p=p0; uint32_t w=(uint32_t)p[0]|((uint32_t)p[1]<<8);
-            uint32_t nd=(x<RANS_L); x=nd?((x<<16)|w):x; p0=p+(nd<<1); s0[k]=x;
-        }
-        for (int k=0;k<8;k++){
-            uint32_t x=s1[k];
-            x=((e1[k]>>20)+1)*(x>>PROB_BITS)+(x&(PROB_SCALE-1))-((e1[k]>>8)&0xfff);
-            const uint8_t *p=p1; uint32_t w=(uint32_t)p[0]|((uint32_t)p[1]<<8);
-            uint32_t nd=(x<RANS_L); x=nd?((x<<16)|w):x; p1=p+(nd<<1); s1[k]=x;
-        }
-    }
-    return (int)i;
+/* N chunks decoded together: different bytes, different coded streams, and a
+ * frequency table each, because that is what N chunks are. Decoding one stream
+ * N times instead would let the later passes ride on cache lines the first had
+ * just pulled in, and reports a speedup that does not exist.
+ *
+ * Each chunk keeps its own cursor, so N chunks is N chains of eight rather than
+ * one chain of 8N -- which is the difference between this and widening the
+ * format, and it is not a small one. */
+#define MAKE_MANY(N)                                                          \
+static int dec_many##N(const uint8_t *const *src, const size_t *slen,         \
+                       const uint32_t *const *luts, uint8_t *const *dst,      \
+                       size_t n)                                              \
+{                                                                             \
+    const uint8_t *ptr[N], *end[N];                                           \
+    uint32_t st[N][8];                                                        \
+    for (int m = 0; m < (N); m++) {                                           \
+        ptr[m] = src[m] + HDR; end[m] = src[m] + slen[m];                      \
+        for (int k = 0; k < 8; k++) {                                          \
+            st[m][k] = (uint32_t)ptr[m][0] | ((uint32_t)ptr[m][1] << 8)        \
+                | ((uint32_t)ptr[m][2] << 16) | ((uint32_t)ptr[m][3] << 24);   \
+            ptr[m] += 4;                                                       \
+        }                                                                      \
+    }                                                                          \
+    size_t i = 0;                                                              \
+    for (;;) {                                                                 \
+        if (i + 8 > n) break;                                                  \
+        int room = 1;                                                          \
+        for (int m = 0; m < (N); m++) if (ptr[m] + 16 > end[m]) room = 0;       \
+        if (!room) break;                                                      \
+        for (int m = 0; m < (N); m++) {                                        \
+            const uint32_t *lut = luts[m];                                     \
+            uint8_t *d = dst[m];                                               \
+            const uint8_t *p = ptr[m];                                         \
+            uint32_t e[8];                                                     \
+            for (int k = 0; k < 8; k++) e[k] = lut[st[m][k] & (PROB_SCALE-1)]; \
+            for (int k = 0; k < 8; k++) d[i+k] = (uint8_t)(e[k] & 0xff);       \
+            for (int k = 0; k < 8; k++) {                                      \
+                uint32_t x = st[m][k];                                         \
+                x = ((e[k]>>20)+1)*(x>>PROB_BITS) + (x&(PROB_SCALE-1))         \
+                    - ((e[k]>>8)&0xfff);                                       \
+                uint32_t w = (uint32_t)p[0] | ((uint32_t)p[1] << 8);           \
+                uint32_t nd = (x < RANS_L);                                    \
+                x = nd ? ((x<<16)|w) : x;                                      \
+                p = p + (nd<<1);                                               \
+                st[m][k] = x;                                                  \
+            }                                                                  \
+            ptr[m] = p;                                                        \
+        }                                                                      \
+        i += 8;                                                                \
+    }                                                                          \
+    return (int)i;                                                             \
 }
+MAKE_MANY(1)
+MAKE_MANY(2)
+MAKE_MANY(3)
+MAKE_MANY(4)
 
 /* The same instructions with the loop-carried dependency cut: the table index
  * comes from an array recorded on an earlier pass rather than from the state
@@ -449,40 +469,58 @@ int main(int argc, char **argv)
         row("decode, chain cut", b, n, base, "not a decoder; the headroom");
         free(slots);
 
-        /* Two chunks together. Each half of the plane is its own stream with
+        /* Chunks together. Each quarter of the plane is its own stream with
          * its own table, which is what pairing chunks would really mean. */
-        size_t h = n / 2;
-        uint64_t ca[256], cb[256]; uint16_t fa[256], fb[256];
-        hist(buf, h, ca); normalize(ca, fa);
-        hist(buf + h, h, cb); normalize(cb, fb);
-        uint8_t *ea = malloc(cap), *eb = malloc(cap);
-        long la = encode8(buf, h, ea, cap, fa);
-        long lb = encode8(buf + h, h, eb, cap, fb);
-        uint32_t *lua = malloc(PROB_SCALE*4), *lub = malloc(PROB_SCALE*4);
-        build_lut(fa, lua); build_lut(fb, lub);
-        b = 1e9;
-        for (int r=0;r<7;r++){ double s=now();
-            dec_shared(ea,(size_t)la,o0,h,lua);
-            dec_shared(eb,(size_t)lb,o1,h,lub);
-            double e=now()-s; if(e<b)b=e; }
-        double apart = b;
-        row("two chunks, one at a time", b, n, base, "");
-        b = 1e9;
-        for (int r=0;r<7;r++){ double s=now();
-            dec_two(ea,(size_t)la,lua,o0,eb,(size_t)lb,lub,o1,h);
-            double e=now()-s; if(e<b)b=e; }
-        row("two chunks, interleaved", b, n, apart, "against the line above");
-        free(ea); free(eb); free(lua); free(lub);
+        {
+            size_t h = n / 4;
+            const uint8_t *cs[4]; size_t cl[4]; const uint32_t *cu[4];
+            uint8_t *cd[4]; uint8_t *ce[4]; uint32_t *cl2[4];
+            uint8_t *pool = malloc(4 * h);
+            for (int m = 0; m < 4; m++) {
+                uint64_t cc[256]; uint16_t ff[256];
+                hist(buf + (size_t)m*h, h, cc); normalize(cc, ff);
+                ce[m] = malloc(cap);
+                cl[m] = (size_t)encode8(buf + (size_t)m*h, h, ce[m], cap, ff);
+                cl2[m] = malloc(PROB_SCALE*4); build_lut(ff, cl2[m]);
+                cs[m] = ce[m]; cu[m] = cl2[m]; cd[m] = pool + (size_t)m*h;
+            }
+            int (*many[4])(const uint8_t *const *, const size_t *,
+                           const uint32_t *const *, uint8_t *const *, size_t)
+                = {dec_many1, dec_many2, dec_many3, dec_many4};
+            double alone = 1e9;
+            for (int r=0;r<7;r++){ double s2=now();
+                for (int m=0;m<4;m++) dec_many1(&cs[m],&cl[m],&cu[m],&cd[m],h);
+                double e=now()-s2; if(e<alone)alone=e; }
+            row("chunks, one at a time", alone, n, base,
+                memcmp(cd[0], buf, h-64) ? "!! WRONG" : "");
+            for (int q = 2; q <= 4; q++) {
+                double bb = 1e9;
+                for (int r=0;r<7;r++){ double s2=now();
+                    for (int m=0;m+q<=4;m+=q)
+                        many[q-1](&cs[m],&cl[m],&cu[m],&cd[m],h);
+                    double e=now()-s2; if(e<bb)bb=e; }
+                int done = (4/q)*q;
+                char name[48], note[64];
+                snprintf(name, sizeof name, "chunks, %d interleaved", q);
+                snprintf(note, sizeof note, "%s, vs one at a time",
+                         memcmp(cd[0], buf, h-64) ? "!! WRONG" : "exact");
+                row(name, bb * 4.0 / done, n, alone, note);
+            }
+            for (int m=0;m<4;m++){ free(ce[m]); free(cl2[m]); }
+            free(pool);
+        }
 
         free(enc); free(enc16); free(lut); free(o0); free(o1);
         (void)l16;
     }
-    printf("\nThe last four lines, in order.\n\n"
-           "  16 states and two chunks both add independent work for the machine\n"
-           "  to overlap. On x86-64 both come out below 1.00x, because eight rANS\n"
-           "  states and their table entries already fill sixteen general-purpose\n"
-           "  registers and anything more spills. arm64 has thirty-one, so these\n"
-           "  two lines are the ones worth reading on a machine that is not x86.\n\n"
+    printf("\nThe last rows, in order.\n\n"
+           "  16 states and interleaved chunks both add independent work for the\n"
+           "  machine to overlap, but not the same way: N chunks is N chains of\n"
+           "  eight, while 16 states is one chain of sixteen. On x86-64 both lose,\n"
+           "  because eight rANS states and their table entries already fill\n"
+           "  sixteen general-purpose registers. arm64 has thirty-one, and there\n"
+           "  chunks win while 16 states still loses -- so both the register file\n"
+           "  and the length of the cursor chain are doing something.\n\n"
            "  Chain cut is not a decoder -- it replays recorded table indices, so\n"
            "  it computes nothing. It runs the same instructions with the\n"
            "  loop-carried dependency removed, and the ratio is how much of this\n"
