@@ -1412,6 +1412,41 @@ def test_block_codec_declines_on_noise():
                                     crc, True)) == data
 
 
+def test_zstd_backend_preference_does_not_change_what_is_readable():
+    """Which binding wins varies by platform; what it writes must not.
+
+    Both are libzstd, so the choice is only about speed: CPython's bundled build
+    measured roughly 7x slower than the same library through the `zstandard`
+    package on macOS, which is why the preference flips there. An archive has to
+    stay readable either way, so where both are installed their frames must be
+    mutually decodable -- otherwise the preference would be a format decision
+    wearing a performance disguise.
+    """
+    from unittest import mock
+
+    with mock.patch.object(sys, "platform", "darwin"):
+        assert [f.__name__ for f in entropy._backend_order()] == \
+            ["_load_package", "_load_stdlib"], "macOS must prefer the package"
+    for other in ("linux", "win32"):
+        with mock.patch.object(sys, "platform", other):
+            assert [f.__name__ for f in entropy._backend_order()] == \
+                ["_load_stdlib", "_load_package"], f"{other} must prefer stdlib"
+
+    loaded = []
+    for loader in (entropy._load_stdlib, entropy._load_package):
+        try:
+            loaded.append(loader())
+        except ImportError:
+            pass          # only one binding installed here, which is normal
+    if not loaded:
+        raise Skip("no zstd binding is available")
+    data = (bytes(range(256)) * 512) + b"contents number 0\n" * 100
+    for comp, _d, _e, name in loaded:
+        frame = comp(data, 3)
+        for _c, dec, _e2, reader in loaded:
+            assert dec(frame) == data, f"{reader} could not read {name}'s frame"
+
+
 def test_method_tally_counts_only_the_attempt_that_won():
     """Every input byte is credited to exactly one coder, once.
 

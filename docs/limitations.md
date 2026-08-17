@@ -77,6 +77,17 @@
 - GGUF block-quantised tensors are split on their ggml struct layout, which
   covers Q4_0 through Q8_1, every k-quant, the IQ types and the ternary ones.
   A layout this build does not recognise falls back to opaque bytes.
+- **CPython's bundled zstd is slow on macOS.** Measured on a GitHub
+  `macos-latest` runner: 103 MiB/s compressing a 64 MiB BF16 sample through
+  `compression.zstd`, against 767 MiB/s for the same work through the
+  `zstandard` package on an Apple Silicon Mac, and 673 MiB/s for the same
+  stdlib module on Linux. lmz hands libzstd whole multi-megabyte chunks, so
+  binding overhead cannot explain a gap that size. On Darwin lmz therefore
+  prefers the `zstandard` package when it is installed, and falls back to the
+  stdlib when it is not. This affects generic data and `lmz fs`, which code
+  everything with zstd; it does not affect model weights, where the plane split
+  sends the compressible bytes to rANS and zstd sees close to none of them.
+  `lmz doctor` prints which binding is in use.
 
 ## Tests
 

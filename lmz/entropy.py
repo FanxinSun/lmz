@@ -6,10 +6,12 @@ Deflate is the last resort so the tool degrades rather than failing outright.
 
 The method used for each stream is recorded in the archive, so a file written
 by one backend stays readable by any build that has the corresponding decoder.
+Which one wrote it changes nothing but speed: both emit ordinary zstd frames.
 """
 
 from __future__ import annotations
 
+import sys
 import zlib
 
 METHOD_STORED = 0
@@ -27,36 +29,59 @@ _zstd_decompress = None
 BACKEND = "deflate"
 ZstdTruncated = ValueError  # replaced with the backend's error type below
 
-try:  # Python 3.14+
-    from compression import zstd as _z
+def _load_stdlib():
+    from compression import zstd as _z          # Python 3.14+
 
-    def _zstd_compress(d, lvl):
+    def compress(d, lvl):
         return _z.compress(d, lvl)
 
-    def _zstd_decompress(d):
+    def decompress(d):
         # A one-shot decompressor object is markedly faster than the
         # module-level decompress(), which loops looking for further frames.
         dec = _z.ZstdDecompressor()
         out = dec.decompress(d)
         if not dec.eof:
-            raise ZstdTruncated("compressed stream ends mid-frame")
+            raise _z.ZstdError("compressed stream ends mid-frame")
         return out
 
-    ZstdTruncated = _z.ZstdError
-    BACKEND = f"zstd {_z.zstd_version} (stdlib)"
-except ImportError:
+    return compress, decompress, _z.ZstdError, f"zstd {_z.zstd_version} (stdlib)"
+
+
+def _load_package():
+    import zstandard as _zs
+
+    def compress(d, lvl):
+        return _zs.ZstdCompressor(level=lvl).compress(d)
+
+    def decompress(d):
+        return _zs.ZstdDecompressor().decompress(d)
+
+    return (compress, decompress, _zs.ZstdError,
+            f"zstd {_zs.__version__} (zstandard)")
+
+
+def _backend_order():
+    """Which zstd binding to try first. Both are libzstd; only speed differs.
+
+    On macOS, CPython's bundled zstd measured 103 MiB/s compressing where the
+    same work through the `zstandard` package measured 767, on hardware that is
+    otherwise the fastest of any platform tested here. lmz hands libzstd whole
+    multi-megabyte chunks, so per-call binding overhead cannot account for a gap
+    that size -- it is the bundled build. No other platform showed a gap, so the
+    preference is narrowed to where the evidence is, and it costs nothing
+    anywhere: with only one binding installed this changes no behaviour at all.
+    """
+    if sys.platform == "darwin":
+        return (_load_package, _load_stdlib)
+    return (_load_stdlib, _load_package)
+
+
+for _loader in _backend_order():
     try:
-        import zstandard as _zs
-
-        def _zstd_compress(d, lvl):
-            return _zs.ZstdCompressor(level=lvl).compress(d)
-
-        def _zstd_decompress(d):
-            return _zs.ZstdDecompressor().decompress(d)
-
-        BACKEND = f"zstd {_zs.__version__} (zstandard)"
+        _zstd_compress, _zstd_decompress, ZstdTruncated, BACKEND = _loader()
+        break
     except ImportError:
-        pass
+        continue
 
 HAVE_ZSTD = _zstd_compress is not None
 
