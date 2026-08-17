@@ -462,6 +462,18 @@ def _encode_bf16_cond(exp, sm, nelem: int, level: int, method: int, sink=None):
 
     # Each segment's histogram is what decides this, and it is also what the
     # coder would otherwise take for itself, so it is kept rather than dropped.
+    #
+    # These counts look like they should be free. They are the joint counts of
+    # (bucket, sign+mantissa byte), and the partition above has just read both
+    # planes and already knows the bucket, so it could take them on the way
+    # past instead of this pass reading the segments back. Measured, that costs
+    # the partition exactly what it saves here -- 1.37 to 1.89 cycles a byte
+    # against a pass that runs at about one -- because what a histogram costs is
+    # the increment, not the load, and the segments are still warm. Widening
+    # lmz_hist from four sub-tables to eight or sixteen is the same story: 1.10x
+    # on a skewed plane, 0.95x on a flat one. Counting is near its floor, and
+    # every byte counted here is needed exactly, since the bucket map has to be
+    # one the decoder can rebuild and the coder's frequencies have to match.
     est_cond = 0
     seg_hists = []
     pos = 0
