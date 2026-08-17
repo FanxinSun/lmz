@@ -398,6 +398,79 @@ def test_rans_matches_entropy():
         assert len(enc) < bound * 1.02, (name, len(enc), bound)
 
 
+def test_rans_accepts_a_precomputed_histogram():
+    """Handing the coder counts it would otherwise take must change nothing.
+
+    The caller usually has them, because whether to code at all is decided
+    from a histogram. Counts of the wrong bytes are the hazard: a symbol given
+    frequency zero cannot be coded at all, so the kernel checks their total
+    against the buffer and counts for itself rather than trusting them.
+    """
+    if not kernels.have_rans():
+        return
+    cases = (("weights", weights_bf16(200000, 5)),
+             ("noise", rand(200000, 6)),
+             ("few symbols", bytes((i * i) % 7 for i in range(200000))))
+    for name, data in cases:
+        hist = kernels.histogram(data)
+        with_hist = kernels.rans_encode(data, hist)
+        plain = kernels.rans_encode(data)
+        assert with_hist == plain, name
+        assert bytes(kernels.rans_decode(with_hist, len(data))) == data, name
+        # A histogram of other bytes. The total gives it away and the kernel
+        # counts again, so the stream is the same one either way.
+        wrong = kernels.histogram(data[:len(data) // 2])
+        assert kernels.rans_encode(data, wrong) == plain, f"{name}, wrong counts"
+
+
+def test_rans_cost_is_a_floor():
+    """Streams are skipped on this figure, so it must not exceed the truth.
+
+    `_rans_cost` prices a stream against the frequencies the coder will use,
+    and the encoder is never run when the price cannot clear the threshold. If
+    it ever came out above what the coder charges, a stream that would have
+    paid its way could be stored instead. Near-uniform alphabets are where the
+    twelve-bit quantisation bites hardest and the margin is thinnest.
+    """
+    if not kernels.have_rans():
+        return
+    data = weights_bf16(400000, 12)
+    planes = kernels.split_bf16(data)
+    n = len(data) // 2
+    cases = (("exponent", bytes(planes[:n])),
+             ("sign+mantissa", bytes(planes[n:])),
+             ("uniform", rand(300000, 13)),
+             ("nearly uniform",
+              bytes((i * 251) % 256 if i % 17 else 5 for i in range(300000))),
+             ("single symbol", bytes([3]) * 100000),
+             ("two symbols", bytes((i & 1) * 200 for i in range(100000))))
+    for name, buf in cases:
+        hist = kernels.histogram(buf)
+        cost = codec._rans_cost(hist, len(buf))
+        actual = len(kernels.rans_encode(buf, hist))
+        assert cost is not None, name
+        assert cost <= actual, f"{name}: priced {cost}, coder charged {actual}"
+        # And close enough that the floor is worth deciding on: a figure far
+        # under the truth would refuse to skip anything.
+        assert actual - cost <= 2 * codec.RANS_COST_SLACK, (name, cost, actual)
+        # Counts of other bytes price a stream that is not this one, so the
+        # decision they would inform is declined rather than made.
+        assert codec._rans_cost(kernels.histogram(buf[:len(buf) // 2]),
+                                len(buf)) is None, name
+
+
+def test_bucket_partition_accepts_a_precomputed_histogram():
+    """Same contract as the coder's: use the caller's counts, verify the total."""
+    ctx = rand(50000, 21)
+    val = rand(50000, 22)
+    hist = kernels.histogram(ctx)
+    lut = kernels.bucket_lut(hist, 8)
+    plain = kernels.bucket_partition(ctx, val, lut, 8)
+    assert kernels.bucket_partition(ctx, val, lut, 8, hist=hist) == plain
+    wrong = kernels.histogram(ctx[:100])
+    assert kernels.bucket_partition(ctx, val, lut, 8, hist=wrong) == plain
+
+
 def test_codec_detects_corruption():
     data = weights_bf16(100000)
     parts, cid, flags, crc = codec.encode_chunk(data, 2, 1, True)

@@ -197,7 +197,7 @@ LMZ_API const char *lmz_isa(void)
 #endif
 }
 
-LMZ_API int lmz_abi_version(void) { return 10; }
+LMZ_API int lmz_abi_version(void) { return 11; }
 
 /*
  * out = a ^ b, the whole of a delta chunk's arithmetic.
@@ -521,27 +521,74 @@ LMZ_API int lmz_bucket_lut(const uint64_t *hist, size_t k, uint8_t *lut)
 }
 
 /* Deal val[i] into per-bucket segments of `out` by ctx[i]'s bucket, keeping
- * order within each bucket. counts[k] receives the segment lengths. */
+ * order within each bucket. counts[k] receives the segment lengths.
+ *
+ * `ctx_hist` is the context plane's histogram when the caller has one. The lut
+ * is built from that same histogram, so the caller always does -- and counting
+ * it again here is a second pass over the context plane. NULL to count it
+ * here; counts that do not sum to `n` are not this plane's and are ignored. */
 LMZ_API int lmz_bucket_partition(const uint8_t *ctx, const uint8_t *val,
                                  size_t n, const uint8_t *lut, size_t k,
-                                 uint8_t *out, uint64_t *counts)
+                                 uint8_t *out, uint64_t *counts,
+                                 const uint64_t *ctx_hist)
 {
     if (k == 0 || k > LMZ_MAX_BUCKETS) return -1;
-    uint64_t hist[256];
-    lmz_hist(ctx, n, hist);
+    uint64_t own[256];
+    if (ctx_hist) {
+        uint64_t total = 0;
+        for (int s = 0; s < 256; s++) total += ctx_hist[s];
+        if (total != n) ctx_hist = NULL;
+    }
+    if (!ctx_hist) {
+        lmz_hist(ctx, n, own);
+        ctx_hist = own;
+    }
     for (size_t b = 0; b < k; b++) counts[b] = 0;
-    for (int s = 0; s < 256; s++) counts[lut[s]] += hist[s];
+    for (int s = 0; s < 256; s++) counts[lut[s]] += ctx_hist[s];
     uint8_t *cur[LMZ_MAX_BUCKETS];
     uint8_t *p = out;
     for (size_t b = 0; b < k; b++) {
         cur[b] = p;
         p += counts[b];
     }
-    for (size_t i = 0; i < n; i++) *cur[lut[ctx[i]]]++ = val[i];
+    /*
+     * Four at a time. Written one at a time, each element has to load the
+     * cursor the one before it just stored, and neighbouring context bytes
+     * land in the same bucket constantly -- so the loop spends its time
+     * waiting for stores to forward rather than moving bytes.
+     *
+     * Taking four cursors before any of them is written breaks that. An
+     * element's cursor is then corrected by how many earlier elements of its
+     * group share its bucket, which is a compare and an add and needs no
+     * load; the write-backs follow in group order, so the last one for a
+     * bucket leaves exactly what a serial loop would have left. Measured
+     * 1.22x on a real exponent plane. Groups of five and up lose it again:
+     * the corrections grow as the square of the group size.
+     */
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        unsigned b0 = lut[ctx[i]], b1 = lut[ctx[i + 1]];
+        unsigned b2 = lut[ctx[i + 2]], b3 = lut[ctx[i + 3]];
+        uint8_t *p0 = cur[b0];
+        uint8_t *p1 = cur[b1] + (b0 == b1);
+        uint8_t *p2 = cur[b2] + (b0 == b2) + (b1 == b2);
+        uint8_t *p3 = cur[b3] + (b0 == b3) + (b1 == b3) + (b2 == b3);
+        *p0 = val[i];
+        *p1 = val[i + 1];
+        *p2 = val[i + 2];
+        *p3 = val[i + 3];
+        cur[b0] = p0 + 1;
+        cur[b1] = p1 + 1;
+        cur[b2] = p2 + 1;
+        cur[b3] = p3 + 1;
+    }
+    for (; i < n; i++) *cur[lut[ctx[i]]]++ = val[i];
     return 0;
 }
 
-/* Inverse of the partition: streams[b] holds bucket b's segment. */
+/* Inverse of the partition: streams[b] holds bucket b's segment. The cursors
+ * are read from rather than written to, but they are the same chain and take
+ * the same grouping; see above. */
 LMZ_API int lmz_bucket_unpartition(const uint8_t *ctx,
                                    const uint8_t *const *streams, size_t n,
                                    const uint8_t *lut, size_t k,
@@ -550,7 +597,24 @@ LMZ_API int lmz_bucket_unpartition(const uint8_t *ctx,
     if (k == 0 || k > LMZ_MAX_BUCKETS) return -1;
     const uint8_t *cur[LMZ_MAX_BUCKETS];
     for (size_t b = 0; b < k; b++) cur[b] = streams[b];
-    for (size_t i = 0; i < n; i++) val_out[i] = *cur[lut[ctx[i]]]++;
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        unsigned b0 = lut[ctx[i]], b1 = lut[ctx[i + 1]];
+        unsigned b2 = lut[ctx[i + 2]], b3 = lut[ctx[i + 3]];
+        const uint8_t *p0 = cur[b0];
+        const uint8_t *p1 = cur[b1] + (b0 == b1);
+        const uint8_t *p2 = cur[b2] + (b0 == b2) + (b1 == b2);
+        const uint8_t *p3 = cur[b3] + (b0 == b3) + (b1 == b3) + (b2 == b3);
+        val_out[i] = *p0;
+        val_out[i + 1] = *p1;
+        val_out[i + 2] = *p2;
+        val_out[i + 3] = *p3;
+        cur[b0] = p0 + 1;
+        cur[b1] = p1 + 1;
+        cur[b2] = p2 + 1;
+        cur[b3] = p3 + 1;
+    }
+    for (; i < n; i++) val_out[i] = *cur[lut[ctx[i]]]++;
     return 0;
 }
 
@@ -701,13 +765,18 @@ static inline void rans_enc_put(uint32_t *r, uint8_t **pptr, const RansEncSym *s
      * exactly 2^32, and truncating it to 32 bits would wrap to zero and
      * renormalise on every symbol. */
     uint64_t x_max = ((uint64_t)(RANS_L >> RANS_PROB_BITS) << 16) * sym->freq;
-    if (x >= x_max) {
-        uint8_t *p = *pptr - 2;
-        p[0] = (uint8_t)(x & 0xff);
-        p[1] = (uint8_t)((x >> 8) & 0xff);
-        *pptr = p;
-        x >>= 16;
-    }
+    /* Branchless, for the same reason the decoder is: whether a symbol needs
+     * to emit is close to a coin flip on a near-uniform plane, and as a branch
+     * it mispredicts about half the time. Encoding runs backwards, so the two
+     * bytes below the cursor are always scratch -- write them every time and
+     * advance the cursor only when the emission was real. The write that was
+     * not needed is overwritten by the next one. */
+    uint32_t need = (x >= x_max);
+    uint8_t *p = *pptr;
+    p[-2] = (uint8_t)(x & 0xff);
+    p[-1] = (uint8_t)((x >> 8) & 0xff);
+    *pptr = p - (need << 1);
+    x = need ? (x >> 16) : x;
     /* The quotient must be floor(x/freq) EXACTLY for every state the
      * renormalisation allows, which here reaches (1<<20)*freq -- past 2^31
      * whenever freq exceeds 2048. The fixed-point reciprocal this used to
@@ -838,6 +907,22 @@ static int rans_normalize(const uint64_t *counts, uint16_t *freqs)
     return 0;
 }
 
+/*
+ * The frequencies the encoder will use for this histogram, so a caller can
+ * price a stream before coding it.
+ *
+ * The order-0 entropy of the raw counts is not that price. Frequencies are
+ * quantised to twelve bits, and close to a uniform alphabet -- which is
+ * exactly where the decision is marginal -- that rounding costs a few tenths
+ * of a percent, enough to turn a stream that looks worth coding into one that
+ * is stored after the work is done. Charging against these numbers instead
+ * answers the real question for the price of 256 logarithms.
+ */
+LMZ_API int lmz_rans_freqs(const uint64_t *counts, uint16_t *freqs)
+{
+    return rans_normalize(counts, freqs);
+}
+
 LMZ_API size_t lmz_rans_bound(size_t n)
 {
     /* Worst case is one 16-bit renormalisation per symbol, plus the states
@@ -848,14 +933,34 @@ LMZ_API size_t lmz_rans_bound(size_t n)
 /*
  * Encode `n` bytes. Returns the stream length, or -1 if it does not fit.
  * The layout is [header][4 initial states][coded bytes].
+ *
+ * `counts` is this buffer's byte histogram when the caller already has one --
+ * the encoder is chosen from a histogram, so by the time it runs the counts
+ * have usually just been taken, and computing them again is a second pass over
+ * the stream for nothing. Pass NULL to have it counted here.
+ *
+ * The contract is that `counts` describes exactly these bytes; a histogram of
+ * anything else can give an occurring symbol frequency zero, which the coder
+ * cannot represent. Counts that do not sum to `n` are the form that mistake
+ * actually takes -- a stale slice, the wrong segment -- so they are rejected
+ * and the histogram is taken here instead.
  */
-LMZ_API long lmz_rans_encode(const uint8_t *src, size_t n, uint8_t *dst, size_t cap)
+LMZ_API long lmz_rans_encode_h(const uint8_t *src, size_t n, uint8_t *dst,
+                               size_t cap, const uint64_t *counts)
 {
     if (n == 0) return -1;
     if (cap < lmz_rans_bound(n)) return -1;
 
-    uint64_t counts[256];
-    lmz_hist(src, n, counts);
+    uint64_t own[256];
+    if (counts) {
+        uint64_t total = 0;
+        for (int s = 0; s < 256; s++) total += counts[s];
+        if (total != n) counts = NULL;
+    }
+    if (!counts) {
+        lmz_hist(src, n, own);
+        counts = own;
+    }
     uint16_t freqs[256];
     if (rans_normalize(counts, freqs) != 0) return -1;
 
@@ -903,6 +1008,13 @@ LMZ_API long lmz_rans_encode(const uint8_t *src, size_t n, uint8_t *dst, size_t 
     }
     memmove(dst + RANS_HEADER, ptr, coded);
     return (long)total;
+}
+
+/* The same, counting the histogram here. Kept as its own symbol because it is
+ * the whole interface anything outside this package uses. */
+LMZ_API long lmz_rans_encode(const uint8_t *src, size_t n, uint8_t *dst, size_t cap)
+{
+    return lmz_rans_encode_h(src, n, dst, cap, NULL);
 }
 
 /* Decode exactly `n` bytes. Returns 0 on success, -1 on malformed input. */

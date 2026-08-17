@@ -48,7 +48,7 @@ def _load_native():
                 return None
             lib = ctypes.CDLL(path)
             lib.lmz_abi_version.restype = ctypes.c_int
-            if lib.lmz_abi_version() != 10:
+            if lib.lmz_abi_version() != 11:
                 _state = "abi-mismatch"
                 return None
             lib.lmz_isa.restype = ctypes.c_char_p
@@ -78,7 +78,7 @@ def _load_native():
             lib.lmz_bucket_lut.argtypes = [v, ctypes.c_size_t, v]
             lib.lmz_bucket_partition.restype = ctypes.c_int
             lib.lmz_bucket_partition.argtypes = [v, v, ctypes.c_size_t, v,
-                                                 ctypes.c_size_t, v, v]
+                                                 ctypes.c_size_t, v, v, v]
             lib.lmz_bucket_unpartition.restype = ctypes.c_int
             lib.lmz_bucket_unpartition.argtypes = [v, ctypes.POINTER(ctypes.c_void_p),
                                                    ctypes.c_size_t, v,
@@ -97,8 +97,13 @@ def _load_native():
             lib.lmz_k4_unpack.argtypes = [v, ctypes.c_size_t, v]
             lib.lmz_rans_bound.restype = ctypes.c_size_t
             lib.lmz_rans_bound.argtypes = [ctypes.c_size_t]
+            lib.lmz_rans_freqs.restype = ctypes.c_int
+            lib.lmz_rans_freqs.argtypes = [v, v]
             lib.lmz_rans_encode.restype = ctypes.c_long
             lib.lmz_rans_encode.argtypes = [v, ctypes.c_size_t, v, ctypes.c_size_t]
+            lib.lmz_rans_encode_h.restype = ctypes.c_long
+            lib.lmz_rans_encode_h.argtypes = [v, ctypes.c_size_t, v,
+                                              ctypes.c_size_t, v]
             lib.lmz_rans_decode.restype = ctypes.c_int
             lib.lmz_rans_decode.argtypes = [v, ctypes.c_size_t, v, ctypes.c_size_t]
             _lib = lib
@@ -140,6 +145,19 @@ def _ptr(obj):
         b = bytes(obj)  # read-only memoryview or other exporter
         p = ctypes.c_char_p(b)
         return ctypes.cast(p, ctypes.c_void_p).value, (p, b)
+
+
+def _counts_arg(hist):
+    """A `const uint64_t *` for a 256-entry histogram, or NULL for None.
+
+    Kernels that take one verify its total against the buffer they were given,
+    so a histogram of the wrong bytes is ignored rather than trusted.
+    """
+    if hist is None:
+        return None
+    if len(hist) != 256:
+        raise ValueError(f"a histogram has 256 entries, not {len(hist)}")
+    return (ctypes.c_uint64 * 256)(*hist)
 
 
 # Element sizes above 2 need a working area as large as the chunk. Reusing it
@@ -465,11 +483,16 @@ def bucket_counts(hist, lut: bytes, k: int) -> list[int]:
     return counts
 
 
-def bucket_partition(ctx, val, lut: bytes, k: int):
+def bucket_partition(ctx, val, lut: bytes, k: int, hist=None):
     """Group val[i] into per-bucket segments by ctx[i]'s bucket.
 
     Returns (buffer of concatenated segments, per-bucket lengths). Order is
     preserved within each bucket, which is what makes it invertible.
+
+    `hist` is the context plane's histogram if the caller has one -- the lut
+    comes from it, so the caller normally does, and passing it saves a second
+    pass over the plane. It must be that plane's own counts; the kernel checks
+    the total and counts again itself if it does not match.
     """
     n = len(ctx)
     if len(val) != n:
@@ -482,10 +505,14 @@ def bucket_partition(ctx, val, lut: bytes, k: int):
         va, _b = _ptr(val)
         la, _c = _ptr(lut)
         oa, _d = _ptr(out)
-        if lib.lmz_bucket_partition(ca, va, n, la, k, oa, ctypes.byref(counts)) != 0:
+        ha = _counts_arg(hist)
+        if lib.lmz_bucket_partition(ca, va, n, la, k, oa, ctypes.byref(counts),
+                                    ha) != 0:
             raise ValueError(f"unsupported bucket count {k}")
         return out, list(counts)
-    counts = bucket_counts(histogram(ctx), lut, k)
+    if hist is None or sum(hist) != n:
+        hist = histogram(ctx)
+    counts = bucket_counts(hist, lut, k)
     cur = [0] * k
     pos = 0
     for b in range(k):
@@ -776,8 +803,30 @@ def have_rans() -> bool:
 _rans_scratch = threading.local()
 
 
-def rans_encode(src) -> bytes | None:
-    """Order-0 rANS encode. Returns None if unavailable or the input is empty."""
+def rans_freqs(hist) -> list[int] | None:
+    """The frequencies the coder will quantise this histogram to, or None.
+
+    They sum to the coder's probability scale, so a caller can price a stream
+    against the model that will actually be used rather than against the raw
+    counts. None if the native kernel is unavailable or nothing was counted.
+    """
+    lib = _load_native()
+    if lib is None:
+        return None
+    counts = _counts_arg(hist)
+    freqs = (ctypes.c_uint16 * 256)()
+    if lib.lmz_rans_freqs(counts, ctypes.byref(freqs)) != 0:
+        return None
+    return list(freqs)
+
+
+def rans_encode(src, hist=None) -> bytes | None:
+    """Order-0 rANS encode. Returns None if unavailable or the input is empty.
+
+    `hist` is this buffer's histogram if the caller already took one. The coder
+    is picked from a histogram, so by the time it runs the counts usually exist;
+    handing them over saves the encoder a second pass over the stream.
+    """
     lib = _load_native()
     if lib is None or len(src) == 0:
         return None
@@ -788,7 +837,8 @@ def rans_encode(src) -> bytes | None:
         buf = _rans_scratch.buf = bytearray(cap)
     src_addr, _a = _ptr(src)
     dst_addr, _b = _ptr(buf)
-    written = lib.lmz_rans_encode(src_addr, n, dst_addr, cap)
+    written = lib.lmz_rans_encode_h(src_addr, n, dst_addr, cap,
+                                    _counts_arg(hist))
     if written < 0:
         return None
     return bytes(memoryview(buf)[:written])

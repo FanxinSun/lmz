@@ -304,7 +304,8 @@ def merge_methods(a: dict | None, b: dict | None) -> dict:
     return out
 
 
-def _encode_stream(buf, level: int, method: int, plane: bool = False, sink=None):
+def _encode_stream(buf, level: int, method: int, plane: bool = False, sink=None,
+                   hist=None):
     """Compress one stream unless doing so is not worth it.
 
     Returns (method_used, payload). `sink` records what was chosen and what it
@@ -316,18 +317,32 @@ def _encode_stream(buf, level: int, method: int, plane: bool = False, sink=None)
     match search eat the whole gain and then some. rANS charges fractional
     bits and almost no overhead, so it collects that 1.3% where zstd could
     only decline the job.
+
+    `hist` is this stream's exact histogram when the caller has already taken
+    one, and it changes both decisions here. Whether to code at all is settled
+    by pricing the stream against the coder's own frequencies rather than by
+    sampling it, and `_rans_cost` is a floor on that price -- so a stream it
+    cannot bring under the threshold will not get there by being coded. Those
+    are the streams that used to be coded in full and then discarded. What is
+    coded is coded from the counts already in hand rather than counting them
+    a second time.
     """
     n = len(buf)
     if n == 0:
         return entropy.METHOD_STORED, b""
-    if estimate_entropy(buf) >= NOISE_BITS:
+    cost = _rans_cost(hist, n) if hist is not None else None
+    if cost is not None:
+        hopeless = cost + _min_gain(n) >= n
+    else:
+        hopeless = estimate_entropy(buf) >= NOISE_BITS
+    if hopeless:
         if sink is not None:
             sink.add(entropy.METHOD_STORED, n, n)
         return entropy.METHOD_STORED, buf
 
     best_method, best, alt_size = entropy.METHOD_STORED, None, None
     if plane and kernels.have_rans():
-        best = kernels.rans_encode(buf)
+        best = kernels.rans_encode(buf, hist)
         if best is not None:
             best_method = entropy.METHOD_RANS
         if sink is not None and sink.measure_alt:
@@ -347,7 +362,7 @@ def _encode_stream(buf, level: int, method: int, plane: bool = False, sink=None)
         # A stream the general-purpose coder barely dented may still be a
         # plain symbol distribution -- quantised INT8 weights, for one.
         if kernels.have_rans() and (best is None or len(best) > n - (n >> 5)):
-            alt = kernels.rans_encode(buf)
+            alt = kernels.rans_encode(buf, hist)
             if alt is not None:
                 if best is None:
                     best_method, best = entropy.METHOD_RANS, alt
@@ -369,6 +384,44 @@ def _encode_stream(buf, level: int, method: int, plane: bool = False, sink=None)
 def _min_gain(n: int) -> int:
     """Smallest saving worth encoding for: the coder's own header, plus a bit."""
     return max(1024, n >> 8)
+
+
+# How far the cost below may sit above the stream the coder actually writes.
+# The two differ by where the interleaved states happen to fall when they are
+# flushed, which measures within a byte or two either way on every
+# distribution tested; this is that slack with room to spare. Subtracting it
+# is what makes the figure a floor, which is the only form a caller can skip
+# work on: below the floor there is nothing to find.
+RANS_COST_SLACK = 64
+
+
+def _rans_cost(hist, total: int) -> int | None:
+    """A floor on what rANS will charge for these counts, in bytes.
+
+    Priced against the frequencies the coder will really use, not against the
+    histogram's own entropy. The two part company precisely where the decision
+    is close: quantising to twelve bits costs a few tenths of a percent on a
+    near-uniform alphabet, which is the same order as the saving being weighed,
+    so the raw-entropy estimate says yes to streams that end up stored.
+
+    None when the native coder cannot say, or when the counts are not this
+    stream's -- the kernels that take a histogram check the same total, but
+    they only guard the coding, and a decision made from another stream's
+    counts would skip work that was worth doing. Both ends check.
+    """
+    if sum(hist) != total:
+        return None
+    freqs = kernels.rans_freqs(hist)
+    if not freqs:
+        return None
+    scale = sum(freqs)
+    if not scale:
+        return None
+    bits = 0.0
+    for c, f in zip(hist, freqs):
+        if c:
+            bits -= c * log2(f / scale)
+    return RANS_OVERHEAD + int(bits / 8) - RANS_COST_SLACK
 
 
 def _hist_entropy(counts, total: int) -> float:
@@ -393,8 +446,8 @@ def _encode_bf16_cond(exp, sm, nelem: int, level: int, method: int, sink=None):
     """Code the sign+mantissa plane with one rANS table per exponent bucket.
 
     Decides from exact histograms whether conditioning beats one shared
-    table, and only encodes the winning side, so declining costs two
-    histogram passes and a partition rather than a wasted encode. Returns
+    table, and only encodes the winning side, so declining costs one
+    histogram pass and a partition rather than a wasted encode. Returns
     (parts, flags) or None to fall back to the plain field split.
 
     The bucket map is derived from the exponent histogram, which the decoder
@@ -402,38 +455,48 @@ def _encode_bf16_cond(exp, sm, nelem: int, level: int, method: int, sink=None):
     stored in the archive.
     """
     ehist = kernels.histogram(exp)
-    shist = kernels.histogram(sm)
-    h_sm = _hist_entropy(shist, nelem)
     lut = kernels.bucket_lut(ehist, COND_BUCKETS)
-    part, counts = kernels.bucket_partition(exp, sm, lut, COND_BUCKETS)
+    part, counts = kernels.bucket_partition(exp, sm, lut, COND_BUCKETS,
+                                            hist=ehist)
     pmv = memoryview(part)
 
+    # Each segment's histogram is what decides this, and it is also what the
+    # coder would otherwise take for itself, so it is kept rather than dropped.
     est_cond = 0
+    seg_hists = []
     pos = 0
     for c in counts:
-        if c:
-            hseg = _hist_entropy(kernels.histogram(pmv[pos:pos + c]), c)
-            est_cond += _est_stream(c, hseg)
-            pos += c
-    est_plain = _est_stream(nelem, h_sm)
+        if not c:
+            seg_hists.append(None)
+            continue
+        hseg = kernels.histogram(pmv[pos:pos + c])
+        seg_hists.append(hseg)
+        est_cond += _est_stream(c, _hist_entropy(hseg, c))
+        pos += c
+    # The partition permutes the plane, so its histogram is the sum of the
+    # segments' -- the same numbers, and no second pass over the plane to get
+    # them. This is the baseline the conditioned side has to beat.
+    taken = [h for h in seg_hists if h]
+    shist = [sum(x) for x in zip(*taken)] if taken else [0] * 256
+    est_plain = _est_stream(nelem, _hist_entropy(shist, nelem))
     # The conditional side pays its larger header and one table per bucket;
     # demand a clear win so estimate noise cannot flip the choice.
     if est_cond + (_bf16c_hdr.size - _plane_header(2).size) + 512 >= est_plain:
         return None
 
     exp_used, exp_payload = _encode_stream(exp, level, method, plane=True,
-                                           sink=sink)
+                                           sink=sink, hist=ehist)
     sm_methods = []
     seg_lens = []
     parts = []
     pos = 0
-    for c in counts:
+    for c, hseg in zip(counts, seg_hists):
         if c == 0:
             sm_methods.append(entropy.METHOD_STORED)
             seg_lens.append(0)
             continue
         used, payload = _encode_stream(pmv[pos:pos + c], level, method,
-                                       plane=True, sink=sink)
+                                       plane=True, sink=sink, hist=hseg)
         sm_methods.append(used)
         seg_lens.append(len(payload))
         parts.append(payload)
