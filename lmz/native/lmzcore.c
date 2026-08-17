@@ -1264,25 +1264,41 @@ LMZ_API int lmz_rans_decode(const uint8_t *src, size_t src_len, uint8_t *dst, si
             dst[i + k] = (uint8_t)(e[k] & 0xff);
 
         /*
-         * The refills the same way. Whether a lane needs one depends on how
-         * many bits its symbol consumed and on nothing else -- not on the
-         * cursor, and not on any other lane. Deciding all eight first turns
-         * the cursor into a prefix sum of small integers, so the eight refill
-         * loads are independent; written one at a time each waits on the one
-         * before it just to learn its own address.
+         * The refills go two ways, and which is faster is a property of the
+         * machine rather than of the code. Both are branchless: the refill
+         * word is always loaded, because whether a symbol needs one is close
+         * to a coin flip on a near-uniform plane and mispredicts about half
+         * the time as a branch. They differ in what they do about the cursor.
          *
-         * Each load is unconditional and reads up to two bytes past its own
-         * offset, the furthest being fifteen bytes beyond the cursor, which
-         * the loop's guard has already established is readable. A lane that
-         * did not need its word simply does not use it, and the branch that
-         * would have decided is not taken: on a near-uniform plane it is a
-         * coin flip and mispredicts about half the time.
+         * Written one lane at a time, a lane cannot compute its own address
+         * until the lane before it has decided whether it consumed a word, so
+         * the eight loads run one behind another. But whether a lane refills
+         * depends on how many bits its own symbol consumed and on nothing
+         * else, so all eight decisions can be made first and the cursor
+         * becomes a prefix sum of small integers, leaving the loads
+         * independent. That trades a chain of loads for two dozen more
+         * arithmetic operations.
+         *
+         * Measured per plane, decoding: +11% on Zen 5, +4% on a Neoverse
+         * runner, -12% on Apple silicon, where the serial version is the
+         * fastest of the three machines outright and both planes decode at
+         * the same rate whatever their refill rate -- that core hides the
+         * chain completely, so the extra arithmetic is pure loss. arm64
+         * cannot tell those two parts apart at build time (a VM reports no
+         * implementer at all), so it takes the shape that does not cost 12%
+         * on the hardware people run models on.
+         *
+         * Either way the loads read up to two bytes past their own offset,
+         * the furthest fifteen bytes beyond the cursor, which the loop guard
+         * has established is readable.
          */
-        uint32_t x[RANS_STREAMS], need[RANS_STREAMS], off[RANS_STREAMS];
+        uint32_t x[RANS_STREAMS], need[RANS_STREAMS];
         for (int k = 0; k < RANS_STREAMS; k++)
             x[k] = ((e[k] >> 20) + 1) * (state[k] >> RANS_PROB_BITS)
                  + (state[k] & (RANS_PROB_SCALE - 1)) - ((e[k] >> 8) & 0xfff);
         for (int k = 0; k < RANS_STREAMS; k++) need[k] = (x[k] < RANS_L);
+#if LMZ_X86
+        uint32_t off[RANS_STREAMS];
         off[0] = 0;
         for (int k = 1; k < RANS_STREAMS; k++)
             off[k] = off[k - 1] + (need[k - 1] << 1);
@@ -1292,6 +1308,14 @@ LMZ_API int lmz_rans_decode(const uint8_t *src, size_t src_len, uint8_t *dst, si
             state[k] = need[k] ? ((x[k] << 16) | word) : x[k];
         }
         ptr += off[RANS_STREAMS - 1] + (need[RANS_STREAMS - 1] << 1);
+#else
+        for (int k = 0; k < RANS_STREAMS; k++) {
+            const uint8_t *p = ptr;
+            uint32_t word = (uint32_t)p[0] | ((uint32_t)p[1] << 8);
+            state[k] = need[k] ? ((x[k] << 16) | word) : x[k];
+            ptr = p + (need[k] << 1);
+        }
+#endif
     }
     for (; i < n; i++) {
         uint32_t k = (uint32_t)(i & (RANS_STREAMS - 1));
