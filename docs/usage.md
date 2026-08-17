@@ -207,7 +207,7 @@ lmz decompress  <input> [output]   -j N  --no-verify  -f
 lmz verify      <archive>          -j N
 lmz info        <archive>          --tensors  --json  --limit N
 lmz cat         <archive> <tensor> -o FILE  --member FILE
-lmz bench       <file>             --bytes N
+lmz bench       <file>             --bytes N  --methods
 lmz doctor
 
 lmz add         <path>             --name N  -l LEVEL  -j N  -f   --store DIR
@@ -233,6 +233,33 @@ chunk codecs
   bf16-split   140 chunks    1.09 GiB -> 730.89 MiB  1.524x
   entropy        2 chunks   12.54 KiB ->   1.82 KiB  6.885x
   stored         1 chunks       568 B ->      568 B  1.000x
+entropy coders
+  rans           120 streams 184.90 MiB ->  80.59 MiB  2.294x   58.3% of input
+  stored         160 streams 132.13 MiB -> 132.13 MiB  1.000x   41.7% of input
+  zstd             1 streams   6.30 KiB ->      930 B  6.933x    0.0% of input
+```
+
+The two tables answer different questions. A codec is the framing -- how a
+chunk was taken apart -- while the coder is what actually compressed the pieces,
+and a bf16-split chunk says nothing about whether rANS or zstd earned its bytes.
+The example above is a BF16 checkpoint where rANS codes every compressible
+plane, zstd sees only the header, and the 41.7% that is stored is the part of
+the sign and mantissa that is genuinely noise. Every input byte appears exactly
+once across the coders, so the shares sum to the file.
+
+The counts are recorded while writing and kept in the manifest, so `info` reads
+them without decompressing anything. Archives written before this was tracked
+simply have no such section.
+
+What `info` cannot say is how much the winner won by: the archive stores the
+size that was chosen and nothing about the size that was not. `bench --methods`
+answers that by coding every plane both ways, which is why it is a flag and not
+the default:
+
+```
+  entropy coder           streams         in        out    ratio   share  vs the other coder
+  rans                         24  37.36 MiB  16.30 MiB   2.292x   58.4%  +5.3% over 24 streams
+  stored                       32  26.64 MiB  26.64 MiB   1.000x   41.6%  not contested
 ```
 
 `cat` pulls a single tensor out of an archive by decoding only the chunks it

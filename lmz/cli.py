@@ -146,6 +146,23 @@ def cmd_info(args) -> int:
             r = rlen / clen if clen else 0
             print(f"  {name:10s} {count:7d} chunks  {human(rlen):>10s} -> "
                   f"{human(clen):>10s}  {r:.3f}x")
+    # The codec above is the framing; this is the coder that did the work. A
+    # bf16-split chunk says nothing about whether rANS or zstd earned its bytes,
+    # and that is the question worth asking of a hand-written entropy coder.
+    if data.get("methods"):
+        total_raw = sum(m["raw"] for m in data["methods"].values())
+        print("entropy coders")
+        for name, m in sorted(data["methods"].items(),
+                              key=lambda kv: -kv[1]["raw"]):
+            r = m["raw"] / m["coded"] if m["coded"] else 0
+            share = m["raw"] / total_raw * 100 if total_raw else 0
+            print(f"  {name:10s} {m['streams']:7d} streams {human(m['raw']):>10s} -> "
+                  f"{human(m['coded']):>10s}  {r:.3f}x  {share:5.1f}% of input")
+            if m.get("contested"):
+                alt = m["contested_alt"]
+                by = (1 - m["contested_coded"] / alt) * 100 if alt else 0
+                print(f"  {'':10s} {m['contested']:7d} of those ran against the "
+                      f"other coder and won by {by:.1f}%")
     print(f"members     {len(data['members'])}")
     for m in data["members"][:args.limit]:
         ntensors = len(m.get("tensors") or {})
@@ -489,6 +506,33 @@ def cmd_bench(args) -> int:
         return len(c), c
 
     report("gzip -6 (plain)", enc_gzip, lambda obj, d, e, k, b: zlib.decompress(obj))
+
+    if args.methods:
+        # A second pass, deliberately untimed. `measure_alt` makes the plane
+        # path also run the general-purpose coder it normally skips, which is
+        # the only way to see what rANS is winning by -- the archive records
+        # the winner's size and nothing about the loser. It roughly doubles the
+        # coding work, which is why it stays out of the timings above.
+        mt = _codec.MethodTally(measure_alt=True)
+        for d, e, k, b in data:
+            _codec.encode_chunk(d, e, 1, False, kind=k, btype=b, tally=mt)
+        rows = mt.to_json()
+        if rows:
+            raw_total = sum(r["raw"] for r in rows.values())
+            print(f"\n  {'entropy coder':<22s} {'streams':>8s} {'in':>10s} "
+                  f"{'out':>10s} {'ratio':>8s} {'share':>7s}  vs the other coder")
+            for name, r in sorted(rows.items(), key=lambda kv: -kv[1]["raw"]):
+                ratio = r["raw"] / r["coded"] if r["coded"] else 0
+                share = r["raw"] / raw_total * 100 if raw_total else 0
+                if r.get("contested"):
+                    alt = r["contested_alt"]
+                    by = (1 - r["contested_coded"] / alt) * 100 if alt else 0
+                    versus = f"{by:+.1f}% over {r['contested']} streams"
+                else:
+                    versus = "not contested"
+                print(f"  {name:<22s} {r['streams']:>8d} {human(r['raw']):>10s} "
+                      f"{human(r['coded']):>10s} {ratio:>7.3f}x {share:>6.1f}%  "
+                      f"{versus}")
     return 0
 
 
@@ -581,6 +625,9 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--bytes", type=parse_size, default=None,
                    help="how much to sample (default: 256MiB)")
     b.add_argument("--chunk-size", type=parse_size, default=api.DEFAULT_CHUNK_SIZE)
+    b.add_argument("--methods", action="store_true",
+                   help="break the sample down by entropy coder, and code every "
+                        "plane both ways to show what the winner won by")
     b.set_defaults(func=cmd_bench)
 
     doc = sub.add_parser("doctor", help="report the active backends")

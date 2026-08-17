@@ -393,6 +393,7 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
 
         pool = _FdPool(paths, os.O_RDONLY)
         done = 0
+        tally = _codec.MethodTally()
         stats = Stats(input_bytes=total_new, files=len(members),
                       chunks=len(plan),
                       detail={"delta_bytes": delta_bytes, "appended": True})
@@ -406,11 +407,12 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
                 base_bytes = arc.read(src_off, end - start)
                 parts, flags, crc = _codec.encode_delta(
                     data, base_bytes, esize, level, checksum, kind=ikind,
-                    btype=btype, src=src_off)
+                    btype=btype, src=src_off, tally=tally)
                 return (members[idx].dst + start, end - start, parts,
                         CODEC_DELTA, esize, flags, crc)
             parts, cid, flags, crc = _codec.encode_chunk(
-                data, esize, level, checksum, kind=kind, btype=btype)
+                data, esize, level, checksum, kind=kind, btype=btype,
+                tally=tally)
             return (members[idx].dst + start, end - start, parts, cid, esize,
                     flags, crc)
 
@@ -437,6 +439,12 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
                     done += rlen
                 if progress:
                     progress(done, total_new)
+            # The table describes the whole archive after an append, so the
+            # method counts have to as well.
+            merged = _codec.merge_methods(old_manifest.get("methods"),
+                                          tally.to_json())
+            if merged:
+                manifest["methods"] = merged
             writer.close(base)
             # An append can leave a shorter tail than the one it replaced.
             out.truncate(writer.end)
@@ -444,6 +452,7 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
     finally:
         arc.close()
 
+    stats.detail["methods"] = tally.to_json()   # this append's share, not the whole
     stats.output_bytes = os.path.getsize(archive)
     stats.seconds = time.perf_counter() - started
     return stats
@@ -726,6 +735,10 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
 
     pool = _FdPool(paths, os.O_RDONLY)
     done = 0
+    # Which coder actually earned the bytes. The chunk table records the codec
+    # that framed each chunk, never the coder that compressed the planes inside
+    # it, so a split chunk says nothing about whether rANS or zstd did the work.
+    tally = _codec.MethodTally()
     stats = Stats(input_bytes=total_in, files=len(members), chunks=len(plan),
                   detail={"dedup_bytes": dedup_bytes,
                           "delta_bytes": delta_bytes})
@@ -748,11 +761,12 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
                 raise IOError(f"short read on {members[midx].path} at {moff}")
             parts, flags, crc = _codec.encode_delta(
                 data, base, esize, level, checksum, kind=ikind, btype=btype,
-                src=ref_src)
+                src=ref_src, tally=tally)
             return (members[idx].dst + start, end - start, parts, CODEC_DELTA,
                     esize, flags, crc)
         parts, cid, flags, crc = _codec.encode_chunk(data, esize, level, checksum,
-                                                     kind=kind, btype=btype)
+                                                     kind=kind, btype=btype,
+                                                     tally=tally)
         return members[idx].dst + start, end - start, parts, cid, esize, flags, crc
 
     def work_batch(batch):
@@ -778,6 +792,11 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
                     done += rlen
                 if progress:
                     progress(done, total_in)
+            # The writer serialises the manifest as it closes, so this lands in
+            # the archive rather than only in the return value.
+            methods = tally.to_json()
+            if methods:
+                manifest["methods"] = methods
             writer.close(total_in)
         os.replace(tmp, dst)
     except BaseException:
@@ -790,6 +809,7 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
         pool.close()
 
     stats.detail["padding_bytes"] = writer.padding
+    stats.detail["methods"] = methods
     stats.output_bytes = os.path.getsize(dst)
     stats.seconds = time.perf_counter() - started
     return stats
@@ -1127,6 +1147,10 @@ def info(src: str) -> dict:
             "manifest": reader.manifest,
             "members": [m.to_json() for m in reader.members],
             "codecs": by_codec,
+            # Recorded while writing: which coder compressed each stream, which
+            # the chunk table cannot show because it names only the framing
+            # codec. Absent from archives written before this was tracked.
+            "methods": reader.manifest.get("methods") or {},
             "payload_bytes": sum(c.clen for c in reader.chunks),
         }
 

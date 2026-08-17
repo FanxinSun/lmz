@@ -15,6 +15,7 @@ incompressible.
 from __future__ import annotations
 
 import struct
+import threading
 import zlib
 from math import log2
 
@@ -212,10 +213,102 @@ def estimate_entropy(buf) -> float:
     return h
 
 
-def _encode_stream(buf, level: int, method: int, plane: bool = False):
+class _Sink:
+    """One encode attempt's worth of per-stream records, not yet committed.
+
+    An attempt can lose -- a block split that fails to beat its own input, a
+    conditioned BF16 chunk that the plain split undercuts -- and the streams it
+    coded never reach the archive. Recording into a sink and committing only the
+    attempt that won is what keeps the tally a description of the file rather
+    than of the search.
+    """
+
+    __slots__ = ("rows", "measure_alt")
+
+    def __init__(self, measure_alt: bool = False):
+        self.rows: list[tuple[int, int, int, int | None]] = []
+        self.measure_alt = measure_alt
+
+    def add(self, method: int, raw: int, coded: int, alt: int | None = None):
+        self.rows.append((method, raw, coded, alt))
+
+
+class MethodTally:
+    """Which entropy coder actually did the work, and on how much of the file.
+
+    The chunk table records the codec that framed each chunk, never the coder
+    that compressed the planes inside it, so a BF16 split chunk says nothing
+    about whether rANS or zstd earned the bytes. Every coded stream in every
+    codec passes through `_encode_stream`, which makes that the one place the
+    question can be answered for the whole archive.
+
+    `contested` counts only the streams where both coders were actually run, so
+    `alt` is a real measured size rather than a guess. On the plane path only
+    rANS runs, so those streams are contested solely when `measure_alt` asks for
+    the loser to be computed too -- which doubles the coding work and is
+    therefore never on by default.
+    """
+
+    __slots__ = ("_by_method", "_lock", "measure_alt")
+
+    def __init__(self, measure_alt: bool = False):
+        # method -> [streams, raw, coded, contested, contested_coded, alt]
+        self._by_method: dict[int, list[int]] = {}
+        self._lock = threading.Lock()
+        self.measure_alt = measure_alt
+
+    def sink(self) -> _Sink:
+        return _Sink(self.measure_alt)
+
+    def commit(self, sink: _Sink | None) -> None:
+        if not sink or not sink.rows:
+            return
+        with self._lock:
+            for method, raw, coded, alt in sink.rows:
+                slot = self._by_method.setdefault(method, [0, 0, 0, 0, 0, 0])
+                slot[0] += 1
+                slot[1] += raw
+                slot[2] += coded
+                if alt is not None:
+                    slot[3] += 1
+                    slot[4] += coded
+                    slot[5] += alt
+
+    def stored(self, raw: int) -> None:
+        """A whole chunk kept as-is, whatever its discarded attempts coded."""
+        sink = _Sink()
+        sink.add(entropy.METHOD_STORED, raw, raw)
+        self.commit(sink)
+
+    def to_json(self) -> dict:
+        out = {}
+        with self._lock:
+            for method, slot in self._by_method.items():
+                name = entropy.METHOD_NAMES.get(method, f"method-{method}")
+                row = {"streams": slot[0], "raw": slot[1], "coded": slot[2]}
+                if slot[3]:
+                    row["contested"] = slot[3]
+                    row["contested_coded"] = slot[4]
+                    row["contested_alt"] = slot[5]
+                out[name] = row
+        return out
+
+
+def merge_methods(a: dict | None, b: dict | None) -> dict:
+    """Sum two method tables, for an archive that grew by being appended to."""
+    out = {name: dict(row) for name, row in (a or {}).items()}
+    for name, row in (b or {}).items():
+        slot = out.setdefault(name, {})
+        for key, value in row.items():
+            slot[key] = slot.get(key, 0) + value
+    return out
+
+
+def _encode_stream(buf, level: int, method: int, plane: bool = False, sink=None):
     """Compress one stream unless doing so is not worth it.
 
-    Returns (method_used, payload).
+    Returns (method_used, payload). `sink` records what was chosen and what it
+    cost; see MethodTally for why the record is provisional.
 
     Planes get the order-0 rANS coder, which is what the data actually calls
     for. A mantissa plane sits at about 7.90 bits per byte -- a real 1.3%
@@ -228,13 +321,23 @@ def _encode_stream(buf, level: int, method: int, plane: bool = False):
     if n == 0:
         return entropy.METHOD_STORED, b""
     if estimate_entropy(buf) >= NOISE_BITS:
+        if sink is not None:
+            sink.add(entropy.METHOD_STORED, n, n)
         return entropy.METHOD_STORED, buf
 
-    best_method, best = entropy.METHOD_STORED, None
+    best_method, best, alt_size = entropy.METHOD_STORED, None, None
     if plane and kernels.have_rans():
         best = kernels.rans_encode(buf)
         if best is not None:
             best_method = entropy.METHOD_RANS
+        if sink is not None and sink.measure_alt:
+            # What the general-purpose coder would have charged for the same
+            # bytes. Only ever computed on request: it is a second full
+            # compression of a stream that is already coded.
+            try:
+                alt_size = len(entropy.compress(buf, level, method))
+            except Exception:
+                alt_size = None
     else:
         try:
             best = entropy.compress(buf, level, method)
@@ -245,11 +348,21 @@ def _encode_stream(buf, level: int, method: int, plane: bool = False):
         # plain symbol distribution -- quantised INT8 weights, for one.
         if kernels.have_rans() and (best is None or len(best) > n - (n >> 5)):
             alt = kernels.rans_encode(buf)
-            if alt is not None and (best is None or len(alt) < len(best)):
-                best_method, best = entropy.METHOD_RANS, alt
+            if alt is not None:
+                if best is None:
+                    best_method, best = entropy.METHOD_RANS, alt
+                elif len(alt) < len(best):
+                    alt_size = len(best)   # both ran, so the loser is measured
+                    best_method, best = entropy.METHOD_RANS, alt
+                else:
+                    alt_size = len(alt)
 
     if best is None or len(best) + _min_gain(n) >= n:
+        if sink is not None:
+            sink.add(entropy.METHOD_STORED, n, n)
         return entropy.METHOD_STORED, buf
+    if sink is not None:
+        sink.add(best_method, n, len(best), alt_size)
     return best_method, best
 
 
@@ -276,7 +389,7 @@ def _est_stream(total: int, h: float) -> int:
     return min(total, int(total * h / 8) + RANS_OVERHEAD)
 
 
-def _encode_bf16_cond(exp, sm, nelem: int, level: int, method: int):
+def _encode_bf16_cond(exp, sm, nelem: int, level: int, method: int, sink=None):
     """Code the sign+mantissa plane with one rANS table per exponent bucket.
 
     Decides from exact histograms whether conditioning beats one shared
@@ -308,7 +421,8 @@ def _encode_bf16_cond(exp, sm, nelem: int, level: int, method: int):
     if est_cond + (_bf16c_hdr.size - _plane_header(2).size) + 512 >= est_plain:
         return None
 
-    exp_used, exp_payload = _encode_stream(exp, level, method, plane=True)
+    exp_used, exp_payload = _encode_stream(exp, level, method, plane=True,
+                                           sink=sink)
     sm_methods = []
     seg_lens = []
     parts = []
@@ -318,7 +432,8 @@ def _encode_bf16_cond(exp, sm, nelem: int, level: int, method: int):
             sm_methods.append(entropy.METHOD_STORED)
             seg_lens.append(0)
             continue
-        used, payload = _encode_stream(pmv[pos:pos + c], level, method, plane=True)
+        used, payload = _encode_stream(pmv[pos:pos + c], level, method,
+                                       plane=True, sink=sink)
         sm_methods.append(used)
         seg_lens.append(len(payload))
         parts.append(payload)
@@ -396,7 +511,7 @@ def _choose_group(mv, nblocks: int, start: int, width: int, sub=None):
 
 
 def _encode_gblk(data, nblocks: int, period: int, groups, level: int, method: int,
-                 subctx=None):
+                 subctx=None, sink=None):
     """Split blocks on their field boundaries and code each field its own way.
 
     Every field records its own mode and stream lengths in the payload, so the
@@ -416,29 +531,30 @@ def _encode_gblk(data, nblocks: int, period: int, groups, level: int, method: in
         if mode == GRP_SUB:
             subs[start] = sub
             for seg in cond:
-                streams.append(_encode_stream(seg, level, method, plane=True))
+                streams.append(_encode_stream(seg, level, method, plane=True,
+                                              sink=sink))
         elif mode == GRP_CONCAT:
             streams.append(_encode_stream(
                 mv[start * nblocks:(start + width) * nblocks], level, method,
-                plane=True))
+                plane=True, sink=sink))
         elif mode == GRP_PLANES:
             for j in range(width):
                 streams.append(_encode_stream(
                     mv[(start + j) * nblocks:(start + j + 1) * nblocks], level,
-                    method, plane=True))
+                    method, plane=True, sink=sink))
         else:
             part, counts = cond
             pmv = memoryview(part)
             streams.append(_encode_stream(
                 mv[(start + 1) * nblocks:(start + 2) * nblocks], level, method,
-                plane=True))
+                plane=True, sink=sink))
             pos = 0
             for c in counts:
                 if c == 0:
                     streams.append((entropy.METHOD_STORED, b""))
                     continue
                 streams.append(_encode_stream(pmv[pos:pos + c], level, method,
-                                              plane=True))
+                                              plane=True, sink=sink))
                 pos += c
 
     parts = [_gblk_hdr.pack(period, len(descs))]
@@ -709,16 +825,25 @@ def _decode_q80(payload, nblocks: int, out=None):
 
 
 def encode_chunk(data, esize: int, level: int = 1, checksum: bool = True,
-                 method: int = -1, kind: int = KIND_BYTES, btype: int = -1):
+                 method: int = -1, kind: int = KIND_BYTES, btype: int = -1,
+                 tally=None):
     """Encode one chunk.
 
     Returns (payload, codec, flags, crc). `payload` may be a list of buffers,
     which the caller writes in order.
+
+    `tally`, when given, is told about the streams of whichever attempt is
+    kept. Each attempt below codes into its own sink, so the ones that lose --
+    a block split that cannot beat its own input, a conditioned BF16 chunk the
+    plain split undercuts -- leave no trace. Otherwise the tally would describe
+    the search rather than the archive, and would credit a coder for bytes that
+    were ultimately stored raw.
     """
     if method < 0:
         method = entropy.DEFAULT_METHOD
     crc = zlib.crc32(data) & 0xFFFFFFFF if checksum else 0
     n = len(data)
+    new_sink = tally.sink if tally is not None else lambda: None
 
     layout = BLOCK_LAYOUTS.get(btype) if kind == KIND_BLOCK else None
     if (layout is not None and esize == layout[0] and n % esize == 0
@@ -729,9 +854,12 @@ def encode_chunk(data, esize: int, level: int = 1, checksum: bool = True,
             qstart, cstart, skind = recipe
             subctx = (qstart, (cstart, kernels.K4_SCALE_BYTES,
                                kernels.K4_SUBBLOCKS, skind, SUB_KS, SUB_KM))
+        sink = new_sink()
         parts, flags = _encode_gblk(data, n // esize, layout[0], layout[1],
-                                    level, method, subctx)
+                                    level, method, subctx, sink=sink)
         if sum(len(p) for p in parts) + _min_gain(n) < n:
+            if tally is not None:
+                tally.commit(sink)
             return parts, CODEC_GBLK, flags, crc
         # Otherwise fall through: a block period is not a splittable width, so
         # the chunk takes the generic single-stream path.
@@ -743,10 +871,14 @@ def encode_chunk(data, esize: int, level: int = 1, checksum: bool = True,
         nelem = n // 2
         if nelem >= COND_MIN_ELEMS and kernels.have_rans():
             mv = memoryview(planes)
-            cond = _encode_bf16_cond(mv[:nelem], mv[nelem:], nelem, level, method)
+            sink = new_sink()
+            cond = _encode_bf16_cond(mv[:nelem], mv[nelem:], nelem, level, method,
+                                     sink=sink)
             if cond is not None:
                 parts, flags = cond
                 if sum(len(p) for p in parts) + _min_gain(n) < n:
+                    if tally is not None:
+                        tally.commit(sink)
                     return parts, CODEC_BF16C, flags, crc
     elif splittable:
         nplanes, cid = esize, CODEC_SPLIT
@@ -760,9 +892,10 @@ def encode_chunk(data, esize: int, level: int = 1, checksum: bool = True,
         parts, lengths, flags = [], [], 0
         total = 0
         any_compressed = False
+        sink = new_sink()
         for k in range(nplanes):
             used, payload = _encode_stream(mv[k * nelem:(k + 1) * nelem], level,
-                                           method, plane=True)
+                                           method, plane=True, sink=sink)
             flags |= (used & 0x3) << (2 * k)
             lengths.append(len(payload))
             parts.append(payload)
@@ -772,11 +905,18 @@ def encode_chunk(data, esize: int, level: int = 1, checksum: bool = True,
         # If nothing compressed, the split only shuffled bytes; storing the
         # original avoids paying for a merge on the way back.
         if any_compressed and total + _plane_header(nplanes).size < n:
+            if tally is not None:
+                tally.commit(sink)
             return ([_plane_header(nplanes).pack(*lengths)] + parts,
                     cid, flags, crc)
+        if tally is not None:
+            tally.stored(n)   # the coded planes are discarded with the split
         return ([data], CODEC_STORED, 0, crc)
 
-    used, payload = _encode_stream(data, level, method)
+    sink = new_sink()
+    used, payload = _encode_stream(data, level, method, sink=sink)
+    if tally is not None:
+        tally.commit(sink)
     if used == entropy.METHOD_STORED:
         return ([data], CODEC_STORED, 0, crc)
     return ([payload], CODEC_ZSTD, used & 0x3, crc)
@@ -789,7 +929,8 @@ _delta_hdr = struct.Struct("<QB")
 
 
 def encode_delta(data, base, esize: int, level: int = 1, checksum: bool = True,
-                 kind: int = KIND_BYTES, btype: int = -1, src: int = 0):
+                 kind: int = KIND_BYTES, btype: int = -1, src: int = 0,
+                 tally=None):
     """Code a chunk as its difference from an earlier output range.
 
     The checksum is of the original bytes, not the difference, so it verifies
@@ -799,7 +940,7 @@ def encode_delta(data, base, esize: int, level: int = 1, checksum: bool = True,
     crc = zlib.crc32(data) & 0xFFFFFFFF if checksum else 0
     diff = kernels.xor_bytes(data, base)
     parts, cid, flags, _ = encode_chunk(bytes(diff), esize, level, False,
-                                        kind=kind, btype=btype)
+                                        kind=kind, btype=btype, tally=tally)
     return [_delta_hdr.pack(src, cid)] + list(parts), flags, crc
 
 

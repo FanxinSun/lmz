@@ -1411,6 +1411,95 @@ def test_block_codec_declines_on_noise():
                                     crc, True)) == data
 
 
+def test_method_tally_counts_only_the_attempt_that_won():
+    """Every input byte is credited to exactly one coder, once.
+
+    encode_chunk tries several codings and keeps the smallest: a block split, a
+    conditioned BF16 chunk, a plain plane split. An attempt that loses has
+    already coded its streams, and those streams never reach the archive, so
+    counting them would credit a coder for work that was thrown away and would
+    describe the search rather than the file. Summing the tally back to the
+    exact input size is precisely the assertion that this did not happen -- a
+    committed loser shows up as roughly twice the bytes.
+    """
+    if not kernels.have_rans():
+        raise Skip("the tally distinguishes coders only when rANS is available")
+    period = planner.BLOCK_LAYOUTS[12][0]
+    nblk = codec.BLOCK_MIN_BLOCKS * 2
+    cases = [
+        # A block split that is attempted and declined: the interesting one.
+        ("gblk declined", rand(period * nblk, 99), period, planner.KIND_BLOCK, 12),
+        ("gblk kept", quant_blocks(12, nblk), period, planner.KIND_BLOCK, 12),
+        ("bf16 conditioned", weights_bf16_cond(1 << 20, 3), 2, planner.KIND_BF16, -1),
+        ("bf16 plain", weights_bf16(400000, 7), 2, planner.KIND_BF16, -1),
+        ("byte split", weights_bf16(400000, 7), 2, planner.KIND_BYTES, -1),
+        ("noise", rand(1 << 20, 11), 2, planner.KIND_BYTES, -1),
+        ("all zeros", b"\x00" * (1 << 20), 4, planner.KIND_BYTES, -1),
+    ]
+    for label, data, esize, kind, btype in cases:
+        tally = codec.MethodTally()
+        codec.encode_chunk(data, esize, 1, False, kind=kind, btype=btype,
+                           tally=tally)
+        rows = tally.to_json()
+        raw = sum(r["raw"] for r in rows.values())
+        assert raw == len(data), f"{label}: {raw} bytes tallied for {len(data)}"
+        assert all(r["streams"] > 0 for r in rows.values()), (label, rows)
+
+
+def test_method_tally_measures_the_losing_coder():
+    """measure_alt has to record a size the winner actually beat.
+
+    The plane path runs rANS alone, so the archive records what the winner cost
+    and nothing about what the alternative would have. Asking for the loser to
+    be coded too is the only way to answer "by how much", and the answer is
+    only meaningful if the winner is genuinely no larger.
+    """
+    if not kernels.have_rans() or not entropy.HAVE_ZSTD:
+        raise Skip("needs both coders to have a contest")
+    tally = codec.MethodTally(measure_alt=True)
+    data = weights_bf16(400000, 7)
+    codec.encode_chunk(data, 2, 1, False, kind=planner.KIND_BF16, tally=tally)
+    rows = tally.to_json()
+    rans = rows.get("rans")
+    assert rans and rans.get("contested"), f"no contested streams: {rows}"
+    assert rans["contested_coded"] <= rans["contested_alt"], \
+        f"the chosen coder was larger: {rans}"
+    # And without asking, nothing is contested: the loser is never coded.
+    quiet = codec.MethodTally()
+    codec.encode_chunk(data, 2, 1, False, kind=planner.KIND_BF16, tally=quiet)
+    assert not quiet.to_json().get("rans", {}).get("contested"), \
+        "the alternative was coded without being asked for"
+
+
+def test_info_reports_which_coder_did_the_work():
+    """The tally has to survive into the archive, since that is where it is read.
+
+    A chunk's codec is the framing, not the coder: a bf16-split chunk says
+    nothing about whether rANS or zstd earned its bytes. The manifest carries
+    the answer so `lmz info` can report it without decompressing anything.
+    """
+    if not kernels.have_rans():
+        raise Skip("the tally distinguishes coders only when rANS is available")
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "m.safetensors")
+        write_safetensors(path, [
+            ("w1", "BF16", [1024, 1024], weights_bf16(1024 * 1024)),
+            ("w2", "I8", [8192], rand(8192, 13)),
+        ])
+        archive = os.path.join(d, "m.lmz")
+        stats = lmz.compress(path, archive)
+        assert stats.detail.get("methods"), "compress reported no method tally"
+
+        methods = lmz.api.info(archive)["methods"]
+        assert methods, "the archive did not carry the tally"
+        assert methods.get("rans", {}).get("raw"), \
+            f"rANS coded nothing on BF16 weights: {methods}"
+        # Same invariant as at chunk level, now across the whole archive.
+        raw = sum(m["raw"] for m in methods.values())
+        assert raw == os.path.getsize(path), \
+            f"{raw} bytes tallied for a {os.path.getsize(path)} byte input"
+
+
 def _k4_quant(v: int, scale: int) -> int:
     """A 4-bit quant whose spread follows its own sub-block's scale."""
     span = 1 + scale * 7 // 63
