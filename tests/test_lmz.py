@@ -18,6 +18,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -2254,6 +2255,60 @@ def test_fs_write_then_immediately_read():
                     fh.write(body)
                 with open(p) as fh:          # no sync, no settle: on purpose
                     assert fh.read() == body, f"f{i} read back wrong"
+
+
+def test_fs_never_publishes_a_size_it_knows_is_stale():
+    """A stat of a file mid-write must not see the placeholder, ever.
+
+    Until the commit lands, what is on disk is an empty placeholder and the real
+    length is the scratch copy's. node_for is handed that length so it assigns
+    the node's size once, already right. Correcting it afterwards -- which is
+    what this used to do -- still publishes the placeholder for as long as the
+    correction takes, and the node is shared, so a second server thread
+    answering a stat inside that window reports zero bytes. The reader then
+    believes the file is empty and stops before asking for any of it.
+
+    With the correction applied after the fact, a watching thread saw the wrong
+    size 50% of the time, so a short sample is more than enough to catch a
+    regression.
+    """
+    from lmz import lmzfs
+
+    with tempfile.TemporaryDirectory() as d:
+        fs = lmzfs.LmzFS(os.path.join(d, "back"), os.path.join(d, "mnt"))
+        try:
+            root = fs.btree.root
+            body = b"contents number 0\n" * 40
+            node, fh = fs.fs_create(root, "w.bin", 0o644, os.O_WRONLY)
+            fs.fs_write(node, fh, 0, body)
+
+            # The on-disk placeholder is empty; the node must not report that.
+            assert os.path.getsize(fs.btree.rawfile("w.bin")) == 0
+            fs.resolve(root, "w.bin")
+            live = fs.btree.by_path["w.bin"]
+            assert live.size == len(body), live.size
+
+            seen, stop = set(), threading.Event()
+
+            def lookups():
+                while not stop.is_set():
+                    fs.resolve(root, "w.bin")
+
+            def watch():
+                while not stop.is_set():
+                    seen.add(live.size)
+
+            threads = [threading.Thread(target=lookups) for _ in range(2)]
+            threads.append(threading.Thread(target=watch))
+            for t in threads:
+                t.start()
+            time.sleep(0.3)
+            stop.set()
+            for t in threads:
+                t.join()
+            assert seen == {len(body)}, f"a stat could have seen {sorted(seen)}"
+        finally:
+            fs.close()
 
 
 def test_fs_scratch_fd_closes_only_once_unreachable():

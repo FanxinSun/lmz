@@ -121,8 +121,16 @@ class BackingTree(Tree):
         return None, False
 
     # -- nodes -------------------------------------------------------------
-    def node_for(self, rel: str, parent: Node) -> Node | None:
-        """The node for a logical path, created or refreshed from disk."""
+    def node_for(self, rel: str, parent: Node,
+                 live_size: int | None = None) -> Node | None:
+        """The node for a logical path, created or refreshed from disk.
+
+        `live_size` overrides what is on disk, for a file whose contents are
+        still in a scratch copy. It is passed in rather than corrected
+        afterwards because the node is shared: assigning the on-disk size first
+        publishes a value that is known to be wrong, and another server thread
+        answering a stat in that window reports it.
+        """
         real = self.real(rel)
         name = posixpath.basename(rel)
         if os.path.isdir(real):
@@ -140,6 +148,8 @@ class BackingTree(Tree):
                 mode = S_IFREG
                 size = archive_size(path) if is_arc else st.st_size
                 target = None
+            if live_size is not None:
+                size = live_size
         with self._lock:
             node = self.by_path.get(rel)
             if node is None:
@@ -288,35 +298,36 @@ class LmzFS(FuseServer):
                 pass
 
     # -- tree hooks --------------------------------------------------------
-    def _live_size(self, node: Node, rel: str) -> Node:
-        """Report the scratch copy's size while a write is still open.
+    def _writing_size(self, rel: str) -> int | None:
+        """The scratch copy's size while a write is still open, else None.
 
-        Until the commit lands, what is on disk is an empty placeholder. A
-        stat that believed it would report zero bytes, and a reader that
-        trusted the stat would stop before asking for any -- which is exactly
-        how `echo > f && cat f` came back empty even though the data was
-        there to be read.
+        Until the commit lands, what is on disk is an empty placeholder. A stat
+        that believed it would report zero bytes, and a reader that trusted the
+        stat would stop before asking for any -- which is exactly how
+        `echo > f && cat f` came back empty even though the data was there.
+
+        Handed to node_for rather than written over the node afterwards. The
+        node is shared, so correcting it after the fact still publishes the
+        placeholder for as long as the correction takes, and a second server
+        thread answering a stat inside that window reports zero. Measured under
+        the lock because fs_release closes this descriptor in the same critical
+        section that unregisters the handle.
         """
-        if node is None:
-            return node
         with self._lock:
             handle = self._open_writes.get(rel)
-            if handle is not None:
-                # Measured under the lock: the descriptor is closed in the same
-                # critical section that unregisters the handle, so an fstat
-                # outside it can size whatever file inherited the number.
-                try:
-                    node.size = os.fstat(handle.fd).st_size
-                except OSError:
-                    pass
-        return node
+            if handle is None:
+                return None
+            try:
+                return os.fstat(handle.fd).st_size
+            except OSError:
+                return None
 
     def resolve(self, node: Node, name: str):
         if not node.is_dir or name in (SCRATCH,):
             return None
         try:
             rel = self._child_rel(node, name)
-            return self._live_size(self.btree.node_for(rel, node), rel)
+            return self.btree.node_for(rel, node, self._writing_size(rel))
         except OSError:
             return None
 
@@ -326,7 +337,7 @@ class LmzFS(FuseServer):
             return
         parent = self.tree.nodes.get(node.parent, self.tree.root)
         rel = self._rel(node)
-        self._live_size(self.btree.node_for(rel, parent), rel)
+        self.btree.node_for(rel, parent, self._writing_size(rel))
 
     def entries(self, node: Node):
         rel = self._rel(node)
@@ -341,7 +352,7 @@ class LmzFS(FuseServer):
             logical = (entry[:-len(ARCHIVE)] if entry.endswith(ARCHIVE)
                        else entry[:-len(RAW)] if entry.endswith(RAW) else entry)
             crel = f"{rel}/{logical}" if rel else logical
-            child = self._live_size(self.btree.node_for(crel, node), crel)
+            child = self.btree.node_for(crel, node, self._writing_size(crel))
             if child is not None:
                 out.append((logical, child))
         return out
