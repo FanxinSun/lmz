@@ -276,6 +276,55 @@ static int dec_two(const uint8_t *sa, size_t la, const uint32_t *lua, uint8_t *d
     return (int)i;
 }
 
+/* The same instructions with the loop-carried dependency cut: the table index
+ * comes from an array recorded on an earlier pass rather than from the state
+ * the loop just computed. Same loads, same store, same arithmetic, same refill
+ * -- eight independent streams of work instead of eight chains. What separates
+ * this from the real decoder is latency and nothing else, so the ratio between
+ * them is the headroom the loop is failing to use. */
+static int dec_nochain(const uint8_t *src, size_t src_len, uint8_t *dst,
+                       size_t n, const uint32_t *lut, const uint32_t *slots)
+{
+    const uint8_t *ptr=src+HDR, *limit=src+src_len;
+    uint32_t acc=0;
+    size_t i=0;
+    for (; i+8<=n && ptr+16<=limit; i+=8){
+        uint32_t e[8];
+        for (int k=0;k<8;k++) e[k]=lut[slots[i+k]];
+        for (int k=0;k<8;k++) dst[i+k]=(uint8_t)(e[k]&0xff);
+        for (int k=0;k<8;k++){
+            uint32_t x=slots[i+k];
+            x=((e[k]>>20)+1)*(x>>PROB_BITS)+(x&(PROB_SCALE-1))-((e[k]>>8)&0xfff);
+            const uint8_t *p=ptr; uint32_t w=(uint32_t)p[0]|((uint32_t)p[1]<<8);
+            uint32_t nd=(x<RANS_L); x=nd?((x<<16)|w):x; ptr=p+(nd<<1); acc+=x;
+        }
+    }
+    return (int)(acc & 1) & 0;
+}
+
+/* Records the table index each lane used, so the run above can replay them. */
+static void dec_record(const uint8_t *src, size_t src_len, size_t n,
+                       const uint32_t *lut, uint32_t *slots)
+{
+    const uint8_t *ptr=src+HDR, *limit=src+src_len;
+    uint32_t state[8];
+    for (int k=0;k<8;k++){ state[k]=(uint32_t)ptr[0]|((uint32_t)ptr[1]<<8)
+        |((uint32_t)ptr[2]<<16)|((uint32_t)ptr[3]<<24); ptr+=4; }
+    size_t i=0;
+    for (; i+8<=n && ptr+16<=limit; i+=8){
+        uint32_t e[8];
+        for (int k=0;k<8;k++) slots[i+k]=state[k]&(PROB_SCALE-1);
+        for (int k=0;k<8;k++) e[k]=lut[state[k]&(PROB_SCALE-1)];
+        for (int k=0;k<8;k++){
+            uint32_t x=state[k];
+            x=((e[k]>>20)+1)*(x>>PROB_BITS)+(x&(PROB_SCALE-1))-((e[k]>>8)&0xfff);
+            const uint8_t *p=ptr; uint32_t w=(uint32_t)p[0]|((uint32_t)p[1]<<8);
+            uint32_t nd=(x<RANS_L); x=nd?((x<<16)|w):x; ptr=p+(nd<<1); state[k]=x;
+        }
+    }
+    for (; i<n; i++) slots[i]=0;
+}
+
 /* Sixteen interleaved states in one stream: the format change that a "more
  * chains would help" reading of the two-chunk figure appears to argue for.
  * It does not survive being measured. */
@@ -392,6 +441,14 @@ int main(int argc, char **argv)
         row("decode, 16 states", b, n, base,
             (rc==0 && !memcmp(o0,buf,n)) ? "the format change" : "!! WRONG");
 
+        uint32_t *slots = malloc(n * sizeof(uint32_t));
+        dec_record(enc, (size_t)l8, n, lut, slots);
+        b = 1e9;
+        for (int r=0;r<7;r++){ double s=now();
+            dec_nochain(enc,(size_t)l8,o0,n,lut,slots); double e=now()-s; if(e<b)b=e; }
+        row("decode, chain cut", b, n, base, "not a decoder; the headroom");
+        free(slots);
+
         /* Two chunks together. Each half of the plane is its own stream with
          * its own table, which is what pairing chunks would really mean. */
         size_t h = n / 2;
@@ -420,12 +477,16 @@ int main(int argc, char **argv)
         free(enc); free(enc16); free(lut); free(o0); free(o1);
         (void)l16;
     }
-    printf("\nWhat the last three lines are for. Sixteen states is the format\n"
-           "change; if it is below 1.00x the register file, not the dependency\n"
-           "chains, is what the decoder is short of. Interleaving two chunks is\n"
-           "the same idea without a format change, and the honest version of it:\n"
-           "two different streams with a table each, not one stream decoded\n"
-           "twice, which only measures the second one reusing the first's cache.\n");
+    printf("\nThe last four lines, in order.\n\n"
+           "  16 states and two chunks both add independent work for the machine\n"
+           "  to overlap. On x86-64 both come out below 1.00x, because eight rANS\n"
+           "  states and their table entries already fill sixteen general-purpose\n"
+           "  registers and anything more spills. arm64 has thirty-one, so these\n"
+           "  two lines are the ones worth reading on a machine that is not x86.\n\n"
+           "  Chain cut is not a decoder -- it replays recorded table indices, so\n"
+           "  it computes nothing. It runs the same instructions with the\n"
+           "  loop-carried dependency removed, and the ratio is how much of this\n"
+           "  machine the real loop leaves idle waiting on its own state.\n");
     free(expp); free(smp);
     return 0;
 }
