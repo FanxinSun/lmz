@@ -109,8 +109,9 @@ or [Alipay](assets/alipay.jpg) (打开支付宝，扫一扫). Thank you.
   filesystem
 - [**Limitations**](docs/limitations.md) — where it does not pay, and what the
   91 tests check
-- [**Vectorising the coder**](docs/vectorising-the-coder.md) — the two pieces of
-  work still open, and the six that were tried and measured out flat
+- [**Vectorising the coder**](docs/vectorising-the-coder.md) — how the encoder
+  reached arm64, the one piece of work still open, and the six that were tried
+  and measured out flat
 
 Python 3.10+, no runtime dependencies. zstd comes from the standard library on
 3.14+; a C compiler, if present, is used once to build the SIMD kernel into the

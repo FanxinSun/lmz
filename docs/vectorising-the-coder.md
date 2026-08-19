@@ -1,8 +1,8 @@
 # Vectorising the coder
 
-*Two pieces of work that are open, what is already known about them, and the
-six things that were tried and do not work. Written for whoever picks this up
-next, so that none of it has to be rediscovered.*
+*One piece of work that is open, what is already known about it, the six things
+that were tried and do not work, and how the encoder got to arm64. Written for
+whoever picks this up next, so that none of it has to be rediscovered.*
 
 [← back to the README](../README.md)
 
@@ -18,68 +18,136 @@ Per 64 MiB of BF16, single-threaded, AMD Ryzen 7 9800X3D:
 | split / merge | 9.6 (12%) | 3.4 (3%) |
 
 Against `zstd -1` on the same data: encode is about 1.4× behind on x86 and
-2.0× on arm64; decode is 2.4× behind on x86 and 1.1× on arm64.
+1.5× on arm64; decode is 2.4× behind on x86 and 1.1× on arm64.
 
-The encoder is vectorised on x86 and nowhere else. The decoder is vectorised
-nowhere. Those are the two projects, and they are not equally well understood:
-the first is a port of something that works, the second is an open question
-with a large prize and no guarantee.
+The encoder is now vectorised on x86 and on arm64. The decoder is vectorised
+nowhere, and that is the work that is left. The two were never equally well
+understood: the encoder was a port of something that already worked, and the
+decoder is an open question with a large prize and no guarantee.
 
-## Project one — the NEON encoder
+## The NEON encoder
 
-arm64 gets nothing from the AVX2 encoder, and arm64 is where models are loaded.
-It is the widest single gap in the project.
+`rans_enc_body_neon` in `lmz/native/lmzcore.c`. Eight 32-bit states are what
+the format already interleaves, so this is not a new stream layout — it is the
+same arithmetic in parallel, and it writes byte-identical output. That property
+is what makes it a speed change rather than a format change, and everything
+below is arranged around keeping it.
 
-**What to copy.** `rans_enc_body_avx2` in `lmz/native/lmzcore.c`. Eight 32-bit
-states are exactly one AVX2 register and eight is what the format already
-interleaves, so the vector encoder is not a new stream layout — it is the same
-arithmetic in parallel, and it writes byte-identical output. That property is
-what makes the whole thing safe, and NEON should keep it.
+**Three things the scalar step needs replacing, and only one of them was the
+problem x86 also had.**
 
-**Three things the scalar step needs replacing.**
+*The divide* becomes a fixed-point reciprocal, after Giesen — the same one the
+AVX2 body uses, exact only while states stay below 2^31, and states reach
+`freq << 20`, so the two meet at half the probability scale. The caller checks
+the frequencies and hands anything above `RANS_SIMD_MAX_FREQ` to the scalar
+loop, whose hardware divide is exact everywhere. Frequencies below two need
+`bias = start + RANS_PROB_SCALE - 1` to make the reciprocal's off-by-one come
+out right, which keeps the lane step free of any special case. Both bodies now
+read that table from one place, because it is the part that is easy to get
+wrong.
 
-*The divide* becomes a fixed-point reciprocal, after Giesen. It is exact only
-while states stay below 2^31, and states reach `freq << 20`, so the two meet at
-half the probability scale — see `RANS_SIMD_MAX_FREQ`. The caller checks the
-frequencies and hands anything above it to the scalar loop, whose hardware
-divide is exact everywhere. Frequencies below two need `bias = start +
-RANS_PROB_SCALE - 1` to make the reciprocal's off-by-one come out right, which
-keeps the lane step free of any special case.
+*The emission mask*, because NEON has no `movemask`. The lane masks are
+unzipped down to one 16-bit element each and summed against a weight vector,
+which is a single `ADDV` — and the weights are `256 + (1 << j)` rather than
+`1 << j`, so one sum carries the shuffle's index in its low byte and the number
+of lanes that emitted above it. A mask cannot reach 256 and eight lanes cannot
+reach 65536, so the two never meet. That matters because both answers are on
+short chains that the rest of the loop waits on: the store waits for the index,
+the cursor waits for the count, and neither waits for a second reduction.
 
-*The emission.* Lanes renormalise independently, so their words must be made
-contiguous before they can be written. On AVX2 they are packed down, compacted
-to the right by a shuffle chosen from an 8-bit emission mask, and stored
-unconditionally sixteen bytes below the cursor — which is scratch, because
-encoding runs backwards, so only the cursor moves by the number of lanes that
-really emitted. NEON has `vqtbl1q_u8`, which is the shuffle. What it does not
-have is `movemask`: narrowing with `vshrn_n_u16` and extracting a lane, or a
-paired-add against a bit-weight vector, are the usual substitutes and neither
-has been measured here.
+*The variable shift*, which does not exist on NEON as such: `USHL` by a
+negative count is a right shift, so the shift is negated in a vector and
+applied left.
 
-*The table lookups.* Do not reach for a gather. On x86 three gathers reached
-1.56×, two reached 1.90×, and eight ordinary scalar loads filling the vectors
-by hand reached 1.94× — `vpgatherdd` was the slow one. NEON has no gather at
-all, which for once costs nothing.
+**Two things are cheaper here than on x86.** Packing the eight low halves into
+one register is a single `UZP1`, where AVX2 needs a shuffle and a cross-lane
+permute. And the per-symbol table is one array of 64-bit entries rather than
+two of 32-bit, so a group of eight is eight loads landing straight in a
+register, where AVX2 fills its two vectors by writing sixteen words to the
+stack and reading them back.
 
-**What to expect.** AVX2 measured 1.94× over the scalar loop, and within 3% of
-that same loop with its table lookups removed entirely — so what remains there
-is one dependency chain and not anything still on the table. NEON is 128-bit,
-so eight states is two registers rather than one, and the compaction has to
-happen twice per group. Expect less than 1.94×.
+**What it is worth.** 16 MiB planes, `scratchpad/encbench.c`, best of seven,
+against the scalar loop on the same machine in the same process:
 
-**How to know it is right.** `test_rans_vector_path_writes_the_same_bytes`
-already does the whole job: nine lengths straddling the group boundary and the
-length the vector path starts at, across five distributions, three of which take
-the vector path and two of which the frequency guard turns away. It compares
-against `kernels.rans_encode(data, portable=True)`, which forces the scalar
-body through `lmz_rans_encode_portable`. If that passes, the kernel is correct.
+| | scalar | vector | |
+|---|---|---|---|
+| **GitHub arm64, exponent plane** | 455 MiB/s | 911 MiB/s | **2.00×** |
+| **GitHub arm64, near-uniform** | 463 | 895 | **1.93×** |
+| **Apple silicon, exponent plane** | 1063 | 1340 | **1.26×** |
+| **Apple silicon, near-uniform** | 1040 | 1301 | **1.25×** |
+| GitHub x86, exponent plane (AVX2) | 395 | 1266 | 3.20× |
+| Zen 5, exponent plane (AVX2) | 811 | 1566 | 1.93× |
 
-**Where to do it.** Not from a machine that cannot compile it. An arm64 Linux
-guest on Apple silicon runs natively under Parallels and gives a compile-run
-loop of seconds; CI gives timings on arm64 but a three-minute round trip, which
-is not a development loop for SIMD.
+Which is the same kernel varying by a factor of two across two arm64 machines,
+and the same AVX2 kernel varying by 1.7× across two x86 ones. The reason is
+visible in the scalar column: **a machine with a fast integer divider has less
+to win**, because the divide is what the vector path removes. Apple silicon
+runs the scalar encoder at 1063 MiB/s, faster than any other machine here runs
+it, and takes the smallest speedup as a result. The old estimate in this
+document — "expect less than 1.94×" — was wrong on one machine and right on the
+other, for a reason that has nothing to do with NEON being 128-bit.
 
-## Project two — the vector decoder
+On the whole compress pipeline, 64 MiB of BF16 through `lmz bench`, arm64:
+**330 MiB/s before, 455 after**, with `zstd -1` measured in the same process at
+666 both times — so that is the pipeline gaining 38%, not the runner having a
+good day. Decompression is untouched at 468 → 471. Apple silicon gains about
+30% on the same measurement, more noisily.
+
+**One arrangement was measured and kept.** `x + bias + q * cmpl` was three
+instructions deep behind the quotient, and the quotient is what everything
+waits for. `x + bias` does not need the quotient, so it goes in the accumulator
+and `MLA` does the rest, which leaves one instruction on the chain instead of
+three. Worth nothing on the GitHub arm64 runner (2.00× either way) and a great
+deal on Apple silicon, where the near-uniform plane went from **1.04× to
+1.25×** — that is, from a wash to a real speedup. A latency-bound machine and a
+throughput-bound one do not respond to the same change, and there is no way to
+find that out except on both.
+
+**What was not separately measured.** The 64-bit table and the single-`ADDV`
+mask were reasoned about and then shipped inside a kernel that was measured as
+a whole; neither was held against the alternative on hardware. If the decoder
+work makes either look wrong, they are worth pricing on their own.
+
+## How the arm64 kernel is checked without an arm64 machine
+
+`scratchpad/neonshim/arm_neon.h` is an `arm_neon.h` written in plain C —
+only the intrinsics `lmzcore.c` actually names, each one written to the
+definition the ARM intrinsics reference gives it. `-DLMZ_FORCE_NEON` makes the
+kernel include that instead of the real one:
+
+```
+cc -O2 -DLMZ_FORCE_NEON -Iscratchpad/neonshim -o encbench-neon \
+    scratchpad/encbench.c && ./encbench-neon
+```
+
+The source under test is the shipped file, unmodified, compiled down its arm64
+path. What comes out is the real byte stream — lane order, emission mask,
+compaction and arithmetic are all decided by the source — so the comparison
+against the scalar loop is the real comparison. Only the timings are
+meaningless, and the tool says so on the line it prints.
+
+The same trick runs the *whole Python suite* against the arm64 kernel. Build
+the library by hand into the name `lmz/native/build.py` would give it, and it
+is loaded rather than built:
+
+```
+cc -O2 -fPIC -shared -DLMZ_FORCE_NEON -Iscratchpad/neonshim \
+    -o "$(python -c 'from lmz.native import build; print(build.library_path())')" \
+    lmz/native/lmzcore.c
+python -c "from lmz import kernels; print(kernels.backend())"   # native:neon
+python tests/test_lmz.py                                        # 91/91
+```
+
+Do that in a copy of the tree. The library's name is a hash of the source, so a
+shim build and a real build claim the same file, and one left behind is slow,
+correct, and very hard to notice.
+
+None of this replaces an arm64 machine for *tuning* — the two arrangements
+above were separated by a CI round trip each, and that is a bad development
+loop for a third or a tenth. It replaces it for correctness, which is the part
+that has to hold everywhere.
+
+## The project — the vector decoder
 
 **The prize is large and it is measured.** Replay the table indices from a
 recorded run instead of computing them — same loads, same store, same
@@ -108,8 +176,16 @@ of sixteen, and that arrangement is the one that loses hardest.
 Encoding compacts — a variable number of lanes each contribute a word to a
 contiguous run. Decoding *expands* — a variable number of lanes each take a
 word from a contiguous run, in lane order. AVX-512 has `vpexpandd` for exactly
-this; AVX2 needs a 256-entry shuffle table, the inverse of the encoder's; NEON
-needs the table plus a `movemask` substitute, as above.
+this; AVX2 needs a 256-entry shuffle table, the inverse of the encoder's
+`rans_compact_table`; NEON needs that table and `vqtbl1q_u8`, whose
+out-of-range-selects-zero rule lets the same 0x80 fill serve both ISAs.
+
+What the encoder settles for it: the mask is no longer an open question. `UZP1`
+down to 16-bit lanes and one weighted `ADDV` produces both the table index and
+the population count, and on the encoder that chain was never what the loop
+waited on. The decoder will lean on it harder — there it is per group, on the
+critical path, and the vector-to-general-register transfer is the part to
+watch.
 
 **Honest expectation.** Somewhere between 1.5× and 2.5× on 70% of decode, and
 that is a guess rather than a measurement. A gather adds latency to every
@@ -148,8 +224,20 @@ because a comparison of different bytes is worse than no comparison. It builds
 with `cc -O3 -o coderbench scratchpad/coderbench.c` and takes the core clock in
 GHz as an optional argument for cycles per byte.
 
-Push a branch named `bench…` and `.github/workflows/bench.yml` runs the whole
-pipeline on x86, arm64 and macOS runners. `LMZ_NO_NATIVE=1` forces the numpy
+`scratchpad/encbench.c` asks the two questions a vector encoder has to answer —
+does it write the scalar loop's bytes, and is it faster — and it compiles the
+shipped kernel itself rather than a copy, so it cannot drift from it. It uses
+the same generator and the same seed as `coderbench`, so the two print the same
+plane digests. It also counts how many of its inputs were *eligible* for the
+vector body, because two encoders agreeing while both run the scalar loop is
+not evidence of anything, and that is a quiet way for a check like this to pass
+forever.
+
+Every CI job runs it twice, natively and through the shim, so the arm64 encoder
+is checked on every machine in the matrix rather than on the two that are
+arm64. Push a branch named `bench…` and `.github/workflows/bench.yml` runs the
+whole pipeline, and `encbench` natively, on x86, arm64 and macOS runners —
+which is where the numbers above come from. `LMZ_NO_NATIVE=1` forces the numpy
 and pure-Python fallbacks. `lmz bench <file> --methods` shows which coder
 actually earned the bytes.
 
@@ -166,6 +254,11 @@ A whole roadmap was built on that number before it was caught.
 refills before any of their addresses is worth +11% on Zen 5 and −12% on Apple
 silicon, where the serial cursor is the fastest decoder of the three machines
 measured. It shipped on the x86 number alone and had to be made conditional
-afterwards. The `bench…` branch trigger makes checking both architectures
-nearly free; the cost of not checking is a regression on the platform people
-actually run models on.
+afterwards.
+
+The NEON encoder is the same lesson from the other side. The same kernel is
+worth 2.00× on the GitHub arm64 runner and 1.26× on Apple silicon; the one
+instruction it was tuned by is worth nothing on the first and 20% on the
+second. Neither machine would have predicted the other, and neither number is
+wrong. The `bench…` branch trigger makes checking both nearly free; the cost of
+not checking is a regression on the platform people actually run models on.

@@ -73,6 +73,21 @@ jobs:
       - name: Report the active backends
         run: python -m lmz doctor
 
+      # The vector encoders have to write byte for byte what the scalar loop
+      # writes, or an archive depends on the machine that made it. That is
+      # checked for whichever one this machine has -- and then for the arm64
+      # one as well, on every machine, because scratchpad/neonshim stands a
+      # portable arm_neon.h in front of the kernel's include and the shipped
+      # source compiles down its NEON path anywhere. Only the timings from
+      # that second build are meaningless; the bytes are the real ones.
+      - name: The vector encoder writes the scalar loop's bytes
+        run: |
+          cc -O3 -o encbench scratchpad/encbench.c
+          ./encbench
+          cc -O2 -DLMZ_FORCE_NEON -Iscratchpad/neonshim -o encbench-neon \
+              scratchpad/encbench.c
+          ./encbench-neon
+
       # A kernel that fails to build is silent on purpose: lmz falls back to
       # Python and keeps working. That is right for users and useless for CI --
       # without this, the two jobs added to cover NEON would go green while

@@ -23,12 +23,34 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(__x86_64__) || defined(__i386__)
+/*
+ * LMZ_FORCE_NEON is how the arm64 kernels get checked on a machine that is not
+ * arm64: a harness puts its own arm_neon.h in front of this include and the
+ * shipped source, unmodified, compiles down the arm64 path. Correctness is
+ * then testable everywhere and only the timings need real hardware --
+ * scratchpad/neonshim is that harness. Nothing defines this in a normal build.
+ */
+#if defined(LMZ_FORCE_NEON)
+#define LMZ_NEON 1
+#include <arm_neon.h>
+#elif defined(__x86_64__) || defined(__i386__)
 #define LMZ_X86 1
 #include <immintrin.h>
 #elif defined(__aarch64__) || defined(__ARM_NEON)
 #define LMZ_NEON 1
 #include <arm_neon.h>
+#endif
+
+/*
+ * The vector encoder needs what aarch64 added to NEON and 32-bit ARM never
+ * had: a sixteen-byte table lookup, an across-vector add, and the paired
+ * unzips. Big-endian would also lay the emitted words down in the wrong
+ * order. Both cases fall through to the scalar body, which is correct
+ * everywhere.
+ */
+#if LMZ_NEON && (defined(__aarch64__) || defined(LMZ_FORCE_NEON)) \
+    && !defined(__ARM_BIG_ENDIAN)
+#define LMZ_NEON_ENC 1
 #endif
 
 #define LMZ_API __attribute__((visibility("default")))
@@ -956,6 +978,74 @@ static uint8_t *rans_enc_body(const uint8_t *src, size_t n, uint8_t *end,
     return ptr;
 }
 
+/*
+ * Tables the vector encoders share.
+ *
+ * Both ISAs want the same three numbers per symbol and the same shuffle per
+ * emission pattern; what differs is only how they are laid out in a register.
+ * So the parts that are easy to get wrong -- the fixed-point reciprocal, and
+ * what a frequency below two does to it -- are written once and read twice.
+ */
+#if LMZ_X86 || LMZ_NEON_ENC
+
+/*
+ * freq, bias and the reciprocal's shift share one word, so a lane needs two
+ * loads rather than four; the complement is 4096 - freq and is computed rather
+ * than stored.
+ */
+static void rans_simd_tables(const uint16_t *freqs, uint32_t *packed,
+                             uint32_t *rcp)
+{
+    uint32_t start = 0;
+    for (int s = 0; s < 256; s++) {
+        uint32_t f = freqs[s], bias = start, r, sh;
+        if (f < 2) {
+            /* A quotient of x itself is not something the reciprocal can
+             * express, so it comes out one low and the bias makes up the
+             * difference. That keeps the lane step free of any special case. */
+            r = ~0u;
+            sh = 0;
+            bias = start + RANS_PROB_SCALE - 1;
+        } else {
+            sh = 0;
+            while (f > (1u << sh)) sh++;
+            r = (uint32_t)((((uint64_t)1 << (sh + 31)) + f - 1) / f);
+            sh -= 1;
+        }
+        packed[s] = (f ? f : 1u) | (bias << 12) | (sh << 28);
+        rcp[s] = r;
+        start += f;
+    }
+}
+
+/*
+ * One shuffle control per emission pattern. Lane j's two bytes are sent to
+ * slot 8 - popcount(m) + (how many lower lanes emitted), which leaves the
+ * words that really emitted contiguous, right-aligned in sixteen bytes and in
+ * lane order -- the order the scalar loop writes them in. 0x80 selects a zero
+ * byte on both ISAs, x86 because the high bit is set and NEON because the
+ * index is outside the table, and those bytes land where nothing is kept.
+ *
+ * Built per call for the same reason the decoder builds its table per call: a
+ * heap allocation would sit in the hot path of every plane of every chunk, and
+ * this is 4 KiB of stack against a plane measured in megabytes.
+ */
+static void rans_compact_table(uint8_t compact[256][16])
+{
+    for (unsigned m = 0; m < 256; m++) {
+        int slot = 8 - __builtin_popcount(m);
+        for (int b = 0; b < 16; b++) compact[m][b] = 0x80;
+        for (int j = 0; j < 8; j++) {
+            if (!(m & (1u << j))) continue;
+            compact[m][2 * slot] = (uint8_t)(2 * j);
+            compact[m][2 * slot + 1] = (uint8_t)(2 * j + 1);
+            slot++;
+        }
+    }
+}
+
+#endif /* LMZ_X86 || LMZ_NEON_ENC */
+
 #if LMZ_X86
 
 __attribute__((target("avx2")))
@@ -999,46 +1089,11 @@ __attribute__((target("avx2")))
 static uint8_t *rans_enc_body_avx2(const uint8_t *src, size_t n, uint8_t *end,
                                    const RansEncSym *syms, const uint16_t *freqs)
 {
-    /* freq, bias and the reciprocal's shift share one word, so a group needs
-     * two vector loads rather than four; the complement is 4096 - freq and is
-     * computed rather than stored. */
     uint32_t packed[256], rcp[256];
-    uint32_t start = 0;
-    for (int s = 0; s < 256; s++) {
-        uint32_t f = freqs[s], bias = start, r, sh;
-        if (f < 2) {
-            /* A quotient of x itself is not something the reciprocal can
-             * express, so it comes out one low and the bias makes up the
-             * difference. That keeps the lane step free of any special case. */
-            r = ~0u;
-            sh = 0;
-            bias = start + RANS_PROB_SCALE - 1;
-        } else {
-            sh = 0;
-            while (f > (1u << sh)) sh++;
-            r = (uint32_t)((((uint64_t)1 << (sh + 31)) + f - 1) / f);
-            sh -= 1;
-        }
-        packed[s] = (f ? f : 1u) | (bias << 12) | (sh << 28);
-        rcp[s] = r;
-        start += f;
-    }
-
-    /* One shuffle control per emission pattern, built here for the same reason
-     * the decoder builds its table here: a per-call heap allocation would sit
-     * in the hot path of every plane of every chunk, and this is 4 KiB of
-     * stack against a plane measured in megabytes. */
+    rans_simd_tables(freqs, packed, rcp);
     uint8_t compact[256][16];
-    for (unsigned m = 0; m < 256; m++) {
-        int slot = 8 - __builtin_popcount(m);
-        for (int b = 0; b < 16; b++) compact[m][b] = 0x80;
-        for (int j = 0; j < 8; j++) {
-            if (!(m & (1u << j))) continue;
-            compact[m][2 * slot] = (uint8_t)(2 * j);
-            compact[m][2 * slot + 1] = (uint8_t)(2 * j + 1);
-            slot++;
-        }
-    }
+    rans_compact_table(compact);
+
     /* The low half of each 32-bit lane, four to a 128-bit half. */
     static const uint8_t pack_ctl[32] = {
         0, 1, 4, 5, 8, 9, 12, 13, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
@@ -1105,6 +1160,147 @@ static uint8_t *rans_enc_body_avx2(const uint8_t *src, size_t n, uint8_t *end,
 
 #endif /* LMZ_X86 */
 
+#if LMZ_NEON_ENC
+
+static inline uint32x4_t rans_mulhi_u32(uint32x4_t a, uint32x4_t b)
+{
+    /* Two widening multiplies, and then the odd 32-bit elements of a pair of
+     * 64-bit products are exactly their high halves. */
+    uint64x2_t lo = vmull_u32(vget_low_u32(a), vget_low_u32(b));
+    uint64x2_t hi = vmull_u32(vget_high_u32(a), vget_high_u32(b));
+    return vuzp2q_u32(vreinterpretq_u32_u64(lo), vreinterpretq_u32_u64(hi));
+}
+
+/* A symbol's whole table entry, both words, in one d-register load. */
+static inline uint32x4_t rans_pair(const uint64_t *tab, unsigned a, unsigned b)
+{
+    return vreinterpretq_u32_u64(vcombine_u64(vld1_u64(tab + a),
+                                              vld1_u64(tab + b)));
+}
+
+/*
+ * The same eight states, stepped eight at a time: the AVX2 body above, on
+ * arm64, writing byte for byte what the scalar loop writes. That is what makes
+ * either of them a speed change rather than a format change, and arm64 is
+ * where models are actually loaded.
+ *
+ * Eight 32-bit states are two 128-bit registers rather than one, so the lane
+ * step is written twice over independent halves. That costs issue slots, not
+ * latency -- the two halves are two chains, and the machine has room for both.
+ *
+ * Three things have no NEON instruction, and only one of them is the problem
+ * x86 also had:
+ *
+ *   the divide, which becomes the same fixed-point reciprocal, exact over the
+ *   same range, declined by the same check in the caller;
+ *
+ *   the emission mask, because NEON has no movemask. The lane masks are
+ *   unzipped down to one 16-bit element each and summed against a weight
+ *   vector, which is a single across-vector add -- and the weights carry 256
+ *   as well as 1 << j, so one sum holds the shuffle's index in its low byte
+ *   and the count of lanes that emitted above it. The cursor waits on the
+ *   second and the store waits on the first, and neither waits on a second
+ *   reduction;
+ *
+ *   the variable shift, which is a left shift by a negative count.
+ *
+ * Two things are cheaper here than on x86. Packing the eight low halves into
+ * one register is a single unzip, where AVX2 needs a shuffle and a cross-lane
+ * permute; and one table of 64-bit entries means a group is eight loads that
+ * land in a register directly, where AVX2 fills its two vectors by writing
+ * sixteen words to the stack and reading them back.
+ */
+static uint8_t *rans_enc_body_neon(const uint8_t *src, size_t n, uint8_t *end,
+                                   const RansEncSym *syms, const uint16_t *freqs)
+{
+    uint64_t tab[256];
+    {
+        /* One table of 64-bit entries rather than two of 32-bit: a symbol's
+         * whole entry then arrives in one load, so a group of eight costs
+         * eight of them instead of sixteen. */
+        uint32_t packed[256], rcp[256];
+        rans_simd_tables(freqs, packed, rcp);
+        for (int s = 0; s < 256; s++)
+            tab[s] = (uint64_t)packed[s] | ((uint64_t)rcp[s] << 32);
+    }
+    uint8_t compact[256][16];
+    rans_compact_table(compact);
+
+    /* 1 << j for the emission mask, 256 for the count of lanes that emitted.
+     * The mask cannot reach 256 and eight counts cannot reach 65536, so one
+     * 16-bit sum carries both without them meeting. */
+    static const uint16_t weights[8] = {257, 258, 260, 264, 272, 288, 320, 384};
+
+    uint8_t *ptr = end;
+    uint32_t state[RANS_STREAMS];
+    for (int k = 0; k < RANS_STREAMS; k++) state[k] = RANS_L;
+
+    /* The ragged tail, exactly where the scalar loop meets it. */
+    size_t i = n;
+    while (i > 0 && (i & (RANS_STREAMS - 1))) {
+        i--;
+        rans_enc_put(&state[i & (RANS_STREAMS - 1)], &ptr, &syms[src[i]]);
+    }
+
+    uint32x4_t xa = vld1q_u32(state), xb = vld1q_u32(state + 4);
+    const uint32x4_t m12 = vdupq_n_u32(0xFFF);
+    const uint32x4_t m16 = vdupq_n_u32(0xFFFF);
+    const uint32x4_t scale = vdupq_n_u32(RANS_PROB_SCALE);
+    const uint16x8_t wt = vld1q_u16(weights);
+
+    while (i >= RANS_STREAMS) {
+        i -= RANS_STREAMS;
+        const uint8_t *sy = src + i;
+        uint32x4_t t0 = rans_pair(tab, sy[0], sy[1]);
+        uint32x4_t t1 = rans_pair(tab, sy[2], sy[3]);
+        uint32x4_t t2 = rans_pair(tab, sy[4], sy[5]);
+        uint32x4_t t3 = rans_pair(tab, sy[6], sy[7]);
+        uint32x4_t pka = vuzp1q_u32(t0, t1), rca = vuzp2q_u32(t0, t1);
+        uint32x4_t pkb = vuzp1q_u32(t2, t3), rcb = vuzp2q_u32(t2, t3);
+
+        uint32x4_t fa = vandq_u32(pka, m12), fb = vandq_u32(pkb, m12);
+        uint32x4_t ba = vandq_u32(vshrq_n_u32(pka, 12), m16);
+        uint32x4_t bb = vandq_u32(vshrq_n_u32(pkb, 12), m16);
+        int32x4_t sa = vnegq_s32(vreinterpretq_s32_u32(vshrq_n_u32(pka, 28)));
+        int32x4_t sb = vnegq_s32(vreinterpretq_s32_u32(vshrq_n_u32(pkb, 28)));
+        uint32x4_t ca = vsubq_u32(scale, fa), cb = vsubq_u32(scale, fb);
+
+        /* x >= freq << 20 is exactly (x >> 20) >= freq. */
+        uint32x4_t na = vcgeq_u32(vshrq_n_u32(xa, RANS_XSHIFT), fa);
+        uint32x4_t nb = vcgeq_u32(vshrq_n_u32(xb, RANS_XSHIFT), fb);
+
+        /* Every lane's mask narrowed to one 16-bit element, then weighed. */
+        uint16x8_t nm = vuzp1q_u16(vreinterpretq_u16_u32(na),
+                                   vreinterpretq_u16_u32(nb));
+        unsigned sum = vaddvq_u16(vandq_u16(nm, wt));
+
+        /* The same unzip on the states themselves is the pack: the low half
+         * of all eight, in lane order, in one register. */
+        uint8x16_t w = vreinterpretq_u8_u16(
+            vuzp1q_u16(vreinterpretq_u16_u32(xa), vreinterpretq_u16_u32(xb)));
+        vst1q_u8(ptr - 16, vqtbl1q_u8(w, vld1q_u8(compact[sum & 0xFF])));
+        ptr -= 2 * (sum >> 8);
+
+        xa = vbslq_u32(na, vshrq_n_u32(xa, 16), xa);
+        xb = vbslq_u32(nb, vshrq_n_u32(xb, 16), xb);
+        uint32x4_t qa = vshlq_u32(rans_mulhi_u32(xa, rca), sa);
+        uint32x4_t qb = vshlq_u32(rans_mulhi_u32(xb, rcb), sb);
+        /* x + bias + q * cmpl, arranged so only the multiply-accumulate is
+         * on the chain: x + bias is ready long before q is, and folding the
+         * bias into the accumulator leaves one instruction between the
+         * quotient and the next state instead of three. */
+        xa = vmlaq_u32(vaddq_u32(xa, ba), qa, ca);
+        xb = vmlaq_u32(vaddq_u32(xb, bb), qb, cb);
+    }
+
+    vst1q_u32(state, xa);
+    vst1q_u32(state + 4, xb);
+    for (int k = RANS_STREAMS - 1; k >= 0; k--) rans_enc_flush(&state[k], &ptr);
+    return ptr;
+}
+
+#endif /* LMZ_NEON_ENC */
+
 /*
  * Encode `n` bytes. Returns the stream length, or -1 if it does not fit.
  * The layout is [header][4 initial states][coded bytes].
@@ -1157,6 +1353,11 @@ static long rans_encode_impl(const uint8_t *src, size_t n, uint8_t *dst,
     if (allow_simd && lmz_have_avx2() && maxf <= RANS_SIMD_MAX_FREQ
             && n >= RANS_SIMD_MIN)
         ptr = rans_enc_body_avx2(src, n, end, syms, freqs);
+    else
+#elif LMZ_NEON_ENC
+    /* No runtime check: NEON is not optional on arm64, it is the baseline. */
+    if (allow_simd && maxf <= RANS_SIMD_MAX_FREQ && n >= RANS_SIMD_MIN)
+        ptr = rans_enc_body_neon(src, n, end, syms, freqs);
     else
 #endif
     {

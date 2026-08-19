@@ -6,6 +6,11 @@ lmz/native/lmzcore-*.so
 lmz/native/lmzcore-*.dylib
 lmz/native/lmzcore-*.dll
 
+# Built by hand from scratchpad/ when a coder question comes up.
+coderbench
+encbench
+encbench-neon
+
 *.lmz
 build/
 dist/

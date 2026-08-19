@@ -62,3 +62,13 @@ jobs:
       - name: Which coder did the work here
         run: |
           python -m lmz bench model.safetensors --bytes 64MiB --methods
+
+      # The entropy coder on its own, away from the I/O and the planner: what
+      # the vector encoder is worth against the same scalar loop, on the same
+      # machine, in the same run. A ratio measured that way survives a shared
+      # runner in a way an absolute rate does not -- and it is the only way to
+      # ask the question at all for arm64 and Darwin.
+      - name: The vector encoder, against the loop it replaces
+        run: |
+          cc -O3 -o encbench scratchpad/encbench.c
+          ./encbench
