@@ -330,6 +330,18 @@ def _encode_stream(buf, level: int, method: int, plane: bool = False, sink=None,
     n = len(buf)
     if n == 0:
         return entropy.METHOD_STORED, b""
+    if hist is None and plane and kernels.have_rans():
+        # No caller-supplied counts, so the sample decides whether this is
+        # noise -- and noise is stored here without ever being counted, which
+        # is most of what the sample is for. Anything that survives it is going
+        # to be counted anyway, by the coder if not here, so counting it now
+        # costs nothing and buys the exact price below. Streams that cannot pay
+        # then never reach the coder at all.
+        if estimate_entropy(buf) >= NOISE_BITS:
+            if sink is not None:
+                sink.add(entropy.METHOD_STORED, n, n)
+            return entropy.METHOD_STORED, buf
+        hist = kernels.histogram(buf)
     cost = _rans_cost(hist, n) if hist is not None else None
     if cost is not None:
         hopeless = cost + _min_gain(n) >= n
