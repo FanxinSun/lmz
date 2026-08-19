@@ -90,27 +90,38 @@ them, and the scales hold most of what is left: on Q4_K the fp16 `d`/`dmin`
 planes are 46–51% recoverable and the packed sub-scales 16%, against 3.5% for
 the quants that are 89% of the file.
 
-**Throughput**, 1.09 GiB Llama shard, RAM-backed filesystem, including all I/O
+**Throughput**, 1.119 GiB BF16 shard, RAM-backed filesystem, including all I/O
 and per-chunk checksums, best of 3:
 
 | threads | compress | decompress |
 |---|---|---|
-| 1 | 0.31 GiB/s | 0.35 GiB/s |
-| 4 | 1.18 GiB/s | 1.18 GiB/s |
-| 8 | **1.92 GiB/s** | **1.76 GiB/s** |
-| 16 | 1.71 GiB/s | 1.64 GiB/s |
+| 1 | 0.58 GiB/s | 0.40 GiB/s |
+| 2 | 1.28 GiB/s | 0.77 GiB/s |
+| 4 | **2.00 GiB/s** | 1.44 GiB/s |
+| 6 | 1.95 GiB/s | 1.65 GiB/s |
+| 8 | 1.87 GiB/s | **1.88 GiB/s** |
+| 12 | 1.81 GiB/s | 1.67 GiB/s |
+| 16 | 1.70 GiB/s | 1.53 GiB/s |
 
-Exponent conditioning costs ~20% single-threaded next to v0.1's plain field
-split; at 8 threads the job is memory-bound and the difference disappears.
+A synthetic shard here rather than the Llama one the ratio rows use, so that
+the conditions are reproducible by anyone:
+`tests/make_model.py --dtype bf16 --layers 7 --hidden 2048 --seed 7` builds it,
+and it codes at 32.9% against the real shard's 34.7%. Timed in-process, because
+starting an interpreter costs more than a tenth of a second and the fast rows
+here take less than a second in total.
+
+Compress peaks at four threads and decompress at eight; both used to peak at
+eight. The ceiling has not moved — about 2 GiB/s either way, with source,
+archive and output all in flight and the job memory-bandwidth bound. What moved
+is the work: a thread spends about half the cycles per byte it used to, so half
+as many threads reach the same wall, and the ones past it cost a little rather
+than earning anything.
+
 For scale, ZipNN publishes 1.15 GB/s compress and 1.65 GB/s decompress on this
-model — so lmz is ahead on ratio and on both speeds, though that comparison
-crosses different hardware and should be read loosely.
-
-Throughput peaks at 8 threads and falls off after: with source, archive and
-output all in flight the job goes memory-bandwidth bound. On ordinary disks
-the limit arrives sooner still — writing to ext4 with an fsync runs entirely
-I/O bound, which is the point. The archive is a third smaller, so a
-storage-bound load moves a third fewer bytes.
+model, though that comparison crosses different hardware and should be read
+loosely. On ordinary disks the limit arrives sooner than any row above: writing
+to ext4 with an fsync runs entirely I/O bound, which is the point. The archive
+is a third smaller, so a storage-bound load moves a third fewer bytes.
 
 **Other dtypes** (synthetic checkpoints, `./lmz-cli bench <file>` reproduces
 any row):
