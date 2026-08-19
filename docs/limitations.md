@@ -95,7 +95,7 @@
 python3 tests/test_lmz.py          # also runs under pytest
 ```
 
-81 tests covering kernel equivalence across all backends, element sizes and
+91 tests covering kernel equivalence across all backends, element sizes and
 block periods,
 rANS round-trips over adversarial distributions (including single-symbol
 streams, which exposed a frequency-field overflow), rANS landing within 2% of

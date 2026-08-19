@@ -50,6 +50,22 @@ most of the margin comes from: store a tensor once when a directory ships it
 twice, code a checkpoint as the difference from the one before it, and split
 on a float's own bit-fields instead of byte boundaries.
 
+## What it costs to do that
+
+A 1.12 GiB BF16 shard, RAM-backed, including all I/O and per-chunk checksums:
+
+| threads | compress | decompress |
+|---|---|---|
+| 1 | 0.58 GiB/s | 0.40 GiB/s |
+| 4 | **2.00 GiB/s** | 1.44 GiB/s |
+| 8 | 1.87 GiB/s | **1.88 GiB/s** |
+
+`zstd -1` still compresses about 1.5× faster than lmz does, and saves twelve
+points less. Past four threads lmz is not CPU-bound any more: it runs into the
+memory bus at about 2 GiB/s, and it reaches that at four threads where it used
+to need eight. On real storage the disk arrives before either of them, and the
+archive is a third smaller, so a storage-bound load moves a third fewer bytes.
+
 ## Where it is not worth it
 
 Stated plainly, because a compressor that only advertises its wins should not
@@ -92,7 +108,9 @@ or [Alipay](assets/alipay.jpg) (打开支付宝，扫一扫). Thank you.
 - [**Using lmz**](docs/usage.md) — command line, Python API, the mount and the
   filesystem
 - [**Limitations**](docs/limitations.md) — where it does not pay, and what the
-  81 tests check
+  91 tests check
+- [**Vectorising the coder**](docs/vectorising-the-coder.md) — the two pieces of
+  work still open, and the six that were tried and measured out flat
 
 Python 3.10+, no runtime dependencies. zstd comes from the standard library on
 3.14+; a C compiler, if present, is used once to build the SIMD kernel into the
