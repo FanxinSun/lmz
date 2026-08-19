@@ -279,19 +279,37 @@ def test_bf16_field_split_roundtrip():
         assert bytes(back) == src, f"bf16 merge mismatch at n={n}"
 
 
-def test_bf16_chunk_beats_byte_split():
-    """The field split should encode real BF16 weights smaller than a byte split."""
-    data = weights_bf16(400000, 7)
+def test_bf16_conditioning_beats_a_byte_split():
+    """What earns the BF16 path its ratio is the conditioning, not the split.
+
+    Splitting on the field boundary rather than the byte boundary moves almost
+    nothing on its own. It puts the whole exponent in one plane and sign with
+    mantissa in the other, where a byte split puts the sign alongside the
+    exponent's high bits and leaves its low bit with the mantissa -- and
+    measured across several distributions the two land within a few tenths of a
+    percent, falling either way. This assertion used to be made on the split
+    alone and passed by four bytes on 530 KiB, which is a coin flip rather than
+    a property.
+
+    The win is in coding the sign+mantissa plane against the exponent, and that
+    needs the rANS coder and a chunk with elements enough to pay for one
+    frequency table per bucket. Given both, it is worth about 7% here and is
+    asserted with a margin clear of noise, so that losing the conditioning fails
+    rather than squeaks through.
+    """
+    if not kernels.have_rans():
+        return
+    data = weights_bf16_cond(1_200_000, 7)
     field = codec.encode_chunk(data, 2, 1, False, kind=planner.KIND_BF16)
     byte = codec.encode_chunk(data, 2, 1, False, kind=planner.KIND_BYTES)
     size = lambda r: sum(len(p) for p in r[0])  # noqa: E731
-    assert field[1] == lmzformat.CODEC_BF16, field[1]
+    assert field[1] == lmzformat.CODEC_BF16C, field[1]
     assert byte[1] == lmzformat.CODEC_SPLIT, byte[1]
     for parts, cid, flags, crc in (field, byte):
         payload = b"".join(bytes(p) for p in parts)
         got = codec.decode_chunk(payload, cid, 2, flags, len(data), crc, True)
         assert bytes(got) == data
-    assert size(field) <= size(byte), (size(field), size(byte))
+    assert size(field) < size(byte) * 0.97, (size(field), size(byte))
 
 
 def test_rans_adversarial_distributions():
