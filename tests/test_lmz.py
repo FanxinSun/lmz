@@ -2295,6 +2295,31 @@ def test_gpu_decode_over_distributions_and_shapes():
     assert checked >= 20, f"only {checked} shapes actually ran"
 
 
+def test_gpu_verify_reports_this_machine():
+    """`lmz doctor --gpu-verify` is the field report, so it has to be right.
+
+    It is the one thing a stranger with a Turing card will run, and its answer
+    is the only evidence that will ever exist for that architecture. A verdict
+    that is wrong in either direction is worse than no command at all.
+    """
+    from lmz import gpu
+
+    ok, why = gpu.available()
+    r = gpu.verify(quick=True)
+    assert r["lmz"] == lmz.__version__
+    if not ok:
+        assert r["ok"] is False and r["device"] is None and r["why"]
+        raise Skip(f"no GPU decoder: {why}")
+    assert r["ok"] is True, r["failures"]
+    assert r["checked"] >= 5 and not r["failures"]
+    assert r["gbps"] and r["gbps"] > 0
+
+    out = subprocess.run([*CLI, "doctor", "--gpu-verify"], capture_output=True,
+                         text=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "byte-identical" in out.stdout and "verdict  OK" in out.stdout
+
+
 def test_gpu_refuses_a_device_that_disagrees_with_the_cpu():
     """A card whose answer differs from the CPU's is not used at all.
 

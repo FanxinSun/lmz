@@ -99,6 +99,20 @@ and `lmz doctor` names it. The kernel is clean under `compute-sanitizer` and
 compiles for sm_75 through sm_121, but it has only ever been *run* on one
 card, so it verifies rather than assumes.
 
+**If you have a GPU that is not a Blackwell, this is worth thirty seconds:**
+
+```
+lmz doctor --gpu-verify
+```
+
+It decodes thirty awkward distributions and batch shapes and checks lmz's own
+CPU decoder agrees with every byte. **Turing is the one that matters most**:
+`cp.async` has no instruction there, so the intrinsic compiles to a
+synchronous copy and Turing runs genuinely different code from everything
+above it — and a free Colab or Kaggle T4 is exactly that card. Paste the block
+into [an issue](https://github.com/FanxinSun/lmz/issues) either way. A pass is
+evidence too, and right now there is one card's worth of it.
+
 **CUDA is optional in every direction.** The wheel is pure Python, carries a
 `.cu` and no CUDA, and installing needs no toolkit. `nvcc`, if it is there, is
 used once to build the decoder into the package directory — the same bargain
@@ -154,7 +168,7 @@ or [Alipay](assets/alipay.jpg) (打开支付宝，扫一扫). Thank you.
 - [**Using lmz**](docs/usage.md) — command line, Python API, the mount and the
   filesystem
 - [**Limitations**](docs/limitations.md) — where it does not pay, and what the
-  97 tests check
+  98 tests check
 - [**Vectorising the coder**](docs/vectorising-the-coder.md) — how the encoder
   reached arm64, the one piece of work still open, and the six that were tried
   and measured out flat

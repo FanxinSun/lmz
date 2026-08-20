@@ -22,7 +22,7 @@ import os
 import threading
 
 __all__ = ["available", "backend", "decode_batch", "grain", "header_bytes",
-           "last_error", "pad_bytes", "state"]
+           "last_error", "pad_bytes", "state", "verify"]
 
 # Kept in step with ABI_VERSION in lmzgpu.cu. A library built from an older
 # source is ignored rather than called with the wrong argument list.
@@ -209,6 +209,101 @@ def header_bytes() -> int:
 def pad_bytes() -> int:
     """Readable slack the kernel prefetches past the last stream."""
     return _const("lmz_gpu_pad_bytes", 576)
+
+
+# Byte-value distributions that break frequency tables, as translate() tables
+# over uniform random bytes -- exact shapes at C speed. Shared with the test
+# suite's idea of what is worth checking.
+_SHAPES = {
+    "single symbol": bytes([0x5A]) * 256,
+    "two symbols": bytes([0x01]) * 128 + bytes([0xFE]) * 128,
+    "near uniform": bytes(range(256)),
+    "dominant + tail": bytes([0x20]) * 250 + bytes(range(6)),
+    "skewed": bytes([0x40]) * 170 + bytes(range(16)) * 5 + bytes([0x7F]) * 6,
+}
+
+
+def verify(quick: bool = False) -> dict:
+    """Decode every awkward shape on this device and check the CPU agrees.
+
+    The kernel has been *run* on one architecture. It is sanitizer-clean and
+    compiles from sm_75 to sm_121, but Turing gets genuinely different code --
+    cp.async has no instruction there and the intrinsic falls back to a
+    synchronous copy -- so an untested card is not merely untested hardware.
+
+    This exists so anyone holding one can settle it in a few seconds and paste
+    the answer. It needs no data files and no network: the streams are built
+    by lmz's own encoder here and checked against lmz's own decoder, so the
+    oracle travels with the question.
+    """
+    import random
+    import struct
+    import time
+
+    from .. import __version__, kernels
+
+    report = {"lmz": __version__, "device": None, "ok": False, "checked": 0,
+              "failures": [], "gbps": None, "why": ""}
+    ok, why = available()
+    if not ok:
+        report["why"] = why
+        return report
+    report["device"] = backend().removeprefix("cuda:")
+    if not kernels.have_rans():
+        report["why"] = "no native coder, so there is nothing to check against"
+        return report
+
+    def batch(table, plane, nstr, seed):
+        rnd = random.Random(seed)
+        bufs, streams, offsets = [], bytearray(), bytearray()
+        for _ in range(nstr):
+            buf = rnd.randbytes(plane).translate(table)
+            coded = kernels.rans_encode(buf, kernels.histogram(buf))
+            if coded is None:
+                return None
+            offsets += struct.pack("<QQ", len(streams), len(coded))
+            streams += coded
+            bufs.append(buf)
+        return bufs, streams, bytes(offsets)
+
+    for name, table in _SHAPES.items():
+        for plane in (grain(), 4096) if not quick else (4096,):
+            for nstr in (1, 17, 129):
+                made = batch(table, plane, nstr, hash((name, plane, nstr)) & 0xFFFF)
+                if made is None:
+                    continue
+                bufs, streams, offsets = made
+                out = decode_batch(streams, offsets, nstr, plane)
+                if out is None:
+                    report["failures"].append(
+                        f"{name} plane={plane} n={nstr}: declined -- {last_error()}")
+                    continue
+                for i, want in enumerate(bufs):
+                    if bytes(out[i * plane:(i + 1) * plane]) != want:
+                        report["failures"].append(
+                            f"{name} plane={plane} n={nstr}: stream {i} differs")
+                        break
+                report["checked"] += 1
+
+    # Throughput on a batch big enough to mean something, and every stream
+    # distinct: decoding one stream twice finds its coded bytes in L2 and
+    # reports a rate that does not exist.
+    plane, nstr = 32768, 256 if quick else 2048
+    made = batch(_SHAPES["skewed"], plane, nstr, 4242)
+    if made is not None:
+        bufs, streams, offsets = made
+        out = bytearray(nstr * plane)
+        decode_batch(streams, offsets, nstr, plane, out=out)   # warm the context
+        t = time.perf_counter()
+        got = decode_batch(streams, offsets, nstr, plane, out=out)
+        dt = time.perf_counter() - t
+        if got is not None and dt > 0:
+            report["gbps"] = round(nstr * plane / dt / 1e9, 2)
+        if got is None or bytes(out) != b"".join(bufs):
+            report["failures"].append("throughput batch did not decode correctly")
+
+    report["ok"] = report["checked"] > 0 and not report["failures"]
+    return report
 
 
 def _ptr(obj):

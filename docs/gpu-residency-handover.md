@@ -294,5 +294,27 @@ for the whole first probe, context included.
 clean on both kernels over real planes — which is the check that speaks
 directly to "a two-slot `cp.async` buffer verifies byte-identical and races
 anyway" — and the kernel compiles for every architecture CUDA 13 supports at
-or above the floor, sm_75 through sm_121. What is still untested is *running*
-it anywhere but Blackwell, and the numbers in the README are one card's.
+or above the floor, sm_75 through sm_121.
+
+**And the untested architectures are not equal, which narrows the problem to
+one.** Counting `LDGSTS` in the generated SASS says which of them is running
+the code that was actually verified:
+
+| | `LDGSTS` |
+|---|---|
+| sm_75 | **0** |
+| sm_80, sm_86, sm_89 | 38 |
+| sm_90, sm_120 | 41 |
+
+Turing has no `cp.async` instruction, so `__pipeline_memcpy_async` falls back
+to a synchronous copy and sm_75 is *different generated code* that has never
+been executed. Everything at sm_80 and above runs the algorithm that was
+verified and sanitized here and differs only in scheduling — so above the
+Turing line the open question is a throughput number, and at it the open
+question is correctness. **A free Colab or Kaggle T4 is an sm_75**, which
+makes the one real gap cost nothing but the asking.
+
+`lmz doctor --gpu-verify` is the asking. It builds streams with lmz's own
+encoder, decodes thirty distributions and batch shapes, checks lmz's own CPU
+decoder agrees with every byte, and prints a block worth pasting. No data
+files and no network: the oracle travels with the question.

@@ -225,6 +225,9 @@ def cmd_extract(args) -> int:
 def cmd_doctor(args) -> int:
     from . import fuse, gpu
 
+    if getattr(args, "gpu_verify", False):
+        return _gpu_verify(gpu)
+
     b = api.backends()
     print(f"lmz {__version__}")
     print(f"  python    {sys.version.split()[0]}")
@@ -249,6 +252,39 @@ def cmd_doctor(args) -> int:
         print("        decodes batches of lmz streams straight into VRAM; the")
         print("        CPU path is unaffected either way.")
     return 0
+
+
+def _gpu_verify(gpu) -> int:
+    """Prove the GPU decoder on this machine, in a form worth pasting.
+
+    The kernel has been run on one architecture. Turing in particular gets
+    different generated code -- cp.async has no instruction there and the
+    intrinsic becomes a synchronous copy -- so a report from a card that is
+    not a Blackwell is worth more than any amount of further testing here.
+    """
+    r = gpu.verify()
+    print(f"lmz {r['lmz']} GPU verification")
+    if r["device"] is None:
+        print(f"  no GPU decoder -- {r['why']}")
+        return 1
+    print(f"  device   {r['device']}")
+    print(f"  shapes   {r['checked']} decoded byte-identically to the CPU decoder"
+          if not r["failures"] else
+          f"  shapes   {r['checked']} checked, {len(r['failures'])} FAILED")
+    for f in r["failures"]:
+        print(f"    FAIL   {f}")
+    if r["gbps"] is not None:
+        print(f"  batch    {r['gbps']} GB/s decoding a 67 MB batch, host round "
+              f"trip.")
+        print("           That includes PCIe in and out and is not the kernel's "
+              "own rate;")
+        print("           see docs/gpu-residency-handover.md for the resident "
+              "numbers.")
+    print(f"  verdict  {'OK' if r['ok'] else 'MISMATCH'}")
+    if not r["ok"]:
+        print("\n  Please open an issue with this block:")
+        print("  https://github.com/FanxinSun/lmz/issues")
+    return 0 if r["ok"] else 1
 
 
 # ------------------------------------------------------------------- the store
@@ -639,6 +675,9 @@ def build_parser() -> argparse.ArgumentParser:
     b.set_defaults(func=cmd_bench)
 
     doc = sub.add_parser("doctor", help="report the active backends")
+    doc.add_argument("--gpu-verify", action="store_true",
+                     help="decode every awkward shape on this GPU and check "
+                          "the CPU decoder agrees")
     doc.set_defaults(func=cmd_doctor)
 
     # -- the store ---------------------------------------------------------

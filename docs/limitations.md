@@ -111,7 +111,7 @@
 python3 tests/test_lmz.py          # also runs under pytest
 ```
 
-97 tests covering kernel equivalence across all backends, element sizes and
+98 tests covering kernel equivalence across all backends, element sizes and
 block periods,
 rANS round-trips over adversarial distributions (including single-symbol
 streams, which exposed a frequency-field overflow), rANS landing within 2% of
@@ -181,7 +181,9 @@ one that does not is that a card below the kernel's floor is declined with its
 compute capability in the message rather than handed to a compiler that will
 reject it. The decoder also checks itself: the first thing it does on any
 machine is decode a stream that machine just encoded and compare against the
-CPU decoder, and a device that disagrees is not used.
+CPU decoder, and a device that disagrees is not used. `lmz doctor --gpu-verify`
+runs the whole set on demand and prints a report, because the only evidence
+that will ever exist for an architecture nobody here owns is somebody else's.
 
 `tests/make_model.py` generates synthetic checkpoints with per-channel
 lognormal scaling, which reproduces the exponent skew of trained weights —
