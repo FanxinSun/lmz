@@ -6,16 +6,29 @@ name: release
 # exact repository, workflow and environment, so there is no long-lived
 # credential to leak, rotate or accidentally commit.
 #
-# One-time setup, on pypi.org -> Your projects -> Publishing -> Add a pending
-# publisher:
+# One-time setup, and WHICH form depends on whether the project exists yet.
+# Getting this wrong fails with `invalid-publisher`: a valid token that matches
+# no publisher. Nothing uploads, so the version is not burned and the failed
+# job can simply be re-run once the publisher is right.
 #
-#     PyPI project name : lmzip
+# Before the first release, when the name is unclaimed -- pypi.org -> Your
+# projects -> Publishing -> Add a pending publisher. A pending publisher only
+# applies to a project that does not exist; once lmzip is on PyPI it is the
+# wrong form and will never match.
+#
+# For a project that already exists -- pypi.org -> Your projects -> lmzip ->
+# Manage -> Publishing -> Add a new publisher (GitHub):
+#
 #     Owner             : FanxinSun
-#     Repository        : lmz
+#     Repository name   : lmz
 #     Workflow name     : release.yml
-#     Environment       : pypi
+#     Environment name  : pypi
 #
-# After that:  git tag v1.0.0 && git push origin v1.0.0
+# Those four have to match the OIDC claims exactly. The failed run prints the
+# claims it actually sent, which is the thing to compare against.
+#
+# After that:  git tag v1.2.0 && git push origin v1.2.0
+# Or, if the tag already exists:  gh run rerun <run-id> --failed
 
 on:
   push:
