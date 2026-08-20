@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import ctypes
 import os
+import subprocess
+import sys
 import threading
 
 __all__ = ["available", "backend", "decode_batch", "grain", "header_bytes",
@@ -33,6 +35,65 @@ ENODEV = -1
 EUNSUPPORTED = -2
 EBADSTREAM = -3
 ECUDA = -4
+
+# The dangerous part of using a GPU is the first touch of the driver, and it
+# is dangerous in a way no return code reaches: a driver that is half-removed
+# or mid-upgrade leaves libcuda.so.1 on disk with an initialiser that faults,
+# so `ctypes.CDLL` takes the whole interpreter down. That was not hypothetical
+# -- it happened on the machine this was written on, when a driver update
+# landed underneath a running session and left nvidia-smi answering nothing.
+#
+# lmz's promise is that the GPU decoder is optional in every direction and the
+# CPU path is unaffected. A segmentation fault in someone's process is not a
+# fallback, so the first load happens in a child that is allowed to die.
+_PROBE_SOURCE = """
+import ctypes, sys
+try:
+    lib = ctypes.CDLL(sys.argv[1])
+    lib.lmz_gpu_abi_version.restype = ctypes.c_int
+    if lib.lmz_gpu_abi_version() != ABI:
+        sys.exit(2)
+    lib.lmz_gpu_device_name.restype = ctypes.c_int
+    lib.lmz_gpu_device_name.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    buf = ctypes.create_string_buffer(256)
+    if lib.lmz_gpu_device_name(buf, 256) != 0:
+        sys.exit(3)
+    sys.stdout.write(buf.value.decode())
+except Exception as exc:
+    sys.stderr.write(f"{type(exc).__name__}: {exc}")
+    sys.exit(4)
+"""
+
+
+def _probe_elsewhere(path: str) -> tuple[bool, str]:
+    """Load the library in a child process. (ok, device name) or (False, why).
+
+    Costs one interpreter start and one CUDA context, once, and only on a
+    machine that has both a toolkit and something that looks like a driver.
+    Everywhere else `build()` has already declined and none of this runs.
+    """
+    src = _PROBE_SOURCE.replace("ABI", str(ABI_VERSION))
+    try:
+        p = subprocess.run([sys.executable, "-c", src, path],
+                           capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return False, "the CUDA driver did not answer within 120s"
+    except Exception as exc:
+        return False, f"could not probe the CUDA driver: {exc}"
+    if p.returncode == 0:
+        return True, p.stdout.strip()
+    if p.returncode == 2:
+        return False, "the built CUDA decoder is from another source"
+    if p.returncode == 3:
+        return False, "nvcc is present but no CUDA device is"
+    if p.returncode == 4:
+        return False, (p.stderr.strip().splitlines() or ["the library did not load"])[-1]
+    # Anything else is a death rather than a decision: a negative code is the
+    # POSIX signal that killed it, and Windows reports its own status codes.
+    sig = f"signal {-p.returncode}" if p.returncode < 0 else f"status {p.returncode:#x}"
+    return False, (f"the CUDA driver crashed while loading ({sig}); the driver "
+                   f"is broken or mid-upgrade, so lmz is staying on the CPU")
+
 
 _lock = threading.Lock()
 _lib = None
@@ -53,18 +114,18 @@ def _load():
         try:
             from . import build as _build
 
-            # build() first, and only ask why afterwards: an already-built
-            # library returns without running nvcc at all, and the reasons
-            # cost a subprocess each to establish.
             path = _build.build()
             if not path:
+                # build() states its own reason, and it is the side that knows
+                # whether the compiler was reached at all.
                 _state = "unavailable"
-                if _build.find_compiler() is None:
-                    _why = "no nvcc (a CUDA toolkit is needed once, to build)"
-                else:
-                    _why = "the CUDA decoder did not build"
-                    if _build.last_error:
-                        _why += f" ({_build.last_error})"
+                _why = _build.last_error or "the CUDA decoder did not build"
+                return None
+            # Nothing above has touched the driver. This is where that happens,
+            # and it happens somewhere a fault cannot reach this process.
+            safe, _probed = _probe_elsewhere(path)
+            if not safe:
+                _state, _why = "unavailable", _probed
                 return None
             lib = ctypes.CDLL(path)
             v, c_int, c_uint = ctypes.c_void_p, ctypes.c_int, ctypes.c_uint
@@ -85,13 +146,7 @@ def _load():
             lib.lmz_gpu_decode_batch_dev.restype = c_int
             lib.lmz_gpu_decode_batch_dev.argtypes = [v, v, v, c_uint, c_uint, v,
                                                      v, c_uint]
-            name = ctypes.create_string_buffer(256)
-            if lib.lmz_gpu_device_name(name, 256) != OK:
-                # Built, but there is no device to run it on: a build host, or
-                # a container with the toolkit and no card passed through.
-                _state, _why = "unavailable", "nvcc is present but no CUDA device is"
-                return None
-            device = name.value.decode()
+            device = _probed
             if not _selftest(lib):
                 _state = "unavailable"
                 _why = (f"the CUDA decoder did not reproduce the CPU decoder's "

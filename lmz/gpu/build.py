@@ -28,8 +28,11 @@ SOURCE = os.path.join(HERE, "lmzgpu.cu")
 
 _SUFFIX = ".dll" if os.name == "nt" else ".so"
 
-# Why the last build attempt failed, quoted by `lmz doctor`. A build that
-# never ran leaves this empty.
+# Why the last build attempt did not produce a library, as a complete sentence
+# that `lmz doctor` prints verbatim. Declining before the compiler ("no driver",
+# "this card is too old") and failing in it are different things and the
+# message says which; wrapping either in a second explanation just nests
+# parentheses. A build that never ran leaves this empty.
 last_error = ""
 
 # The kernel decodes with __ballot_sync and __syncwarp across a group of 8
@@ -167,15 +170,15 @@ def build(force: bool = False, verbose: bool = False) -> str | None:
 
     Never raises: no nvcc, no device and a failed compile are all ordinary.
     """
-    out = library_path()
-    if os.path.exists(out) and not force:
-        return out
-    if not os.path.exists(SOURCE):
-        return None
-
     global last_error
-    # The card is checked before the compiler, because no toolkit rescues a
-    # device this kernel cannot target and the answer should say so.
+    # The hardware gates come first, ahead of even the "already built" check.
+    # A library that exists is not a library that is safe to load: an artifact
+    # built when this machine had a working driver is still sitting there
+    # after the driver is removed or half-upgraded, and loading it then takes
+    # the whole process down inside the driver rather than returning an error.
+    #
+    # The card is also checked before the compiler, because no toolkit rescues
+    # a device this kernel cannot target and the answer should say so.
     cc = _device_cc()
     if cc is None and shutil.which("nvidia-smi") is None:
         # nvcc without a driver is a build host. Say so before spending a
@@ -191,9 +194,15 @@ def build(force: bool = False, verbose: bool = False) -> str | None:
             print(f"lmz: {last_error}; the decoder stays on the CPU", file=sys.stderr)
         return None
 
+    out = library_path()
+    if os.path.exists(out) and not force:
+        return out
+    if not os.path.exists(SOURCE):
+        return None
+
     nvccs = find_compilers()
     if not nvccs:
-        last_error = "no nvcc found"
+        last_error = "no nvcc (a CUDA toolkit is needed once, to build)"
         if verbose:
             print("lmz: no nvcc found; the decoder stays on the CPU", file=sys.stderr)
         return None
@@ -232,11 +241,12 @@ def build(force: bool = False, verbose: bool = False) -> str | None:
                     print(f"lmz: built {os.path.basename(out)} with {nvcc}",
                           file=sys.stderr)
                 return out
-            last_error = (proc.stderr.strip().splitlines() or ["nvcc failed"])[-1]
+            last_error = "nvcc failed: " + (
+                proc.stderr.strip().splitlines() or ["no output"])[-1].strip()
             if verbose:
                 print(f"lmz: {nvcc} failed:\n{proc.stderr}", file=sys.stderr)
         except Exception as exc:  # nvcc vanished mid-flight, timeout, sandbox
-            last_error = f"{type(exc).__name__}: {exc}"
+            last_error = f"nvcc failed: {type(exc).__name__}: {exc}"
             if verbose:
                 print(f"lmz: {nvcc} failed: {exc}", file=sys.stderr)
         try:

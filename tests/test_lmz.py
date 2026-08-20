@@ -2349,6 +2349,38 @@ def test_gpu_refuses_a_device_that_disagrees_with_the_cpu():
     assert gpu.backend().startswith("cuda:")
 
 
+def test_gpu_probe_survives_a_driver_that_crashes():
+    """Loading the CUDA library must not be able to kill the caller.
+
+    A driver that is half-removed or mid-upgrade leaves libcuda.so.1 on disk
+    with an initialiser that faults, and `ctypes.CDLL` then takes the whole
+    interpreter down -- no return code involved. That happened for real, so
+    the first load is done in a child process that is allowed to die. This
+    runs everywhere: it is the plumbing, not the driver.
+    """
+    from lmz import gpu
+
+    ok, why = gpu._probe_elsewhere("/nonexistent/nothing-here.so")
+    assert ok is False and "No such file" in why
+
+    junk = os.path.join(tempfile.mkdtemp(), "junk.so")
+    with open(junk, "wb") as fh:
+        fh.write(b"not an ELF file at all")
+    ok, why = gpu._probe_elsewhere(junk)
+    assert ok is False and why, why
+
+    # A child that dies from a signal must be reported as a crash rather than
+    # raising, because that is the case the guard exists for.
+    saved = gpu._PROBE_SOURCE
+    try:
+        gpu._PROBE_SOURCE = "import os, signal\nos.kill(os.getpid(), signal.SIGSEGV)\n"
+        ok, why = gpu._probe_elsewhere(junk)
+        assert ok is False, why
+        assert "crashed" in why and "staying on the CPU" in why, why
+    finally:
+        gpu._PROBE_SOURCE = saved
+
+
 def test_gpu_build_declines_hardware_it_cannot_target():
     """A card below the floor is declined with a reason, not a compiler error.
 

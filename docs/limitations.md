@@ -111,7 +111,7 @@
 python3 tests/test_lmz.py          # also runs under pytest
 ```
 
-98 tests covering kernel equivalence across all backends, element sizes and
+99 tests covering kernel equivalence across all backends, element sizes and
 block periods,
 rANS round-trips over adversarial distributions (including single-symbol
 streams, which exposed a frequency-field overflow), rANS landing within 2% of
@@ -184,6 +184,10 @@ machine is decode a stream that machine just encoded and compare against the
 CPU decoder, and a device that disagrees is not used. `lmz doctor --gpu-verify`
 runs the whole set on demand and prints a report, because the only evidence
 that will ever exist for an architecture nobody here owns is somebody else's.
+And that loading the CUDA library cannot kill the caller: a driver that is
+mid-upgrade faults inside `ctypes.CDLL` with no return code involved, so the
+first load happens in a child process, and the test kills one to prove the
+crash is reported rather than propagated.
 
 `tests/make_model.py` generates synthetic checkpoints with per-channel
 lognormal scaling, which reproduces the exponent skew of trained weights —

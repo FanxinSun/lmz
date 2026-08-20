@@ -138,6 +138,19 @@ its compute capability in the message rather than handed to nvcc to reject.
 The fallback also emits PTX for the newest architecture it knows, because a
 card newer than the toolkit has nothing to JIT from otherwise.
 
+**A driver can fault on load, and no return code says so.** This one was
+found the hard way, when a driver update landed underneath a running session:
+`libcuda.so.1` stays on disk with an initialiser that segfaults, `nvidia-smi`
+comes back on PATH but answers nothing, and a bare `ctypes.CDLL` takes the
+interpreter down. Checking return codes cannot help, because the process is
+already gone. So the first load happens in a child that is allowed to die,
+and the parent turns a signal into a sentence. It costs one interpreter start
+and one CUDA context, once, and only on a machine that has both a toolkit and
+something that looks like a driver — everywhere else the build has already
+declined and none of it runs. The hardware gates also sit *ahead* of the
+"already built" check, because an artifact built when the driver worked is
+still sitting there after it stops.
+
 **The pipeline needs four slots, not two.** A two-slot `cp.async` buffer
 verifies byte-identical on the exponent plane and *races anyway*; the failure
 only appears on the sign+mantissa plane, whose 3× higher refill rate reaches

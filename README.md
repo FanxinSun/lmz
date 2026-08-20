@@ -135,6 +135,12 @@ the SIMD kernel already makes with a C compiler, and nothing is installed
 system-wide. No nvcc or no card means the CPU path, unchanged. `lmz doctor`
 says which you have.
 
+That holds even when the driver itself is broken. A CUDA driver that is
+half-removed or mid-upgrade leaves `libcuda.so.1` on disk with an initialiser
+that faults, and loading it takes the whole process down with no return code
+involved — so lmz does its first load in a child process that is allowed to
+die, and reports it. A segmentation fault in your program is not a fallback.
+
 Nothing in `lmz decompress` routes to it yet, deliberately: the useful thing
 to do with a GPU decode is to leave the result in VRAM, and deciding when
 belongs to the layer above — see the
@@ -183,7 +189,7 @@ or [Alipay](assets/alipay.jpg) (打开支付宝，扫一扫). Thank you.
 - [**Using lmz**](docs/usage.md) — command line, Python API, the mount and the
   filesystem
 - [**Limitations**](docs/limitations.md) — where it does not pay, and what the
-  98 tests check
+  99 tests check
 - [**Vectorising the coder**](docs/vectorising-the-coder.md) — how the encoder
   reached arm64, the one piece of work still open, and the six that were tried
   and measured out flat
