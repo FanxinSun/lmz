@@ -44,9 +44,25 @@
   repository and does not suit shipping one model to one user. It also needs
   matching tensor names, dtype and size: a fine-tune that switches from BF16
   to F16 has no byte-level relationship to its base at all, and gets nothing.
-- **No GPU path.** DFloat11 and NeuZip decompress on the GPU so a model that
-  doesn't fit in VRAM can still run; lmz only produces files and bytes. For
-  that use case they win regardless of ratio.
+- **The GPU decoder ships, but nothing routes to it yet.** `lmz.gpu` is in
+  the package and builds itself with `nvcc` on first use, the same bargain
+  `lmz.native` makes with a C compiler: the wheel carries a `.cu` and no
+  CUDA, installing needs no toolkit, and a machine with neither nvcc nor a
+  card decodes on the CPU exactly as before. `lmz doctor` says which. What it
+  gives you is one call — `lmz.gpu.decode_batch`, a batch of lmz rANS streams
+  in, their plaintext out, verified byte-identical to `lmz_rans_decode` over
+  936 MB of real planes. What it does not give you is a faster
+  `lmz decompress`: nothing in the archive path calls it, because the useful
+  thing to do with a GPU decode is leave the result in VRAM, and deciding
+  when to do that belongs to the layer above. Two further limits are real.
+  **One stream is 8 lanes of work**, so a GPU is filled by many streams at
+  once and never by one, however large — that is the format's 8-state
+  interleave, not the kernel's. And **an archive written today codes a
+  frequency table per chunk**, which costs 3.8× against a table shared across
+  chunks: 111 GB/s versus 418 on the same 936 MB. The shared table is a
+  format option that has not landed; it is item 1 of
+  [gpu-residency-handover.md](gpu-residency-handover.md). The Apple silicon
+  port under `scratchpad/gpu/metal/` is still written and never run.
 - **Decompressing to a file is I/O bound** on real storage. The gain there is
   that there are a third fewer bytes to move.
 - **The mount is slower than an uncompressed file on fast local storage.**
@@ -95,7 +111,7 @@
 python3 tests/test_lmz.py          # also runs under pytest
 ```
 
-91 tests covering kernel equivalence across all backends, element sizes and
+94 tests covering kernel equivalence across all backends, element sizes and
 block periods,
 rANS round-trips over adversarial distributions (including single-symbol
 streams, which exposed a frequency-field overflow), rANS landing within 2% of
@@ -150,6 +166,14 @@ container, and that a rewrite replaces the contents and leaves exactly one
 backing form behind.
 Mount tests skip themselves where FUSE is unavailable rather than failing.
 Also path-traversal rejection, and the CLI.
+
+The GPU decoder is checked the only way a decoder can be: that it reproduces
+what `lmz_rans_decode` produces, over streams built by lmz's own encoder and
+packed the way an archive packs them -- unpadded and unaligned, which is what
+catches a `cp.async` source alignment bug. Also that it declines rather than
+guesses on a shape it cannot take, that corruption raises instead of decoding
+anyway, and that asking `backends()` a question does not run a compiler as a
+side effect. These skip themselves where there is no GPU.
 
 `tests/make_model.py` generates synthetic checkpoints with per-channel
 lognormal scaling, which reproduces the exponent skew of trained weights —

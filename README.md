@@ -14,6 +14,9 @@ on one 8B model**.
 
 Nothing is approximated. Every byte comes back.
 
+And the decoder now runs on the GPU — **111 GB/s** from an ordinary archive
+against a 28.8 GB/s PCIe link, shipped in the wheel. [Jump to it](#on-a-gpu).
+
 ```
 pip install lmzip
 lmz compress ./Llama-3.1-8B-Instruct/
@@ -66,6 +69,43 @@ memory bus at about 2 GiB/s, and it reaches that at four threads where it used
 to need eight. On real storage the disk arrives before either of them, and the
 archive is a third smaller, so a storage-bound load moves a third fewer bytes.
 
+## On a GPU
+
+`pip install lmzip` ships a CUDA decoder. On an RTX 5080 it decodes lmz's own
+rANS at **111 GB/s** out of an archive written today, and **418 GB/s** when
+the frequency table is shared across chunks — both verified byte-identical to
+the CPU decoder over 936 MB of real BF16 planes.
+
+The ratio to the link is the point. PCIe Gen4 x16 delivers 28.8 GB/s, so a
+decoder 3.9× faster than that makes compression on the path into VRAM free,
+and every point of lmz's ratio becomes a point of load bandwidth. The fused
+whole-BF16 kernel in `scratchpad/gpu/` measures the end of it: cold disk to
+VRAM, plain safetensors 0.373 s against lmz's 0.256 — **1.46× faster**,
+converting 98% of the ratio into load speed.
+
+```python
+from lmz import gpu
+
+gpu.available()                                    # (True, '') -- or why not
+gpu.decode_batch(streams, offsets, nstr, plane)    # a batch in, plaintext out
+```
+
+A batch, not a stream: lmz's 8 interleaved rANS states are 8 lanes of work, so
+one stream never fills a GPU however large it is, and many streams at once do.
+
+**CUDA is optional in every direction.** The wheel is pure Python, carries a
+`.cu` and no CUDA, and installing needs no toolkit. `nvcc`, if it is there, is
+used once to build the decoder into the package directory — the same bargain
+the SIMD kernel already makes with a C compiler, and nothing is installed
+system-wide. No nvcc or no card means the CPU path, unchanged. `lmz doctor`
+says which you have.
+
+Nothing in `lmz decompress` routes to it yet, deliberately: the useful thing
+to do with a GPU decode is to leave the result in VRAM, and deciding when
+belongs to the layer above — see the
+[GPU residency handover](docs/gpu-residency-handover.md) for that boundary and
+for the work still between here and a residency engine.
+
 ## Where it is not worth it
 
 Stated plainly, because a compressor that only advertises its wins should not
@@ -108,14 +148,20 @@ or [Alipay](assets/alipay.jpg) (打开支付宝，扫一扫). Thank you.
 - [**Using lmz**](docs/usage.md) — command line, Python API, the mount and the
   filesystem
 - [**Limitations**](docs/limitations.md) — where it does not pay, and what the
-  91 tests check
+  94 tests check
 - [**Vectorising the coder**](docs/vectorising-the-coder.md) — how the encoder
   reached arm64, the one piece of work still open, and the six that were tried
   and measured out flat
+- [**GPU residency handover**](docs/gpu-residency-handover.md) — the GPU
+  decoder runs at 418 GB/s against a 28.8 GB/s PCIe link, so on that path
+  compression is free by 14×; what shipped as `lmz.gpu`, the three pieces of
+  work still between it and a residency layer, and where lmz's job ends
 
 Python 3.10+, no runtime dependencies. zstd comes from the standard library on
 3.14+; a C compiler, if present, is used once to build the SIMD kernel into the
-package directory — nothing is installed system-wide. Runs straight from a
-checkout with `./lmz-cli` if you would rather not install it at all.
+package directory, and `nvcc`, if present, does the same once for the CUDA
+decoder — nothing is installed system-wide and neither is required. Runs
+straight from a checkout with `./lmz-cli` if you would rather not install it
+at all.
 
 Check what is active with `lmz doctor`.

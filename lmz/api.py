@@ -1508,6 +1508,13 @@ def _version() -> str:
 
 
 def backends() -> dict:
-    """What the tool is actually using, for diagnostics."""
+    """What the tool is actually using, for diagnostics.
+
+    `gpu` reports what is already known rather than going to look, because a
+    probe builds the CUDA library and running a compiler is not what a caller
+    asks for here. `lmz doctor` and `lmz.gpu.available()` do the looking.
+    """
+    from . import gpu
+
     return {"kernel": kernels.backend(), "entropy": entropy.BACKEND,
-            "workers": default_workers()}
+            "workers": default_workers(), "gpu": gpu.state()}

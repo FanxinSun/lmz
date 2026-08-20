@@ -223,7 +223,7 @@ def cmd_extract(args) -> int:
 
 
 def cmd_doctor(args) -> int:
-    from . import fuse
+    from . import fuse, gpu
 
     b = api.backends()
     print(f"lmz {__version__}")
@@ -233,6 +233,10 @@ def cmd_doctor(args) -> int:
     print(f"  threads   {b['workers']} (detected)")
     ok, why = fuse.available()
     print(f"  mount     {'available' if ok else 'unavailable -- ' + why}")
+    # Unlike backends(), doctor is the place that is *supposed* to go and look:
+    # this builds the CUDA decoder if nvcc and a device are both present.
+    gok, gwhy = gpu.available()
+    print(f"  gpu       {gpu.backend() if gok else 'unavailable -- ' + gwhy}")
     from .store import Store
     store = Store()
     print(f"  store     {store.root}"
@@ -240,6 +244,10 @@ def cmd_doctor(args) -> int:
     if not b["kernel"].startswith("native"):
         print("  note: native kernel unavailable; using a slower fallback.")
         print("        a C compiler (cc/gcc/clang) enables the SIMD path.")
+    if not gok:
+        print("  note: the GPU decoder is optional and nothing needs it. It")
+        print("        decodes batches of lmz streams straight into VRAM; the")
+        print("        CPU path is unaffected either way.")
     return 0
 
 

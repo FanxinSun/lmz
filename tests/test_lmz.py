@@ -2174,6 +2174,138 @@ def test_readahead_predicts_only_sequential_streams():
     ra.close()
 
 
+def _gpu_streams(nstr: int, plane: int, seed: int = 12345):
+    """`nstr` plane-sized buffers with a skewed distribution, and their streams.
+
+    Skewed because a uniform buffer is refused by the coder as not worth
+    coding, and packed back to back with no padding and no alignment because
+    that is how an archive stores them. Both matter: the coded bytes of most
+    streams land on an odd address, and the kernel's cp.async needs a
+    16-byte-aligned source; and it prefetches past the last stream, so the
+    slack for that has to come from somewhere the caller did not provide.
+    Padding or aligning here would test a layout lmz never writes.
+    """
+    x = seed
+    plains, streams, offsets = [], bytearray(), bytearray()
+    for _ in range(nstr):
+        buf = bytearray(plane)
+        for i in range(plane):
+            x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+            # Three-way mixture: one dominant symbol, a narrow band, and a
+            # tail, so the frequency table has structure and is not degenerate.
+            r = x >> 8
+            buf[i] = 0x40 if r % 3 else ((r >> 4) & 0x0F) + (0x80 if r & 8 else 0)
+        coded = kernels.rans_encode(buf, kernels.histogram(buf))
+        assert coded, "the coder declined a buffer it should have coded"
+        offsets += struct.pack("<QQ", len(streams), len(coded))
+        streams += coded
+        plains.append(bytes(buf))
+    return plains, streams, bytes(offsets)
+
+
+def test_gpu_decode_matches_cpu():
+    """The GPU decoder reproduces lmz_rans_decode exactly, or it is not shipped.
+
+    This is the whole contract: an archive decoded on a GPU and the same
+    archive decoded on a CPU are the same bytes. There is no tolerance to
+    check, because a decoder either reproduces the plaintext or it does not.
+    """
+    from lmz import gpu
+
+    ok, why = gpu.available()
+    if not ok:
+        raise Skip(f"no GPU decoder: {why}")
+    if not kernels.have_rans():
+        raise Skip("building the streams needs the native coder")
+
+    nstr, plane = 64, 4096
+    assert plane % gpu.grain() == 0
+    plains, streams, offsets = _gpu_streams(nstr, plane)
+
+    out = gpu.decode_batch(streams, offsets, nstr, plane)
+    assert out is not None, f"decode_batch declined: {gpu.last_error()}"
+    assert len(out) == nstr * plane
+    for i, want in enumerate(plains):
+        got = bytes(out[i * plane:(i + 1) * plane])
+        assert got == want, f"stream {i} differs from the plaintext"
+        # And against the CPU decoder on the same bytes, not just the source,
+        # so a shared bug in encode+expectation cannot hide here.
+        o, n = struct.unpack_from("<QQ", offsets, i * 16)
+        assert bytes(kernels.rans_decode(bytes(streams[o:o + n]), plane)) == want
+
+
+def test_gpu_declines_rather_than_guesses():
+    """Every shape it cannot take comes back as None, which means "use the CPU".
+
+    A decoder that is optional has to be unambiguous about declining: the
+    caller's fallback is a correct decode, so silence is fine and a wrong
+    answer is not.
+    """
+    from lmz import gpu
+
+    ok, why = gpu.available()
+    if not ok:
+        raise Skip(f"no GPU decoder: {why}")
+    if not kernels.have_rans():
+        raise Skip("building the streams needs the native coder")
+
+    plains, streams, offsets = _gpu_streams(2, 4096)
+    # An empty batch is not a decline -- there was nothing to decode and it
+    # succeeded. None is reserved for "this needs the CPU".
+    assert bytes(gpu.decode_batch(streams, offsets, 0, 4096)) == b""
+    # A plane that is not a whole number of grains: the kernel retires
+    # gpu.grain() bytes per group per step and cannot stop part way.
+    assert gpu.decode_batch(streams, offsets, 2, 4096 + 1) is None
+    assert "grain" in gpu.last_error()
+
+    # Corruption is not a shape it declines, it is an error it reports.
+    broken = bytearray(streams)
+    broken[0] = ord("X")
+    try:
+        gpu.decode_batch(broken, offsets, 2, 4096)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a stream that is not lmz rANS decoded anyway")
+
+
+def test_gpu_is_optional():
+    """Nothing about lmz requires CUDA, and asking must not build a compiler.
+
+    The package ships a .cu and no CUDA. `pip install lmzip` on a machine with
+    no toolkit and no card has to behave exactly as it did before the GPU
+    decoder existed, so the import must be free and the probe must be opt-in.
+    """
+    from lmz import gpu
+
+    assert gpu.grain() > 0 and gpu.header_bytes() == 516
+
+    # Importing lmz must not drag in the CUDA module at all.
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import lmz, sys; sys.exit(1 if 'lmz.gpu' in sys.modules else 0)"],
+        cwd=ROOT, capture_output=True)
+    assert out.returncode == 0, "import lmz imported lmz.gpu"
+
+    # backends() reports what is known; it must not go and run nvcc.
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import lmz, sys; b = lmz.backends();"
+         " sys.exit(0 if b['gpu'] == 'not probed' else 1)"],
+        cwd=ROOT, capture_output=True)
+    assert out.returncode == 0, "backends() probed the GPU as a side effect"
+
+    # And LMZ_NO_GPU turns it off wherever it would otherwise be on.
+    env = dict(os.environ, LMZ_NO_GPU="1")
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "from lmz import gpu; ok, why = gpu.available();"
+         " print(ok, why)"],
+        cwd=ROOT, capture_output=True, text=True, env=env)
+    assert out.stdout.startswith("False"), out.stdout
+    assert "LMZ_NO_GPU" in out.stdout
+
+
 class Skip(Exception):
     """Raised by a test that cannot run in this environment."""
 

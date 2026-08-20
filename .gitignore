@@ -6,6 +6,10 @@ lmz/native/lmzcore-*.so
 lmz/native/lmzcore-*.dylib
 lmz/native/lmzcore-*.dll
 
+# Built by lmz/gpu/build.py on first use, if nvcc and a device are both here.
+lmz/gpu/lmzgpu-*.so
+lmz/gpu/lmzgpu-*.dll
+
 # Built by hand from scratchpad/ when a coder question comes up.
 coderbench
 encbench

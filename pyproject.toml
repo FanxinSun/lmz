@@ -55,10 +55,17 @@ Funding = "https://buymeacoffee.com/fanxinsun"
 lmz = "lmz.cli:main"
 
 [tool.setuptools]
-packages = ["lmz", "lmz.native"]
+packages = ["lmz", "lmz.native", "lmz.gpu"]
 
-# Only the C source ships. The shared library is built on first use into the
+# Only source ships. Both shared libraries are built on first use into the
 # installed package directory, so the wheel stays pure Python and portable
 # and nothing platform-specific is ever uploaded.
+#
+# lmz.gpu is the CUDA decoder and it is optional in every direction: the wheel
+# carries a .cu file and no CUDA, installing needs no toolkit, importing lmz
+# does not import it, and a machine with neither nvcc nor a device decodes on
+# the CPU exactly as before. It builds itself the first time something asks,
+# which is the same bargain lmz.native already makes with a C compiler.
 [tool.setuptools.package-data]
 "lmz.native" = ["*.c"]
+"lmz.gpu" = ["*.cu"]
