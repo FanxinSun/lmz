@@ -111,7 +111,7 @@
 python3 tests/test_lmz.py          # also runs under pytest
 ```
 
-96 tests covering kernel equivalence across all backends, element sizes and
+97 tests covering kernel equivalence across all backends, element sizes and
 block periods,
 rANS round-trips over adversarial distributions (including single-symbol
 streams, which exposed a frequency-field overflow), rANS landing within 2% of
@@ -179,7 +179,9 @@ two symbols, near-uniform, and one dominant with a tail -- against batch sizes
 that leave a partial block. These skip themselves where there is no GPU; the
 one that does not is that a card below the kernel's floor is declined with its
 compute capability in the message rather than handed to a compiler that will
-reject it.
+reject it. The decoder also checks itself: the first thing it does on any
+machine is decode a stream that machine just encoded and compare against the
+CPU decoder, and a device that disagrees is not used.
 
 `tests/make_model.py` generates synthetic checkpoints with per-channel
 lognormal scaling, which reproduces the exponent skew of trained weights —

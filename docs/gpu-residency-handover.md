@@ -278,6 +278,15 @@ compares against `lmz_rans_decode`, and skips where there is no GPU.
 run on an RTX 5080 cannot be run on a Turing or a Hopper without one, so the
 evidence was widened in the two directions that do not need the hardware:
 
+**And the decoder checks itself before it is used.** The first thing it ever
+does on a machine is decode a stream that machine just encoded and compare
+against `lmz_rans_decode`; a device that disagrees is not used at all, and
+`lmz doctor` says so by name. This is the mitigation that actually covers an
+architecture nobody has run, because a silently wrong decoder is far worse
+than an absent one — the caller gets weights back rather than an error. It
+costs one launch, after a CUDA context that was being created anyway: 281 ms
+for the whole first probe, context included.
+
     compute-sanitizer --tool=memcheck   python3 -c ...   # 0 errors
     compute-sanitizer --tool=racecheck  python3 -c ...   # 0 hazards
     compute-sanitizer --tool=synccheck  python3 -c ...   # 0 errors

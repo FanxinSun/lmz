@@ -91,13 +91,65 @@ def _load():
                 # a container with the toolkit and no card passed through.
                 _state, _why = "unavailable", "nvcc is present but no CUDA device is"
                 return None
+            device = name.value.decode()
+            if not _selftest(lib):
+                _state = "unavailable"
+                _why = (f"the CUDA decoder did not reproduce the CPU decoder's "
+                        f"bytes on {device}; staying on the CPU")
+                return None
             _lib = lib
-            _state = "cuda:" + name.value.decode()
+            _state = "cuda:" + device
             _why = ""
         except Exception as exc:
             _lib = None
             _state, _why = "unavailable", f"{type(exc).__name__}: {exc}"
     return _lib
+
+
+def _selftest(lib) -> bool:
+    """Decode a stream this machine just encoded, and check the CPU agrees.
+
+    This kernel has been run on one card. It compiles for Turing through
+    Blackwell and is clean under compute-sanitizer, but neither of those is
+    the same as having executed it on a Turing -- and a decoder that is
+    silently wrong is far worse than one that is absent, because the caller
+    gets weights rather than an error.
+
+    So the first thing the GPU decoder ever does is decode something whose
+    answer is already known, and a device that disagrees is not used. It costs
+    one launch, after a CUDA context that was being created anyway.
+    """
+    from .. import kernels
+
+    if not kernels.have_rans():
+        # No native coder means no rANS archives exist to decode, so there is
+        # nothing to be wrong about and nothing to check against.
+        return True
+    plane, nstr = 128, 8
+    # Skewed enough that the coder takes it, and mixed enough that the
+    # frequency table has more than one entry to get wrong.
+    plain = bytes(((i * 37) & 0x0F) if i % 3 else 0x40 for i in range(plane))
+    coded = kernels.rans_encode(plain, kernels.histogram(plain))
+    if not coded:
+        return True
+    import struct
+
+    streams, offsets = bytearray(), bytearray()
+    for _ in range(nstr):
+        offsets += struct.pack("<QQ", len(streams), len(coded))
+        streams += coded
+    out = bytearray(nstr * plane)
+    s_addr, _a = _ptr(streams)
+    o_addr, _b = _ptr(bytes(offsets))
+    d_addr, _c = _ptr(out)
+    rc = lib.lmz_gpu_decode_batch(None, s_addr, len(streams), o_addr,
+                                  nstr, plane, d_addr)
+    if rc != OK:
+        # It declined rather than answered -- no device, no shared memory for
+        # this shape. That is the CPU path working as designed, not a wrong
+        # decoder, so do not brand the card as broken.
+        return rc != EBADSTREAM
+    return bytes(out) == plain * nstr
 
 
 def available() -> tuple[bool, str]:

@@ -2295,6 +2295,35 @@ def test_gpu_decode_over_distributions_and_shapes():
     assert checked >= 20, f"only {checked} shapes actually ran"
 
 
+def test_gpu_refuses_a_device_that_disagrees_with_the_cpu():
+    """A card whose answer differs from the CPU's is not used at all.
+
+    The kernel has been executed on one architecture. A silently wrong decoder
+    is worse than an absent one -- the caller gets weights back rather than an
+    error -- so the guard is that the first decode has a known answer, and
+    this checks the guard rather than the kernel.
+    """
+    from lmz import gpu
+
+    ok, why = gpu.available()
+    if not ok:
+        raise Skip(f"no GPU decoder: {why}")
+
+    saved_state, saved_lib, saved_test = gpu._state, gpu._lib, gpu._selftest
+    try:
+        gpu._selftest = lambda lib: False
+        gpu._state, gpu._lib = "unloaded", None
+        live, reason = gpu.available()
+        assert live is False, "a disagreeing device was used anyway"
+        assert "did not reproduce" in reason, reason
+        assert gpu.decode_batch(b"", b"", 1, 128) is None
+    finally:
+        gpu._selftest = saved_test
+        gpu._state, gpu._lib = "unloaded", None
+        gpu.available()          # re-probe honestly for whatever runs next
+    assert gpu.backend().startswith("cuda:")
+
+
 def test_gpu_build_declines_hardware_it_cannot_target():
     """A card below the floor is declined with a reason, not a compiler error.
 

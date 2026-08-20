@@ -93,6 +93,12 @@ gpu.decode_batch(streams, offsets, nstr, plane)    # a batch in, plaintext out
 A batch, not a stream: lmz's 8 interleaved rANS states are 8 lanes of work, so
 one stream never fills a GPU however large it is, and many streams at once do.
 
+The first thing it does on any machine is decode a stream that machine just
+encoded and check the CPU decoder agrees; a device that disagrees is not used,
+and `lmz doctor` names it. The kernel is clean under `compute-sanitizer` and
+compiles for sm_75 through sm_121, but it has only ever been *run* on one
+card, so it verifies rather than assumes.
+
 **CUDA is optional in every direction.** The wheel is pure Python, carries a
 `.cu` and no CUDA, and installing needs no toolkit. `nvcc`, if it is there, is
 used once to build the decoder into the package directory — the same bargain
@@ -148,7 +154,7 @@ or [Alipay](assets/alipay.jpg) (打开支付宝，扫一扫). Thank you.
 - [**Using lmz**](docs/usage.md) — command line, Python API, the mount and the
   filesystem
 - [**Limitations**](docs/limitations.md) — where it does not pay, and what the
-  96 tests check
+  97 tests check
 - [**Vectorising the coder**](docs/vectorising-the-coder.md) — how the encoder
   reached arm64, the one piece of work still open, and the six that were tried
   and measured out flat
