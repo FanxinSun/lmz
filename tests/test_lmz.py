@@ -2360,14 +2360,17 @@ def test_gpu_probe_survives_a_driver_that_crashes():
     """
     from lmz import gpu
 
+    # What matters is that it declines with a reason and does not raise. The
+    # wording is the platform's -- macOS dlopen and glibc describe a missing
+    # library quite differently -- so asserting on it tests dyld, not lmz.
     ok, why = gpu._probe_elsewhere("/nonexistent/nothing-here.so")
-    assert ok is False and "No such file" in why
+    assert ok is False and why.strip(), repr(why)
 
     junk = os.path.join(tempfile.mkdtemp(), "junk.so")
     with open(junk, "wb") as fh:
         fh.write(b"not an ELF file at all")
     ok, why = gpu._probe_elsewhere(junk)
-    assert ok is False and why, why
+    assert ok is False and why.strip(), repr(why)
 
     # A child that dies from a signal must be reported as a crash rather than
     # raising, because that is the case the guard exists for.
