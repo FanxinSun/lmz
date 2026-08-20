@@ -2234,6 +2234,85 @@ def test_gpu_decode_matches_cpu():
         assert bytes(kernels.rans_decode(bytes(streams[o:o + n]), plane)) == want
 
 
+# Byte-value distributions the one benchmark workload never contained. Built
+# by translating uniform random bytes, which is a C-speed way to get an exact
+# shape -- a per-byte Python loop over a 32 KiB plane is not worth the seconds.
+_GPU_SHAPES = {
+    # One symbol at the full probability scale. The CPU coder had a
+    # frequency-field overflow here once; the GPU table packs freq-1 into
+    # twelve bits for the same reason and wants the same check.
+    "single": bytes([0x5A]) * 256,
+    "two": bytes([0x01]) * 128 + bytes([0xFE]) * 128,
+    "flat": bytes(range(256)),
+    "tail": bytes([0x20]) * 250 + bytes(range(6)),
+    "skewed": bytes([0x40]) * 170 + bytes(range(16)) * 5 + bytes([0x7F]) * 6,
+}
+
+
+def test_gpu_decode_over_distributions_and_shapes():
+    """Every distribution the coder emits, and batch shapes that do not divide.
+
+    The 936 MB workload the kernel was tuned on is one distribution at one
+    size. These are the ones that break tables and block arithmetic: a single
+    symbol at full scale, a batch that is not a whole number of blocks, and
+    the smallest plane the kernel will take.
+    """
+    import random
+
+    from lmz import gpu
+
+    ok, why = gpu.available()
+    if not ok:
+        raise Skip(f"no GPU decoder: {why}")
+    if not kernels.have_rans():
+        raise Skip("building the streams needs the native coder")
+
+    checked = 0
+    for name, table in _GPU_SHAPES.items():
+        for plane in (gpu.grain(), 4096):
+            # 1 is a single group in a block of many; 17 and 129 leave a
+            # partial block whose spare groups decode stream 0 and must not
+            # write anything.
+            for nstr in (1, 17, 129):
+                rnd = random.Random(hash((name, plane, nstr)) & 0xFFFF)
+                bufs, streams, offsets = [], bytearray(), bytearray()
+                for _ in range(nstr):
+                    buf = rnd.randbytes(plane).translate(table)
+                    coded = kernels.rans_encode(buf, kernels.histogram(buf))
+                    if coded is None:
+                        break
+                    offsets += struct.pack("<QQ", len(streams), len(coded))
+                    streams += coded
+                    bufs.append(buf)
+                if len(bufs) != nstr:
+                    continue
+                out = gpu.decode_batch(streams, bytes(offsets), nstr, plane)
+                assert out is not None, f"{name} p={plane} n={nstr}: {gpu.last_error()}"
+                for i, want in enumerate(bufs):
+                    assert bytes(out[i * plane:(i + 1) * plane]) == want, \
+                        f"{name} p={plane} n={nstr}: stream {i} differs"
+                checked += 1
+    assert checked >= 20, f"only {checked} shapes actually ran"
+
+
+def test_gpu_build_declines_hardware_it_cannot_target():
+    """A card below the floor is declined with a reason, not a compiler error.
+
+    This runs everywhere, GPU or not: it is the build logic, and the point is
+    that lmz says "compute capability 6.1 is below 7.5" rather than passing
+    -arch=sm_61 to an nvcc that will answer "unsupported gpu architecture".
+    """
+    from lmz.gpu import build as gpubuild
+
+    saved = list(gpubuild._arch_cache)
+    try:
+        gpubuild._arch_cache[:] = [(6, 1)]           # a Pascal card
+        assert gpubuild.build(force=True) is None
+        assert "6.1" in gpubuild.last_error and "below" in gpubuild.last_error
+    finally:
+        gpubuild._arch_cache[:] = saved
+
+
 def test_gpu_declines_rather_than_guesses():
     """Every shape it cannot take comes back as None, which means "use the CPU".
 

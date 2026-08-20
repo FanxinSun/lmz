@@ -125,6 +125,19 @@ a box very often has an old toolkit on PATH beside a new one in
 option gpu-architecture". `-cudart static` so the result depends on the
 driver alone and not on a toolkit that may move. `lmz doctor` reports it.
 
+**Never hardcode an architecture list.** The first version of that build
+carried `("70", "80", "86", "89")` and it was wrong in both directions at
+once: CUDA 12.4 cannot target sm_120, and **CUDA 13 has dropped sm_70
+entirely** — one gencode nvcc refuses fails the whole compile, so on a modern
+toolkit the multi-architecture fallback did not build at all. `nvcc
+--list-gpu-arch` answers the question, and the floor is Turing: `__ballot_sync`
+and `__syncwarp` want Volta's independent thread scheduling, `cp.async` is
+Ampere's and degrades to a synchronous copy below it, and CUDA 13 will not
+compile for anything older anyway. A card below the floor is declined with
+its compute capability in the message rather than handed to nvcc to reject.
+The fallback also emits PTX for the newest architecture it knows, because a
+card newer than the toolkit has nothing to JIT from otherwise.
+
 **The pipeline needs four slots, not two.** A two-slot `cp.async` buffer
 verifies byte-identical on the exponent plane and *races anyway*; the failure
 only appears on the sign+mantissa plane, whose 3× higher refill rate reaches
@@ -260,3 +273,17 @@ reference from the model file rather than re-deriving it from the planes, so
 the test is not circular. The suite carries the same check without the cached
 data: `test_gpu_decode_matches_cpu` builds streams with lmz's own encoder and
 compares against `lmz_rans_decode`, and skips where there is no GPU.
+
+**One card is one card, and the doc's own trap applies here.** What has been
+run on an RTX 5080 cannot be run on a Turing or a Hopper without one, so the
+evidence was widened in the two directions that do not need the hardware:
+
+    compute-sanitizer --tool=memcheck   python3 -c ...   # 0 errors
+    compute-sanitizer --tool=racecheck  python3 -c ...   # 0 hazards
+    compute-sanitizer --tool=synccheck  python3 -c ...   # 0 errors
+
+clean on both kernels over real planes — which is the check that speaks
+directly to "a two-slot `cp.async` buffer verifies byte-identical and races
+anyway" — and the kernel compiles for every architecture CUDA 13 supports at
+or above the floor, sm_75 through sm_121. What is still untested is *running*
+it anywhere but Blackwell, and the numbers in the README are one card's.

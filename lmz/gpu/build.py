@@ -32,17 +32,19 @@ _SUFFIX = ".dll" if os.name == "nt" else ".so"
 # never ran leaves this empty.
 last_error = ""
 
-# Architectures to emit when the local device cannot be identified. Volta
-# through Ada; Blackwell is deliberately absent because an nvcc older than 12.8
-# cannot target it and would fail the whole build for the sake of a guess.
-_FALLBACK_ARCHS = ("70", "80", "86", "89")
+# The kernel decodes with __ballot_sync and __syncwarp across a group of 8
+# lanes, which wants Volta's independent thread scheduling, and stages its
+# input with cp.async, which is Ampere's and degrades to a synchronous copy
+# below it. Turing is the floor: correct there, and the oldest thing CUDA 13
+# will compile for at all.
+_ARCH_FLOOR = (7, 5)
 
 
 _arch_cache: list = []
 
 
-def _device_arch() -> str | None:
-    """Compute capability of device 0 as `sm_120`, or None if it cannot be read.
+def _device_cc() -> tuple[int, int] | None:
+    """Compute capability of device 0, or None if it cannot be read.
 
     Asked of the driver rather than of a CUDA context, so this costs no GPU
     memory and works before anything of ours has initialised. Cached, because
@@ -50,12 +52,12 @@ def _device_arch() -> str | None:
     """
     if _arch_cache:
         return _arch_cache[0]
-    arch = _query_arch()
-    _arch_cache.append(arch)
-    return arch
+    cc = _query_cc()
+    _arch_cache.append(cc)
+    return cc
 
 
-def _query_arch() -> str | None:
+def _query_cc() -> tuple[int, int] | None:
     smi = shutil.which("nvidia-smi")
     if not smi:
         return None
@@ -70,7 +72,29 @@ def _query_arch() -> str | None:
     if not first:
         return None
     m = re.match(r"^\s*(\d+)\.(\d+)\s*$", first[0])
-    return f"sm_{m.group(1)}{m.group(2)}" if m else None
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _device_arch() -> str | None:
+    """Compute capability of device 0 as `sm_120`, or None."""
+    cc = _device_cc()
+    return f"sm_{cc[0]}{cc[1]}" if cc else None
+
+
+def _nvcc_archs(nvcc: str) -> list[int]:
+    """Architectures this nvcc will accept, as 75, 80, ... -- asked, not assumed.
+
+    A hardcoded list rots in both directions: CUDA 12.4 cannot target sm_120
+    and CUDA 13 has dropped sm_70 outright, so a fixed set is wrong on new
+    toolkits and on old ones at the same time. nvcc knows, and one gencode it
+    refuses fails the whole build.
+    """
+    try:
+        out = subprocess.run([nvcc, "--list-gpu-arch"], capture_output=True,
+                             text=True, timeout=30)
+    except Exception:
+        return []
+    return sorted({int(m) for m in re.findall(r"compute_(\d+)", out.stdout)})
 
 
 def _nvcc_version(path: str) -> tuple[int, int]:
@@ -150,6 +174,23 @@ def build(force: bool = False, verbose: bool = False) -> str | None:
         return None
 
     global last_error
+    # The card is checked before the compiler, because no toolkit rescues a
+    # device this kernel cannot target and the answer should say so.
+    cc = _device_cc()
+    if cc is None and shutil.which("nvidia-smi") is None:
+        # nvcc without a driver is a build host. Say so before spending a
+        # multi-architecture compile on a machine that has nothing to run it.
+        last_error = "no NVIDIA driver found (nvidia-smi is not on PATH)"
+        if verbose:
+            print(f"lmz: {last_error}; the decoder stays on the CPU", file=sys.stderr)
+        return None
+    if cc is not None and cc < _ARCH_FLOOR:
+        last_error = (f"compute capability {cc[0]}.{cc[1]} is below the "
+                      f"{_ARCH_FLOOR[0]}.{_ARCH_FLOOR[1]} this kernel needs")
+        if verbose:
+            print(f"lmz: {last_error}; the decoder stays on the CPU", file=sys.stderr)
+        return None
+
     nvccs = find_compilers()
     if not nvccs:
         last_error = "no nvcc found"
@@ -157,18 +198,28 @@ def build(force: bool = False, verbose: bool = False) -> str | None:
             print("lmz: no nvcc found; the decoder stays on the CPU", file=sys.stderr)
         return None
 
-    arch = _device_arch()
-    if arch:
-        gencode = [f"-arch={arch}"]
-    else:
-        gencode = [f"-gencode=arch=compute_{a},code=sm_{a}" for a in _FALLBACK_ARCHS]
-
     # -cudart static so the result depends on the driver alone. A .so living
     # inside a Python package must not break because a CUDA toolkit moved.
-    flags = ["-O3", "-std=c++17", "-cudart", "static",
-             "-Xcompiler", "-fPIC", "-shared", *gencode]
+    base = ["-O3", "-std=c++17", "-cudart", "static",
+            "-Xcompiler", "-fPIC", "-shared"]
 
     for nvcc in nvccs:
+        if cc is not None:
+            gencode = [f"-arch=sm_{cc[0]}{cc[1]}"]
+        else:
+            # No device to ask, so emit for everything this nvcc can reach at
+            # or above the floor, and PTX for the newest of them -- without
+            # that last entry a card newer than the toolkit has nothing to
+            # JIT from and the launch simply fails.
+            archs = [a for a in _nvcc_archs(nvcc)
+                     if (a // 10, a % 10) >= _ARCH_FLOOR]
+            if not archs:
+                last_error = f"{nvcc} targets no architecture this kernel supports"
+                continue
+            gencode = [f"-gencode=arch=compute_{a},code=sm_{a}" for a in archs]
+            gencode.append(f"-gencode=arch=compute_{archs[-1]},"
+                           f"code=compute_{archs[-1]}")
+        flags = [*base, *gencode]
         fd, tmp = tempfile.mkstemp(dir=HERE, suffix=_SUFFIX)
         os.close(fd)
         cmd = [nvcc, *flags, "-o", tmp, SOURCE]

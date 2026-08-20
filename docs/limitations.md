@@ -111,7 +111,7 @@
 python3 tests/test_lmz.py          # also runs under pytest
 ```
 
-94 tests covering kernel equivalence across all backends, element sizes and
+96 tests covering kernel equivalence across all backends, element sizes and
 block periods,
 rANS round-trips over adversarial distributions (including single-symbol
 streams, which exposed a frequency-field overflow), rANS landing within 2% of
@@ -173,7 +173,13 @@ packed the way an archive packs them -- unpadded and unaligned, which is what
 catches a `cp.async` source alignment bug. Also that it declines rather than
 guesses on a shape it cannot take, that corruption raises instead of decoding
 anyway, and that asking `backends()` a question does not run a compiler as a
-side effect. These skip themselves where there is no GPU.
+side effect. The distributions are the ones that break tables rather than the
+one the kernel was tuned on -- a single symbol at the full probability scale,
+two symbols, near-uniform, and one dominant with a tail -- against batch sizes
+that leave a partial block. These skip themselves where there is no GPU; the
+one that does not is that a card below the kernel's floor is declined with its
+compute capability in the message rather than handed to a compiler that will
+reject it.
 
 `tests/make_model.py` generates synthetic checkpoints with per-channel
 lognormal scaling, which reproduces the exponent skew of trained weights —
