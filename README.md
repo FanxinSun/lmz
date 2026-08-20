@@ -106,12 +106,27 @@ lmz doctor --gpu-verify
 ```
 
 It decodes thirty awkward distributions and batch shapes and checks lmz's own
-CPU decoder agrees with every byte. **Turing is the one that matters most**:
-`cp.async` has no instruction there, so the intrinsic compiles to a
-synchronous copy and Turing runs genuinely different code from everything
-above it — and a free Colab or Kaggle T4 is exactly that card. Paste the block
-into [an issue](https://github.com/FanxinSun/lmz/issues) either way. A pass is
-evidence too, and right now there is one card's worth of it.
+CPU decoder agrees with every byte — no data file, no network, no login: the
+streams are built by lmz's own encoder, so the oracle travels with the
+question. Paste the block into
+[an issue](https://github.com/FanxinSun/lmz/issues). A pass is evidence too,
+and right now there is one card's worth of it.
+
+**No GPU? A free Colab T4 is the card that matters most** —
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/FanxinSun/lmz/blob/main/docs/verify-on-colab.ipynb)
+
+Turing is the one open *correctness* question rather than an unknown number.
+Counting `cp.async` instructions in the generated code says why:
+
+| | `LDGSTS` | unknown |
+|---|---|---|
+| **sm_75, Turing** | **0** | **correctness — different generated code** |
+| sm_80 / 86 / 89 | 38 | a throughput number |
+| sm_90 / 120 | 41 | a throughput number |
+
+Turing has no `cp.async` instruction, so the intrinsic falls back to a
+synchronous copy. Everything at sm_80 and above runs the algorithm that has
+already been verified byte-identical and checked under `compute-sanitizer`.
 
 **CUDA is optional in every direction.** The wheel is pure Python, carries a
 `.cu` and no CUDA, and installing needs no toolkit. `nvcc`, if it is there, is
