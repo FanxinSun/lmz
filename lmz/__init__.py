@@ -24,7 +24,7 @@ expanded onto disk:
                                                 #   ordinary model files
 """
 
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 
 from .api import (DEFAULT_CHUNK_SIZE, DEFAULT_LEVEL, Stats, backends, compress,
                   decompress, info, read_tensor, verify)
