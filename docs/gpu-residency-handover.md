@@ -278,7 +278,10 @@ in it deliberately produce wrong output and are labelled timing-only.
 `scratchpad/gpu/cuda/libbench.cu` times what the *package* builds against the
 same data — it `#include`s `lmz/gpu/lmzgpu.cu` rather than linking it, so
 there is no second copy of the kernel to drift — and sweeps the block size.
-It is the source of the 111 and 418 above.
+It is the source of the 111 and 418 above, and takes a directory so it can be
+pointed at `prep_synth.py`'s output instead of this machine's cache. Both
+numbers were re-measured after a driver upgrade from 580 to 610.88 (CUDA UMD
+13.3) and did not move: 111.1 and 417.4 GB/s.
 
 Verification is as easy here as it was for the vector decoder: a decoder
 either reproduces the plaintext or it does not, and `prep_fused.py` takes its
@@ -288,8 +291,9 @@ data: `test_gpu_decode_matches_cpu` builds streams with lmz's own encoder and
 compares against `lmz_rans_decode`, and skips where there is no GPU.
 
 **One card is one card, and the doc's own trap applies here.** What has been
-run on an RTX 5080 cannot be run on a Turing or a Hopper without one, so the
-evidence was widened in the two directions that do not need the hardware:
+run on an RTX 5080 cannot be run on a Turing or a Hopper without one — so the
+evidence was widened in every direction that does not need the hardware, and
+there turned out to be more of those than expected:
 
 **And the decoder checks itself before it is used.** The first thing it ever
 does on a machine is decode a stream that machine just encoded and compare
@@ -320,12 +324,57 @@ the code that was actually verified:
 | sm_90, sm_120 | 41 |
 
 Turing has no `cp.async` instruction, so `__pipeline_memcpy_async` falls back
-to a synchronous copy and sm_75 is *different generated code* that has never
-been executed. Everything at sm_80 and above runs the algorithm that was
-verified and sanitized here and differs only in scheduling — so above the
-Turing line the open question is a throughput number, and at it the open
-question is correctness. **A free Colab or Kaggle T4 is an sm_75**, which
-makes the one real gap cost nothing but the asking.
+to a synchronous copy and sm_75 is *different generated code*. Everything at
+sm_80 and above runs the algorithm that was verified and sanitized here and
+differs only in scheduling, so above the Turing line the open question was a
+throughput number, and at it the open question was correctness.
+
+**A code path can be run on silicon it was not compiled for, which is how the
+sm_75 question got answered without a Turing.** `-arch=compute_75` emits PTX
+and no cubin, so `__CUDA_ARCH__` is 750 while the header picks its scalar
+branch, and the driver JITs the result onto whatever card is present. Turing's
+generated code, run on a Blackwell over the same 936 MB:
+
+| | per-chunk tables |
+|---|---|
+| sm_120 codegen, 41 `LDGSTS` | 110.2 GB/s, byte-identical |
+| sm_75 codegen, 0 `LDGSTS` | 86.7 GB/s, byte-identical |
+
+byte-identical at all seven block sizes, and clean under `memcheck`,
+`racecheck` and `synccheck`. **This does not measure a T4** — it is Turing's
+code on the wrong silicon, so the 21% is what dropping `cp.async` costs a
+Blackwell. What it does settle is that the fallback decodes and does not race,
+which was the only *correctness* gap in the matrix. A real T4 is now wanted for
+its number and its scheduler rather than to find out whether it works.
+
+**A device that cannot fit the tables is refused, and that is arithmetic over
+one number, so no rented card is needed to check it either.**
+`scratchpad/gpu/cuda/shmfit.cu` runs the shipped `pick_tpb` against every
+architecture's `sharedMemPerBlockOptin` and re-derives the local card's row
+from the driver, so the table is checked against hardware at least once:
+
+| | optin | per-chunk | shared |
+|---|---|---|---|
+| sm_75 T4, RTX 2080 | 64 K | 64 thr, 45 K | 384 thr, 46 K |
+| sm_80 A100 | 163 K | 128 thr, 90 K | 384 thr, 46 K |
+| sm_86 / 89 A10G, L4, RTX 4090 | 99 K | 128 thr, 90 K | 384 thr, 46 K |
+| sm_90 / 100 H100, B200 | 227 K | 128 thr, 90 K | 384 thr, 46 K |
+| sm_120 RTX 5080 | 99 K | 128 thr, 90 K | 384 thr, 46 K |
+
+Nothing declines. Turing is the only architecture the per-chunk picker steps
+down for, and it steps down to 64 threads — which measured *faster* than 128
+here, so the narrower block Turing is forced into costs it nothing.
+
+**A benchmark nobody else can run is not evidence.** `prep_synth.py` writes
+libbench's input from lmz's own encoder with no checkpoint and no 1.8 GB of
+cache to reproduce first, bisecting the decay to land on the entropy real
+exponents have — 2.78 bits a symbol, because refill rate is a direct function
+of it and a flatter buffer would measure a different machine. It reproduces
+the real planes within 2.4% at the shipped default (107.6 against 110.2 GB/s)
+and reproduces the 96-thread occupancy cliff too, and it leans the right way:
+340.5 MB coded against the real 336.1 MB, so it asks for slightly more refills
+per byte than real weights do. Twenty minutes on a rented card is now enough
+to produce a number comparable with this one.
 
 `lmz doctor --gpu-verify` is the asking. It builds streams with lmz's own
 encoder, decodes thirty distributions and batch shapes, checks lmz's own CPU

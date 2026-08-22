@@ -97,7 +97,7 @@ The first thing it does on any machine is decode a stream that machine just
 encoded and check the CPU decoder agrees; a device that disagrees is not used,
 and `lmz doctor` names it. The kernel is clean under `compute-sanitizer` and
 compiles for sm_75 through sm_121, but it has only ever been *run* on one
-card, so it verifies rather than assumes.
+card's silicon, so it verifies rather than assumes.
 
 **If you have a GPU that is not a Blackwell, this is worth thirty seconds:**
 
@@ -115,18 +115,24 @@ and right now there is one card's worth of it.
 **No GPU? A free Colab T4 is the card that matters most** —
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/FanxinSun/lmz/blob/main/docs/verify-on-colab.ipynb)
 
-Turing is the one open *correctness* question rather than an unknown number.
-Counting `cp.async` instructions in the generated code says why:
+Turing runs *different generated code*: it has no `cp.async` instruction, so
+the intrinsic falls back to a synchronous copy. Counting them says which
+architectures share the verified path:
 
-| | `LDGSTS` | unknown |
+| | `LDGSTS` | still unknown |
 |---|---|---|
-| **sm_75, Turing** | **0** | **correctness — different generated code** |
+| sm_75, Turing | **0** | throughput, and Turing's scheduler |
 | sm_80 / 86 / 89 | 38 | a throughput number |
 | sm_90 / 120 | 41 | a throughput number |
 
-Turing has no `cp.async` instruction, so the intrinsic falls back to a
-synchronous copy. Everything at sm_80 and above runs the algorithm that has
-already been verified byte-identical and checked under `compute-sanitizer`.
+That fallback is no longer code nothing has run. Built as PTX at `compute_75`
+and JIT'd onto a Blackwell, it decodes 936 MB byte-identically at every block
+size and is clean under `memcheck`, `racecheck` and `synccheck` — so what is
+left open for Turing is a number and a scheduler, not whether it decodes. It
+costs 21% against the `cp.async` path *on that card*, which prices the
+fallback without pretending to be a Turing measurement. Shared memory excludes
+nobody either: a T4's 64 KiB holds the per-chunk tables at 64 threads a block,
+which is the fastest row measured here.
 
 **CUDA is optional in every direction.** The wheel is pure Python, carries a
 `.cu` and no CUDA, and installing needs no toolkit. `nvcc`, if it is there, is
