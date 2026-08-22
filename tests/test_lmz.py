@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+import tracemalloc
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -1945,6 +1946,100 @@ def test_v3_q8_block_chunks_still_decode():
     got = codec.decode_chunk(payload, lmzformat.CODEC_BLK, 34, 0, len(data), 0,
                              False)
     assert bytes(got) == data
+
+
+def test_opening_a_huge_index_stays_cheap():
+    """Opening must not scale with the number of chunks.
+
+    The chunk table used to become one Python object per chunk at open: for a
+    70B checkpoint that is 70 MB of records turning into ~0.5 GB of objects
+    and about five seconds, paid by every process before it read a byte, and
+    it is why mounting a large store was expensive. The records are
+    fixed-width, so the decompressed bytes are already the index.
+
+    Sized so the old behaviour cannot pass: 400k chunks is roughly 100 MB of
+    objects, against a 12.8 MB table.
+    """
+    from lmz.format import RECORD, ChunkTable
+
+    n = 400_000
+    table = b"".join(RECORD.pack(i * 65536, i * 65536, 65536, 65536, 0, 1, 2, 0)
+                     for i in range(n))
+
+    tracemalloc.start()
+    try:
+        before = tracemalloc.get_traced_memory()[0]
+        t0 = time.perf_counter()
+        chunks = ChunkTable(table)
+        assert len(chunks) == n
+        cost = tracemalloc.get_traced_memory()[0] - before
+        elapsed = time.perf_counter() - t0
+    finally:
+        tracemalloc.stop()
+
+    # Materialising even one field of every chunk would be megabytes; this is
+    # a couple of attributes regardless of how many chunks there are.
+    assert cost < 100_000, f"opening allocated {cost} bytes for {n} chunks"
+    assert elapsed < 0.5, f"opening took {elapsed:.2f}s for {n} chunks"
+
+    # And it still behaves like the list it replaced.
+    assert chunks[0].dst == 0
+    assert chunks[-1].dst == (n - 1) * 65536
+    assert chunks[5].off == 5 * 65536
+    assert chunks[-1] == chunks[n - 1]
+    assert [c.dst for c in chunks[:3]] == [0, 65536, 131072]
+    try:
+        chunks[n]
+    except IndexError:
+        pass
+    else:
+        raise AssertionError("an out-of-range index must raise IndexError")
+
+    # The column shortcut has to agree with walking the records, or the
+    # aggregate paths that use it would report something different from the
+    # ones that iterate.
+    assert sum(chunks.column("clen")) == sum(c.clen for c in chunks)
+    assert list(chunks.column("dst")) == [c.dst for c in chunks]
+
+
+def test_chunk_order_survives_a_table_written_out_of_order():
+    """Chunks are appended as workers finish, so dst order is not the file's.
+
+    order_by_dst() skips the sort when the table is already ascending, which
+    is the common case -- and a wrong sortedness test would silently hand back
+    an unordered list, which every offset lookup downstream depends on.
+    """
+    from lmz.format import RECORD, ChunkTable
+
+    order = [3, 0, 4, 1, 2]
+    table = b"".join(RECORD.pack(1000 + i * 10, d * 65536, 10, 65536, 0, 1, 2, 0)
+                     for i, d in enumerate(order))
+    chunks = ChunkTable(table)
+
+    assert [c.dst for c in chunks] == [d * 65536 for d in order]
+    assert [c.dst for c in chunks.order_by_dst()] == [d * 65536 for d in sorted(order)]
+    # The payload offset must travel with its record rather than the position.
+    assert [c.off for c in chunks.order_by_dst()] == [1010, 1030, 1040, 1000, 1020]
+
+    ascending = b"".join(RECORD.pack(100, d * 65536, 10, 65536, 0, 1, 2, 0)
+                         for d in range(5))
+    assert [c.dst for c in ChunkTable(ascending).order_by_dst()] == \
+        [d * 65536 for d in range(5)]
+
+    # Equal destinations are not ascending-violating, and a single record and
+    # an empty table are the boundaries the zip-based check has to survive.
+    same = b"".join(RECORD.pack(100, 0, 10, 0, 0, 1, 2, 0) for _ in range(3))
+    assert len(ChunkTable(same).order_by_dst()) == 3
+    assert len(ChunkTable(RECORD.pack(1, 2, 3, 4, 0, 1, 2, 0)).order_by_dst()) == 1
+    assert ChunkTable(b"").order_by_dst() == []
+    assert len(ChunkTable(b"")) == 0
+
+    try:
+        ChunkTable(b"\0" * (RECORD.size + 1))
+    except FormatError:
+        pass
+    else:
+        raise AssertionError("a partial record must be rejected")
 
 
 def test_v1_archives_still_read():

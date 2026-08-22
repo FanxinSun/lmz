@@ -86,10 +86,17 @@
   the thread that would answer the fault never runs. `lmz mount` is a separate
   process by construction; embedding the server in a process that also reads
   the mount will deadlock.
-- **A large store costs memory to mount.** The chunk table is parsed into
-  Python objects at open: 305 bytes per 64 KiB block, which is 8 MiB for the
-  1.74 GiB model here and extrapolates to ~0.6 GiB for a 70B one, taking
-  about 11 s. That is the next thing to fix and it is a real limit today.
+- **A large store costs the size of its chunk table to open, and no more.**
+  The table used to be parsed into one Python object per chunk at open — 233
+  bytes per 64 KiB block, which for a 70B checkpoint is 0.51 GiB and about
+  5 s before a single byte is read. It is now read in place: the records are
+  fixed width, so the decompressed bytes *are* the index and a chunk is
+  unpacked when something asks for it. Opening a 70B index costs the 70 MB
+  the table actually occupies and about 140 ms, essentially all of it the
+  zstd decode. The trade is that touching one chunk costs a few microseconds
+  rather than an attribute load, so a caller that walks the whole table
+  repeatedly should hoist it into a list — `verify` and `mount` do, since
+  they were going to decode everything anyway.
 - GGUF block-quantised tensors are split on their ggml struct layout, which
   covers Q4_0 through Q8_1, every k-quant, the IQ types and the ternary ones.
   A layout this build does not recognise falls back to opaque bytes.

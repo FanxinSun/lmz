@@ -21,10 +21,13 @@ single-file and directory cases on exactly the same path.
 
 from __future__ import annotations
 
+import array
 import io
 import json
 import struct
+import sys
 from dataclasses import dataclass, field
+from itertools import islice
 
 MAGIC = b"LMZ\x01"
 TAIL = b"LMZTAIL\x01"
@@ -98,6 +101,116 @@ class Chunk:
     def pack(self) -> bytes:
         return RECORD.pack(self.off, self.dst, self.clen, self.rlen, self.crc,
                            self.codec, self.esize, self.flags)
+
+
+class ChunkTable:
+    """The chunk table, read in place instead of expanded into objects.
+
+    The table is fixed-width records, so the decompressed bytes *are* the
+    index and a `Chunk` can be built from any record on demand. Building all
+    of them up front is what used to dominate opening an archive: for a 70B
+    checkpoint the table is 70 MB of records that become 0.51 GB of Python
+    objects and take about 7 s, and the zstd decode of those 70 MB is only
+    0.07 s of it. Every process paid that before reading a single byte.
+
+    This holds the flat buffer and unpacks per access, which is a trade rather
+    than a free win: one record costs a few microseconds, so code that walks
+    the whole table repeatedly should hoist it into a list. The aggregate
+    columns below exist so the callers that only want a total do not have to.
+
+    A sequence, so anything that indexes, iterates, sorts or len()s a list of
+    chunks keeps working unchanged.
+    """
+
+    __slots__ = ("_buf", "_n")
+
+    def __init__(self, buf):
+        if len(buf) % RECORD_SIZE:
+            raise FormatError("chunk table has a partial record")
+        self._buf = buf
+        self._n = len(buf) // RECORD_SIZE
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return [self[k] for k in range(*i.indices(self._n))]
+        if i < 0:
+            i += self._n
+        if not 0 <= i < self._n:
+            raise IndexError("chunk index out of range")
+        return Chunk(*RECORD.unpack_from(self._buf, i * RECORD_SIZE))
+
+    def __iter__(self):
+        for rec in RECORD.iter_unpack(self._buf):
+            yield Chunk(*rec)
+
+    def column(self, name: str) -> "array.array":
+        """One field of every record, without building any Chunk.
+
+        `sum(c.clen for c in chunks)` over a 70B table builds 2.2M objects to
+        add one integer. Reading the column straight out of the buffer is
+        about a hundred times less work and is what `info` and the coverage
+        check want.
+        """
+        width, start = _COLUMNS[name]
+        code = _TYPECODE.get(width)
+        if code is None:                       # no native type of that width
+            return array.array("Q", [getattr(c, name) for c in self])
+        col = array.array(code)
+        col.frombytes(self._buf)
+        if sys.byteorder != "little":          # records are little-endian
+            col.byteswap()
+        stride = RECORD_SIZE // width
+        return col[start::stride]
+
+    def order_by_dst(self) -> list["Chunk"]:
+        """Every chunk, in destination order.
+
+        Chunks are appended as their workers finish, so the table is *nearly*
+        sorted but not reliably so, and the callers that need an order cannot
+        assume one.
+
+        This deliberately materialises in one `iter_unpack` pass and sorts the
+        objects, rather than sorting the packed column and then picking
+        records out by index: a per-record `unpack_from` loop measured almost
+        twice the cost of the single pass, which more than spends whatever the
+        cheaper sort saves. Sorting a column is the right instinct and the
+        wrong trade here, so it is written down rather than re-attempted.
+        """
+        out = list(self)
+        # islice rather than dst[1:], which would copy the whole column just
+        # to look at it once.
+        dst = self.column("dst")
+        if all(a <= b for a, b in zip(dst, islice(dst, 1, None))):
+            return out                  # already ordered: skip the sort
+        out.sort(key=_dst_of)
+        return out
+
+
+def _dst_of(c: "Chunk") -> int:
+    """Sort key for chunk order. A module-level function rather than a lambda
+    so the hot sort does not rebuild a closure per call site."""
+    return c.dst
+
+
+# field -> (width in bytes, index of the field's first element within a record
+# measured in units of that width). RECORD is "<QQIIIBBH": two u64 then three
+# u32 then two u8 and a u16, in 32 bytes.
+_COLUMNS = {
+    "off": (8, 0),
+    "dst": (8, 1),
+    "clen": (4, 4),
+    "rlen": (4, 5),
+    "crc": (4, 6),
+}
+
+# array's typecode widths are platform-defined rather than fixed, so they are
+# discovered instead of assumed; a build where nothing is 4 or 8 bytes falls
+# back to unpacking, which is slower but still correct.
+_TYPECODE = {array.array(c).itemsize: c for c in ("I", "L", "Q")
+             if array.array(c).itemsize in (4, 8)}
 
 
 @dataclass(slots=True)
@@ -248,16 +361,15 @@ class ArchiveReader:
         self.manifest = json.loads(_zstd_decompress(self.f.read(man_clen)))
         self.f.seek(table_off)
         table = _zstd_decompress(self.f.read(table_clen))
-        if len(table) % RECORD_SIZE:
-            raise FormatError("chunk table has a partial record")
-        self.chunks = [Chunk(*rec) for rec in RECORD.iter_unpack(table)]
+        self.chunks = ChunkTable(table)
 
         self.members = [Member.from_json(m) for m in self.manifest.get("members", [])]
 
     @property
     def payload_end(self) -> int:
         """First byte after the chunk payloads."""
-        return min((c.off for c in self.chunks), default=self.file_size)
+        off = self.chunks.column("off")
+        return min(off) if off else self.file_size
 
     @property
     def page_mapped(self) -> bool:

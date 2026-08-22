@@ -818,6 +818,17 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
 # ---------------------------------------------------------------- decompress
 
 
+def _by_dst(chunks):
+    """Chunks in destination order, whatever kind of sequence they came in.
+
+    A ChunkTable can order itself from the packed u64 column and build each
+    Chunk once; a plain list is already objects and just sorts. Both callers
+    below want the same list out.
+    """
+    order = getattr(chunks, "order_by_dst", None)
+    return order() if order is not None else sorted(chunks, key=lambda c: c.dst)
+
+
 def _range_resolver(chunks, payload_of, verify_checksums: bool):
     """A function that materialises the bytes at any earlier output range.
 
@@ -827,7 +838,7 @@ def _range_resolver(chunks, payload_of, verify_checksums: bool):
     may not itself be a ref or a delta, which keeps resolution a single hop
     instead of a chain of unknown depth.
     """
-    ordered = sorted(chunks, key=lambda c: c.dst)
+    ordered = _by_dst(chunks)
     starts = [c.dst for c in ordered]
 
     def resolve(src: int, rlen: int) -> bytearray:
@@ -1027,11 +1038,18 @@ def _batches(items, size_of, target: int = DECODE_BATCH):
 def _check_coverage(chunks, total: int) -> None:
     """Confirm the chunks tile the output exactly, with no gap or overlap."""
     pos = 0
-    for c in sorted(chunks, key=lambda c: c.dst):
-        if c.dst != pos:
+    # Only the two u64/u32 columns are needed to check tiling, so on a large
+    # archive this walks the packed table rather than building every Chunk.
+    col = getattr(chunks, "column", None)
+    if col is not None:
+        pairs = sorted(zip(col("dst"), col("rlen")))
+    else:
+        pairs = sorted((c.dst, c.rlen) for c in chunks)
+    for dst, rlen in pairs:
+        if dst != pos:
             raise FormatError(
                 f"archive does not cover its output: gap or overlap at byte {pos}")
-        pos += c.rlen
+        pos += rlen
     if pos != total:
         raise FormatError(
             f"archive covers {pos} bytes but declares {total}")
@@ -1055,7 +1073,9 @@ def verify(src: str, *, workers: int | None = None, progress=None) -> Stats:
     pool = _FdPool([src], os.O_RDONLY)
     done = 0
 
-    ordered = sorted(chunks, key=lambda c: c.dst)
+    # verify decodes every chunk anyway, so materialising them all is what it
+    # was always going to do.
+    ordered = _by_dst(chunks)
     ordered_starts = [c.dst for c in ordered]
 
     def check_source(src: int, rlen: int, what: str):
@@ -1131,7 +1151,9 @@ def info(src: str) -> dict:
     with open(src, "rb") as fh:
         reader = ArchiveReader(fh)
         by_codec: dict[str, list[int]] = {}
+        payload_bytes = 0
         for c in reader.chunks:
+            payload_bytes += c.clen
             name = {0: "stored", 1: "entropy", 2: "split", 3: "bf16-split",
                     4: "ref", 5: "bf16-cond", 6: "q8-block",
                     7: "blk-split", 8: "delta"}.get(c.codec, "?")
@@ -1151,7 +1173,7 @@ def info(src: str) -> dict:
             # the chunk table cannot show because it names only the framing
             # codec. Absent from archives written before this was tracked.
             "methods": reader.manifest.get("methods") or {},
-            "payload_bytes": sum(c.clen for c in reader.chunks),
+            "payload_bytes": payload_bytes,
         }
 
 
@@ -1198,7 +1220,9 @@ class MappedArchive:
         except BaseException:
             self._fh.close()
             raise
-        self._chunks = sorted(self._reader.chunks, key=lambda c: c.dst)
+        # A mount resolves an arbitrary byte to a block on every read, so this
+        # is the one caller that genuinely wants every Chunk materialised.
+        self._chunks = _by_dst(self._reader.chunks)
         self._starts = [c.dst for c in self._chunks]
         self._decode = _chunk_decoder(self._chunks, self._payload_of, verify)
         self._cache: "OrderedDict[int, bytes]" = OrderedDict()

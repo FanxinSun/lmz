@@ -2,8 +2,8 @@
 
 *The pieces of work in lmz between a fast kernel and a residency layer, why
 each one is load-bearing, what is already measured about it, and where the
-boundary is between lmz and the thing that consumes it. One of the four has
-landed; this says what it cost and what it left. Written for whoever picks
+boundary is between lmz and the thing that consumes it. Two of the four have
+landed; this says what they cost and what they left. Written for whoever picks
 this up next, so that none of it has to be rediscovered.*
 
 [← back to the README](../README.md)
@@ -18,11 +18,12 @@ than plain safetensors end to end from cold disk to VRAM. `gpu_rans10.cu`
 carries the whole V0..V5 ladder and the ablations that attributed the time.
 
 The kernel is now also *shipped*: `lmz.gpu` is in the package, and item 2
-below records what that took. What still does not exist is a layer that can
-put it to work. The fast path needs a format option that is still an
-experiment, the archive index cannot be opened at the size a residency layer
-opens it at, and nothing can ask an archive where a tensor's blocks are. That
-is three pieces of work, and none of them is research.
+below records what that took. The index can now be opened at the size a
+residency layer opens it at — item 3, which was the precondition the rest
+waited on. What still does not exist is a layer that can put the kernel to
+work: the fast path needs a format option that is still an experiment, and
+nothing can ask an archive where a tensor's blocks are. That is two pieces of
+work, and neither is research.
 
 The consumer is a residency engine that keeps weights coded in VRAM, in
 page-locked host RAM and on NVMe, and decodes them on the GPU. Its charter,
@@ -176,26 +177,49 @@ decodes to the same `plane`, and `plane` must be a multiple of 128, which the
 `scratchpad/gpu/metal/` is the Apple silicon port, **written but never run**.
 It is worth exactly what an unrun kernel is worth.
 
-## 3. The chunk table, which is the one that blocks a residency layer
+## 3. The chunk table, which was the one that blocked a residency layer — **done**
 
-`limitations.md` already calls this "the next thing to fix and it is a real
-limit today":
+`limitations.md` used to call this "the next thing to fix and it is a real
+limit today": the chunk table was parsed into one Python object per chunk at
+open, which for a 70B checkpoint is **0.51 GB and about 5 s** before a byte is
+read. For a compressor that is an annoyance. For a residency engine it is
+fatal: the archive is opened on every process start, a placement solver needs
+every extent before it can decide anything, and half a gigabyte of Python
+objects is a meaningful fraction of the host tier it is trying to manage.
 
-> A large store costs memory to mount. The chunk table is parsed into Python
-> objects at open: 305 bytes per 64 KiB block, which is 8 MiB for the
-> 1.74 GiB model here and extrapolates to **~0.6 GiB for a 70B one, taking
-> about 11 s**.
+**It needed no format change, because the records were already an index.**
+The table is fixed-width `RECORD`s, so the decompressed bytes can be held as
+they are and a `Chunk` unpacked when something asks for one. `ChunkTable` is
+that, and it is a sequence, so the nine call sites that indexed, iterated,
+sorted or `len`'d a list kept working untouched.
 
-For a compressor that is an annoyance. For a residency engine it is fatal:
-the archive is opened on every process start, a placement solver needs every
-extent before it can decide anything, and 0.6 GB of Python objects is a
-meaningful fraction of the host tier it is trying to manage.
+| 70B index, 2.2M chunks | before | after |
+|---|---|---|
+| open | 5.1 s | 54 µs |
+| resident | 0.51 GB | the 70 MB table |
+| one lookup | attribute load | ~5 µs |
 
-What it needs is an on-disk index that is **mmapped and used in place** —
-fixed-width records, sorted, binary-searched or directly indexed, with no
-Python objects between the file and a block address. Opening a 70B archive
-should cost a page fault, not eleven seconds. Everything else in this
-handover is an improvement; this one is a precondition.
+**The measurement that decided the design.** Of the 5 s, the zstd decode of
+those 70 MB is 0.07 s; everything else was building objects. So keeping the
+flat buffer captures essentially all of the win, and mmapping the file — the
+obvious move, and what this section used to ask for — would have needed the
+table stored uncompressed to work at all. It buys 0.07 s and costs a format
+change. Not worth it.
+
+**Two traps found while building it, both measured rather than reasoned.**
+Sorting the packed `dst` column and then pulling records out by index is the
+natural instinct and is *slower*: a per-record `unpack_from` loop cost 2.08 s
+against 1.13 s for one `iter_unpack` pass, which more than spends what the
+cheaper sort saves. And the aggregate paths (`info`, the coverage check) do
+want the column — `sum(c.clen for c in chunks)` built 2.2M objects to add one
+integer, and reading the column instead is about twice as fast *and* allocates
+nothing. `order_by_dst()` ends up 1.7× faster than the old sort because it
+also skips sorting entirely when the table is already ascending, which is the
+common case.
+
+What is still true: a caller that walks the whole table repeatedly should
+hoist it into a list, and `verify` and `mount` do, since they were going to
+materialise everything anyway.
 
 ## 4. Tensor-level addressing
 
