@@ -332,20 +332,28 @@ throughput number, and at it the open question was correctness.
 **A code path can be run on silicon it was not compiled for, which is how the
 sm_75 question got answered without a Turing.** `-arch=compute_75` emits PTX
 and no cubin, so `__CUDA_ARCH__` is 750 while the header picks its scalar
-branch, and the driver JITs the result onto whatever card is present. Turing's
-generated code, run on a Blackwell over the same 936 MB:
+branch, and the driver JITs the result onto whatever card is present. That
+works for every architecture, not just Turing, so each variant lmz can emit
+was run on a Blackwell over the same 936 MB:
 
-| | per-chunk tables |
-|---|---|
-| sm_120 codegen, 41 `LDGSTS` | 110.2 GB/s, byte-identical |
-| sm_75 codegen, 0 `LDGSTS` | 86.7 GB/s, byte-identical |
+| codegen | `LDGSTS` | per-chunk | shared |
+|---|---|---|---|
+| sm_120, native | 41 | 110.2 GB/s | 417.4 GB/s |
+| sm_90 | 41 | 104.4 GB/s | — |
+| sm_80 / 86 / 89 | 38 | 104.4 GB/s | — |
+| sm_75 | 0 | 86.7 GB/s | 391.8 GB/s |
 
-byte-identical at all seven block sizes, and clean under `memcheck`,
-`racecheck` and `synccheck`. **This does not measure a T4** — it is Turing's
-code on the wrong silicon, so the 21% is what dropping `cp.async` costs a
-Blackwell. What it does settle is that the fallback decodes and does not race,
-which was the only *correctness* gap in the matrix. A real T4 is now wanted for
-its number and its scheduler rather than to find out whether it works.
+Every one byte-identical, at all seven block sizes. Both kernels under sm_75
+are also clean under `memcheck`, `racecheck` and `synccheck` — the shared one
+too, which the first pass missed by sanitizing only `k_perstream`.
+
+**This does not measure a T4.** It is each architecture's code on the wrong
+silicon, so the 21% sm_75 gives up is what dropping `cp.async` costs a
+Blackwell, not what Turing does. What it settles is that every variant lmz can
+emit decodes and does not race, which was the whole *correctness* column. A
+real T4 is now wanted for its number and its scheduler rather than to find out
+whether it works. The JIT'd rows sitting 5% under native is itself expected —
+the driver's JIT is not `ptxas -O3` on the exact target.
 
 **A device that cannot fit the tables is refused, and that is arithmetic over
 one number, so no rented card is needed to check it either.**

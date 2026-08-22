@@ -125,14 +125,14 @@ architectures share the verified path:
 | sm_80 / 86 / 89 | 38 | a throughput number |
 | sm_90 / 120 | 41 | a throughput number |
 
-That fallback is no longer code nothing has run. Built as PTX at `compute_75`
-and JIT'd onto a Blackwell, it decodes 936 MB byte-identically at every block
-size and is clean under `memcheck`, `racecheck` and `synccheck` — so what is
-left open for Turing is a number and a scheduler, not whether it decodes. It
-costs 21% against the `cp.async` path *on that card*, which prices the
-fallback without pretending to be a Turing measurement. Shared memory excludes
-nobody either: a T4's 64 KiB holds the per-chunk tables at 64 threads a block,
-which is the fastest row measured here.
+That fallback is no longer code nothing has run. `compute_75` emits PTX and no
+cubin, so the driver has to JIT it — which means Turing's generated code can
+be run on a card that is not a Turing. It decodes 936 MB byte-identically at
+every block size, on both kernels, and is clean under `memcheck`, `racecheck`
+and `synccheck`; so are sm_80, sm_86, sm_89 and sm_90. What is left open for
+Turing is a number and a scheduler, not whether it decodes. Shared memory
+excludes nobody either: a T4's 64 KiB holds the per-chunk tables at 64 threads
+a block, which is the fastest row measured here.
 
 **CUDA is optional in every direction.** The wheel is pure Python, carries a
 `.cu` and no CUDA, and installing needs no toolkit. `nvcc`, if it is there, is
