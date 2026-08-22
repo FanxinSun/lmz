@@ -96,10 +96,11 @@ one stream never fills a GPU however large it is, and many streams at once do.
 The first thing it does on any machine is decode a stream that machine just
 encoded and check the CPU decoder agrees; a device that disagrees is not used,
 and `lmz doctor` names it. The kernel is clean under `compute-sanitizer` and
-compiles for sm_75 through sm_121, but it has only ever been *run* on one
-card's silicon, so it verifies rather than assumes.
+compiles for sm_75 through sm_121. It has been *run* on two architectures —
+an RTX 5080 and a Tesla T4 — which are the two ends of the range and the two
+that generate different code, so it verifies rather than assumes.
 
-**If you have a GPU that is not a Blackwell, this is worth thirty seconds:**
+**If you have a GPU, this is worth thirty seconds:**
 
 ```
 lmz doctor --gpu-verify
@@ -110,29 +111,31 @@ CPU decoder agrees with every byte — no data file, no network, no login: the
 streams are built by lmz's own encoder, so the oracle travels with the
 question. Paste the block into
 [an issue](https://github.com/FanxinSun/lmz/issues). A pass is evidence too,
-and right now there is one card's worth of it.
+and an **Ampere, Ada or Hopper** is the gap now: those are the cards nobody
+has run.
 
-**No GPU? A free Colab T4 is the card that matters most** —
+**No GPU? A free Colab T4 takes one click** —
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/FanxinSun/lmz/blob/main/docs/verify-on-colab.ipynb)
 
 Turing runs *different generated code*: it has no `cp.async` instruction, so
 the intrinsic falls back to a synchronous copy. Counting them says which
-architectures share the verified path:
+architectures share which path:
 
-| | `LDGSTS` | still unknown |
+| | `LDGSTS` | run on real silicon |
 |---|---|---|
-| sm_75, Turing | **0** | throughput, and Turing's scheduler |
-| sm_80 / 86 / 89 | 38 | a throughput number |
-| sm_90 / 120 | 41 | a throughput number |
+| sm_75, Turing | **0** | **yes — Tesla T4, 30/30 byte-identical** |
+| sm_80 / 86 / 89 | 38 | not yet |
+| sm_90 / 120 | 41 | **yes — RTX 5080, 936 MB byte-identical** |
 
-That fallback is no longer code nothing has run. `compute_75` emits PTX and no
-cubin, so the driver has to JIT it — which means Turing's generated code can
-be run on a card that is not a Turing. It decodes 936 MB byte-identically at
-every block size, on both kernels, and is clean under `memcheck`, `racecheck`
-and `synccheck`; so are sm_80, sm_86, sm_89 and sm_90. What is left open for
-Turing is a number and a scheduler, not whether it decodes. Shared memory
-excludes nobody either: a T4's 64 KiB holds the per-chunk tables at 64 threads
-a block, which is the fastest row measured here.
+The synchronous fallback is not a guess: a Tesla T4 decodes all thirty shapes
+byte-identically, and separately, `compute_75` built as PTX with no cubin —
+so the driver must JIT it — decodes 936 MB byte-identically at every block
+size on both kernels and is clean under `memcheck`, `racecheck` and
+`synccheck`. Ampere through Hopper sit *between* two architectures that have
+both been verified on hardware, and their generated code has been JIT-run and
+sanitized too, so what is open there is a throughput number rather than a
+question of whether it works. Shared memory excludes nobody either: a T4's
+64 KiB holds the per-chunk tables at 64 threads a block.
 
 **CUDA is optional in every direction.** The wheel is pure Python, carries a
 `.cu` and no CUDA, and installing needs no toolkit. `nvcc`, if it is there, is

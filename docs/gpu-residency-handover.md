@@ -317,7 +317,10 @@ compares against `lmz_rans_decode`, and skips where there is no GPU.
 **One card is one card, and the doc's own trap applies here.** What has been
 run on an RTX 5080 cannot be run on a Turing or a Hopper without one — so the
 evidence was widened in every direction that does not need the hardware, and
-there turned out to be more of those than expected:
+there turned out to be more of those than expected. A free T4 then closed the
+one direction that did need it; the whole sequence is below, in the order it
+happened, because the cheap steps are what made the last one a confirmation
+rather than a gamble:
 
 **And the decoder checks itself before it is used.** The first thing it ever
 does on a machine is decode a stream that machine just encoded and compare
@@ -353,7 +356,9 @@ Turing has no `cp.async` instruction, so `__pipeline_memcpy_async` falls back
 to a synchronous copy and sm_75 is *different generated code*. Everything at
 sm_80 and above runs the algorithm that was verified and sanitized here and
 differs only in scheduling, so above the Turing line the open question was a
-throughput number, and at it the open question was correctness.
+throughput number, and at it the open question was correctness. That made a
+free Colab T4 worth more than a rented A100, which is why the notebook exists
+and why it asks for the card it does.
 
 **A code path can be run on silicon it was not compiled for, which is how the
 sm_75 question got answered without a Turing.** `-arch=compute_75` emits PTX
@@ -376,10 +381,38 @@ too, which the first pass missed by sanitizing only `k_perstream`.
 **This does not measure a T4.** It is each architecture's code on the wrong
 silicon, so the 21% sm_75 gives up is what dropping `cp.async` costs a
 Blackwell, not what Turing does. What it settles is that every variant lmz can
-emit decodes and does not race, which was the whole *correctness* column. A
-real T4 is now wanted for its number and its scheduler rather than to find out
-whether it works. The JIT'd rows sitting 5% under native is itself expected —
-the driver's JIT is not `ptxas -O3` on the exact target.
+emit decodes and does not race, which was the whole *correctness* column. The
+JIT'd rows sitting 5% under native is itself expected — the driver's JIT is
+not `ptxas -O3` on the exact target.
+
+**And then a real T4 ran it, which is the thing none of the above could
+substitute for.** Via the Colab notebook, on a stock runtime with nothing
+built by hand:
+
+    lmz 1.1.3 GPU verification
+      device   Tesla T4 sm_75 40 SMs
+      shapes   30 decoded byte-identically to the CPU decoder
+      verdict  OK
+
+CUDA 12.8, driver 580.82.07, compute capability 7.5. Every step ran as
+shipped: `pip install lmzip` fetched a pure-Python wheel with no CUDA in it,
+`build.py` found the toolkit and targeted `sm_75`, the out-of-process probe
+cleared the driver, the self-test agreed with the CPU coder, and thirty
+distributions and batch shapes came back byte-identical.
+
+**Two predictions this turned into measurements.** `pick_tpb` was expected to
+step the per-chunk kernel down to 64 threads inside Turing's 64 KiB, and the
+64 KiB figure came from a table rather than from a T4; both held. And the
+`_ARCH_FLOOR` of 7.5 is a boundary the only sm_75 card sits exactly on — an
+off-by-one there would have declined every Turing with a plausible-sounding
+message instead of decoding.
+
+**What is still open is now only Ampere through Hopper, and only as a
+number.** sm_75 and sm_120 are the two ends of the supported range, they are
+the two that generate *different* code, and both have now been verified on
+real silicon. sm_80/86/89/90 sit between them, share the 38/41 `LDGSTS` path,
+and have been JIT-run and sanitized here — so a report from an A100, A10G, L4
+or H100 buys a throughput figure, not an answer to whether it works.
 
 **A device that cannot fit the tables is refused, and that is arithmetic over
 one number, so no rented card is needed to check it either.**
@@ -413,4 +446,6 @@ to produce a number comparable with this one.
 `lmz doctor --gpu-verify` is the asking. It builds streams with lmz's own
 encoder, decodes thirty distributions and batch shapes, checks lmz's own CPU
 decoder agrees with every byte, and prints a block worth pasting. No data
-files and no network: the oracle travels with the question.
+files and no network: the oracle travels with the question. That is what a
+stock Colab T4 ran to produce the sm_75 result above, so the mechanism is not
+theoretical — the same one click now wants an Ampere or an Ada.
