@@ -298,11 +298,13 @@ there turned out to be more of those than expected:
 **And the decoder checks itself before it is used.** The first thing it ever
 does on a machine is decode a stream that machine just encoded and compare
 against `lmz_rans_decode`; a device that disagrees is not used at all, and
-`lmz doctor` says so by name. This is the mitigation that actually covers an
-architecture nobody has run, because a silently wrong decoder is far worse
+`lmz doctor` says so by name. This is the mitigation that actually covers
+silicon nobody has run on, because a silently wrong decoder is far worse
 than an absent one — the caller gets weights back rather than an error. It
-costs one launch, after a CUDA context that was being created anyway: 281 ms
-for the whole first probe, context included.
+costs one launch, after a CUDA context that was being created anyway: 385 ms
+for the whole first probe, context and the out-of-process driver check
+included, and 2 µs for every call after it. It was 281 ms before that check
+was added, so surviving a broken driver costs about 100 ms once per process.
 
     compute-sanitizer --tool=memcheck   python3 -c ...   # 0 errors
     compute-sanitizer --tool=racecheck  python3 -c ...   # 0 hazards
