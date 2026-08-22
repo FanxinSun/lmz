@@ -2384,6 +2384,44 @@ def test_gpu_probe_survives_a_driver_that_crashes():
         gpu._PROBE_SOURCE = saved
 
 
+def test_colab_notebook_still_opens():
+    """The badge in the README is the only path most people will ever take.
+
+    It is a JSON file that gets hand-edited whenever the evidence changes, and
+    a stray comma makes Colab show a load error instead of the notebook -- at
+    which point the field reports simply stop arriving and nothing says why.
+    The runtime metadata matters just as much: without `accelerator` and a T4
+    `gpuType` the notebook opens on a CPU runtime, prints "no CUDA device",
+    and asks a card-specific question of no card at all.
+    """
+    path = os.path.join(ROOT, "docs", "verify-on-colab.ipynb")
+    with open(path, encoding="utf-8") as fh:
+        nb = json.load(fh)
+
+    assert nb["metadata"]["accelerator"] == "GPU"
+    assert nb["metadata"]["colab"]["gpuType"] == "T4"
+    assert nb["nbformat"] == 4
+
+    cells = nb["cells"]
+    assert cells, "an empty notebook opens fine and asks nothing"
+    for c in cells:
+        assert c["cell_type"] in ("markdown", "code")
+        # nbformat allows a bare string here and Colab reads it, but an editor
+        # that rewrites one cell that way turns the next prose change into a
+        # single 3000-character line nobody can review. Keep the line lists.
+        assert isinstance(c["source"], list), c["cell_type"]
+        if c["cell_type"] == "code":
+            assert "outputs" in c and "execution_count" in c
+
+    body = "\n".join("".join(c["source"]) for c in cells)
+    # The two things the notebook exists to do: install the published wheel
+    # and run the check. A doc edit that loses either leaves a page that reads
+    # well and reports nothing.
+    assert "pip install -q lmzip" in body
+    assert "doctor --gpu-verify" in body
+    assert "github.com/FanxinSun/lmz/issues" in body
+
+
 def test_gpu_build_declines_hardware_it_cannot_target():
     """A card below the floor is declined with a reason, not a compiler error.
 
