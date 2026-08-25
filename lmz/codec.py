@@ -373,12 +373,33 @@ def _encode_stream(buf, level: int, method: int, plane: bool = False, sink=None,
             best = None
         # A stream the general-purpose coder barely dented may still be a
         # plain symbol distribution -- quantised INT8 weights, for one.
-        if kernels.have_rans() and (best is None or len(best) > n - (n >> 5)):
+        #
+        # This used to run only where zstd had failed to dent the stream by
+        # 1/32, which is a threshold int8 weights never reach: a per-channel
+        # scale maps each filter's maximum to 127 and leaves the body
+        # concentrated, so zstd saves a comfortable 10-11% and rANS was never
+        # priced. It is worth pricing anyway, and not only for the ~0.8 points
+        # it wins there. `lmz.gpu` decodes rANS and nothing else, so a chunk
+        # that lands on METHOD_ZSTD can never ride the batch decoder -- for
+        # int8, the dtype every deployed perception model uses, choosing zstd
+        # by default strands the weights on the CPU permanently.
+        #
+        # `cost` is a floor on what rANS will charge. The general path is not
+        # given a histogram, so one is counted here -- a single pass over a
+        # stream zstd has already read, against a second full compression it
+        # saves wherever the floor says rANS cannot win.
+        if kernels.have_rans() and best is not None and cost is None:
+            hist = kernels.histogram(buf)
+            cost = _rans_cost(hist, n)
+        if kernels.have_rans() and (best is None or cost is None
+                                    or cost < len(best)):
             alt = kernels.rans_encode(buf, hist)
             if alt is not None:
                 if best is None:
                     best_method, best = entropy.METHOD_RANS, alt
-                elif len(alt) < len(best):
+                elif len(alt) <= len(best):
+                    # Ties go to rANS: same bytes on disk, and the GPU can
+                    # decode it.
                     alt_size = len(best)   # both ran, so the loser is measured
                     best_method, best = entropy.METHOD_RANS, alt
                 else:

@@ -11,6 +11,7 @@ import errno
 import hashlib
 import io
 import json
+import math
 import os
 import shutil
 import stat
@@ -1415,6 +1416,50 @@ def test_pytorch_bin_layout_and_roundtrip():
         # Two of four byte planes in the fp32 payload are zeros; anything
         # near or below 1.5x means the container was not really parsed.
         assert stats.ratio > 1.5, f"fp32-from-bf16 only reached {stats.ratio:.3f}x"
+
+
+def test_int8_weights_are_coded_with_rans_not_zstd():
+    """int8 planes must reach the coder the GPU can decode.
+
+    A 1-byte element has no plane split, so an int8 tensor takes the general
+    path. rANS used to be priced there only where zstd had failed to dent the
+    stream by 1/32 -- a bar quantised weights never clear, because a
+    per-channel scale maps each filter's peak to 127 and leaves the body
+    concentrated enough for zstd to save a comfortable tenth. So rANS was
+    never tried, and `lmz.gpu`, which decodes rANS and nothing else, could
+    never touch an int8 archive.
+
+    The size difference is small either way. The point is which decoder can
+    read the result.
+    """
+    if not kernels.have_rans():
+        raise Skip("no native rANS kernel")
+
+    # A per-channel int8 weight plane: symmetric and peaked, but with no long
+    # repeats -- the distribution is the only structure, which is exactly the
+    # case a symbol coder wins and a match finder does not. Mapping distinct
+    # random bytes through a bell curve keeps every byte independent.
+    n = 1 << 20
+    bell = bytes(max(0, min(255, int(128 + 34 * math.sqrt(-2 * math.log(
+        (i + 0.5) / 256)) * math.cos(i * 2.39996))))
+        for i in range(256))
+    plane = rand(n, 9).translate(bell)
+
+    used, payload = codec._encode_stream(plane, 1, entropy.METHOD_ZSTD)
+    assert used == entropy.METHOD_RANS, entropy.METHOD_NAMES.get(used)
+    assert len(payload) < n
+    assert bytes(entropy.decompress(payload, used, n)) == plane
+
+    # Where a general-purpose coder genuinely wins -- long repeats, which are
+    # matches rather than symbol statistics -- it must still be chosen.
+    repetitive = b"the quick brown fox jumps over the lazy dog. " * 20000
+    used, _ = codec._encode_stream(repetitive, 1, entropy.METHOD_ZSTD)
+    assert used == entropy.METHOD_ZSTD, entropy.METHOD_NAMES.get(used)
+
+    # And incompressible bytes must still be stored, without either coder
+    # being run to find that out.
+    used, out = codec._encode_stream(rand(1 << 20, 77), 1, entropy.METHOD_ZSTD)
+    assert used == entropy.METHOD_STORED
 
 
 def test_shared_table_streams_are_ordinary_streams():
