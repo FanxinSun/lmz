@@ -1616,15 +1616,53 @@ def test_int8_weights_are_coded_with_rans_not_zstd():
     assert bytes(entropy.decompress(payload, used, n)) == plane
 
     # Where a general-purpose coder genuinely wins -- long repeats, which are
-    # matches rather than symbol statistics -- it must still be chosen.
+    # matches rather than symbol statistics -- it must still be chosen, and
+    # that holds whichever general coder this interpreter has. Naming zstd
+    # here would only test which Python is running: before 3.14 without the
+    # package there is none, and the fallback is deflate.
     repetitive = b"the quick brown fox jumps over the lazy dog. " * 20000
-    used, _ = codec._encode_stream(repetitive, 1, entropy.METHOD_ZSTD)
-    assert used == entropy.METHOD_ZSTD, entropy.METHOD_NAMES.get(used)
+    used, out = codec._encode_stream(repetitive, 1, entropy.METHOD_ZSTD)
+    assert used in (entropy.METHOD_ZSTD, entropy.METHOD_DEFLATE), \
+        entropy.METHOD_NAMES.get(used)
+    # rANS on this stream is ~500 KB against deflate's ~5 KB, so choosing it
+    # would be a 90x regression rather than a close call.
+    assert len(out) < len(repetitive) // 100
 
     # And incompressible bytes must still be stored, without either coder
     # being run to find that out.
     used, out = codec._encode_stream(rand(1 << 20, 77), 1, entropy.METHOD_ZSTD)
     assert used == entropy.METHOD_STORED
+
+
+def test_a_missing_general_coder_does_not_hand_everything_to_rans():
+    """Without zstd, the fallback must still be priced against rANS.
+
+    Before 3.14 and without the `zstandard` package there is no zstd, so a
+    caller asking for it gets UnsupportedMethod. That used to leave the
+    general path with no candidate at all, and the branch that takes rANS
+    when nothing else worked would then accept it unpriced -- on text with
+    long repeats that is ~500 KB against deflate's ~5 KB, a ninety-fold
+    regression on exactly the interpreters that already compress worst.
+    """
+    if not kernels.have_rans():
+        raise Skip("no native rANS kernel")
+
+    repetitive = b"the quick brown fox jumps over the lazy dog. " * 20000
+    saved = (entropy._zstd_compress, entropy.HAVE_ZSTD, entropy.DEFAULT_METHOD)
+    try:
+        entropy._zstd_compress = None
+        entropy.HAVE_ZSTD = False
+        entropy.DEFAULT_METHOD = entropy.METHOD_DEFLATE
+        used, out = codec._encode_stream(repetitive, 1, entropy.METHOD_ZSTD)
+        assert used == entropy.METHOD_DEFLATE, entropy.METHOD_NAMES.get(used)
+        assert len(out) < len(repetitive) // 100, len(out)
+    finally:
+        (entropy._zstd_compress, entropy.HAVE_ZSTD,
+         entropy.DEFAULT_METHOD) = saved
+
+    # And with zstd back, the same stream picks it up again.
+    used, _ = codec._encode_stream(repetitive, 1, entropy.METHOD_ZSTD)
+    assert used in (entropy.METHOD_ZSTD, entropy.METHOD_DEFLATE)
 
 
 def test_shared_table_streams_are_ordinary_streams():

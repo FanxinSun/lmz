@@ -369,6 +369,17 @@ def _encode_stream(buf, level: int, method: int, plane: bool = False, sink=None,
         try:
             best = entropy.compress(buf, level, method)
             best_method = method
+        except entropy.UnsupportedMethod:
+            # The caller named a coder this interpreter does not have -- zstd
+            # on anything before 3.14 without the package. Fall back to the
+            # one it does have rather than leaving `best` empty, which would
+            # hand the stream to rANS below without ever pricing it against a
+            # general-purpose coder.
+            try:
+                best = entropy.compress(buf, level, entropy.DEFAULT_METHOD)
+                best_method = entropy.DEFAULT_METHOD
+            except Exception:
+                best = None
         except Exception:
             best = None
         # A stream the general-purpose coder barely dented may still be a
@@ -388,7 +399,7 @@ def _encode_stream(buf, level: int, method: int, plane: bool = False, sink=None,
         # given a histogram, so one is counted here -- a single pass over a
         # stream zstd has already read, against a second full compression it
         # saves wherever the floor says rANS cannot win.
-        if kernels.have_rans() and best is not None and cost is None:
+        if kernels.have_rans() and cost is None:
             hist = kernels.histogram(buf)
             cost = _rans_cost(hist, n)
         if kernels.have_rans() and (best is None or cost is None
