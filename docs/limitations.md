@@ -19,9 +19,19 @@
   a C compiler exists. Without one, compression falls back to zstd (~31%
   instead of ~34%) and archives already written with rANS cannot be read —
   `./lmz-cli doctor` reports which backend is live.
-- **Already-quantised weights are mostly entropy — with one exception.**
-  Raw INT8 checkpoints are detected and stored unchanged. **FP8 is not one of
-  them**: `F8_E4M3` is a float, 1 sign + 4 exponent + 3 mantissa, and trained
+- **Already-quantised weights are mostly entropy — with two exceptions.**
+  This line used to say raw INT8 checkpoints were "detected and stored
+  unchanged". The tree has never done that: `I8` is a 1-byte element like any
+  other, every chunk under 7.98 bits/byte is priced and coded, and
+  **per-channel INT8 weights code well** — a 38 MB per-channel INT8 whisper
+  checkpoint gives up **16.7%**, byte-exact, against a 14.2% order-0 bound on
+  the weight bytes alone. The reading that produced the wrong sentence came
+  from GGUF Q8_0, whose quant payload really is flat at 7.64 of 8 bits;
+  per-channel INT8 is a different distribution, because mapping each filter's
+  maximum to 127 leaves the Gaussian body concentrated at 5.9–7.2 bits. Those
+  weights are also now coded with rANS rather than zstd, which is what lets
+  the GPU decoder read them. **FP8 is the other exception**:
+  `F8_E4M3` is a float, 1 sign + 4 exponent + 3 mantissa, and trained
   weights skew its exponent just as they skew BF16's. Measured on a real
   Qwen3.6-27B-FP8 shard (99.7% `F8_E4M3`), lmz removes **17.1%**, byte-exact.
   There is almost nothing left after that: the order-0 bound is 17.7%, and

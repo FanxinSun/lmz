@@ -8,7 +8,7 @@ import os
 import sys
 import time
 
-from . import __version__, api
+from . import __version__, api, entropy
 from .format import FormatError
 from .parallel import default_workers
 
@@ -93,6 +93,14 @@ def cmd_compress(args) -> int:
         delta = stats.detail.get("delta_bytes", 0)
         if delta:
             print(f"  {human(delta)} coded as differences from an earlier file")
+        # An interpreter with no zstd binding silently codes every general
+        # chunk with deflate, which costs several points and looks like
+        # nothing at all -- until `doctor` is run, which nobody does after a
+        # ratio they were not expecting. Say it where the ratio is printed.
+        if not entropy.HAVE_ZSTD:
+            print("  note: no zstd backend, so general chunks used deflate "
+                  "and this archive is larger than lmz would normally make "
+                  "it; `lmz doctor` says what is available")
     return 0
 
 
