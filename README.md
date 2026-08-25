@@ -198,14 +198,18 @@ or [Alipay](assets/alipay.jpg) (打开支付宝，扫一扫). Thank you.
 - [**Using lmz**](docs/usage.md) — command line, Python API, the mount and the
   filesystem
 - [**Limitations**](docs/limitations.md) — where it does not pay, and what the
-  99 tests check
+  108 tests check
 - [**Vectorising the coder**](docs/vectorising-the-coder.md) — how the encoder
   reached arm64, the one piece of work still open, and the six that were tried
   and measured out flat
 - [**GPU residency handover**](docs/gpu-residency-handover.md) — the GPU
   decoder runs at 418 GB/s against a 28.8 GB/s PCIe link, so on that path
-  compression is free by 14×; what shipped as `lmz.gpu`, the three pieces of
+  compression is free by 14×; what shipped as `lmz.gpu`, the two pieces of
   work still between it and a residency layer, and where lmz's job ends
+- [**Perception codec handover**](docs/perception-codec-handover.md) — what
+  vision and audio models need that LLM checkpoints did not: int8 routed to
+  the coder the GPU can read, ONNX parsed, and the two expected ratio items
+  that dissolved under measurement and should stay dissolved
 
 Python 3.10+, no runtime dependencies. zstd comes from the standard library on
 3.14+; a C compiler, if present, is used once to build the SIMD kernel into the

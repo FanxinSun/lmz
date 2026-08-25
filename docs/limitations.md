@@ -69,10 +69,15 @@
   once and never by one, however large — that is the format's 8-state
   interleave, not the kernel's. And **an archive written today codes a
   frequency table per chunk**, which costs 3.8× against a table shared across
-  chunks: 111 GB/s versus 418 on the same 936 MB. The shared table is a
-  format option that has not landed; it is item 1 of
-  [gpu-residency-handover.md](gpu-residency-handover.md). The Apple silicon
-  port under `scratchpad/gpu/metal/` is still written and never run.
+  chunks: 111 GB/s versus 418 on the same 936 MB. The coder primitives for
+  the shared form now exist (`kernels.rans_table`, `rans_encode_shared`,
+  `rans_decode_shared`) and are verified against the ordinary decoder, but
+  no archive writes them yet: the format option is item 1 of
+  [gpu-residency-handover.md](gpu-residency-handover.md), and the
+  measurements that fix its design — the table must be shared per *plane
+  kind*, not per archive, which is otherwise six points worse — are in
+  [perception-codec-handover.md](perception-codec-handover.md). The Apple
+  silicon port under `scratchpad/gpu/metal/` is still written and never run.
 - **Decompressing to a file is I/O bound** on real storage. The gain there is
   that there are a third fewer bytes to move.
 - **The mount is slower than an uncompressed file on fast local storage.**
@@ -140,7 +145,7 @@
 python3 tests/test_lmz.py          # also runs under pytest
 ```
 
-99 tests covering kernel equivalence across all backends, element sizes and
+108 tests covering kernel equivalence across all backends, element sizes and
 block periods,
 rANS round-trips over adversarial distributions (including single-symbol
 streams, which exposed a frequency-field overflow), rANS landing within 2% of

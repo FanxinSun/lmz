@@ -65,6 +65,22 @@ by assumption, and the round-trip in the test suite. This is the one item
 that touches the format, and it is the one that should land first, because
 everything else can be built against a stream that already exists.
 
+**The coder side is now promoted, and the format side has a design it did
+not have here.** `lmz_rans_table`, `lmz_rans_encode_shared` and
+`lmz_rans_decode_shared` are in `lmzcore.c` with Python bindings, sharing
+the decode body with `lmz_rans_decode` rather than copying it, and refusing
+the two ways a shared table can silently corrupt: a symbol the table cannot
+represent, and a table that does not sum to the probability scale.
+
+What changed is the *scope* of the sharing. This section assumed one table
+per archive. Measured on real models, that is **six points worse** than a
+table per stream, because fp32 planes have unrelated distributions and one
+table fits none of them; a chunk-local table loses the same six. Sharing
+within a **plane kind, across chunks** is what wins — +1.5 to +2.5 points on
+perception models. So the manifest needs a table *set* keyed by plane kind,
+and `decode_chunk` needs it threaded in. The numbers are in
+[perception-codec-handover.md](perception-codec-handover.md).
+
 ## 2. The GPU decoder as a library, not a benchmark — **done**
 
 `lmz/gpu/` is the kernel promoted out of its benchmark. The entry point is a
