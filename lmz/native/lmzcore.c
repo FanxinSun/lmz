@@ -1388,6 +1388,86 @@ LMZ_API long lmz_rans_encode_h(const uint8_t *src, size_t n, uint8_t *dst,
     return rans_encode_impl(src, n, dst, cap, counts, 1);
 }
 
+/*
+ * Normalise counts to a frequency table the caller keeps, so many streams can
+ * be coded against one table instead of carrying 516 bytes each.
+ *
+ * Returns 0, or -1 if the counts are empty. `freqs` is the same table
+ * lmz_rans_encode writes into a stream header, so a caller that stores it once
+ * and prepends it to any stream below gets an ordinary lmz stream back --
+ * which is exactly how the round trip is verified.
+ */
+LMZ_API int lmz_rans_table(const uint64_t *counts, uint16_t *freqs)
+{
+    return rans_normalize(counts, freqs);
+}
+
+/*
+ * Encode against a caller-supplied table, writing no header.
+ *
+ * The output is a headerless stream: [8 initial states][coded bytes]. It is
+ * decoded by prepending the 516-byte header built from `freqs`, which makes
+ * it an ordinary lmz stream -- there is no second decoder, and no second
+ * format to keep in step.
+ *
+ * Returns the byte count, -1 on failure, or -2 when `src` contains a symbol
+ * the table gives zero frequency. That case is a caller error rather than a
+ * corruption: a shared table must come from counts covering every stream it
+ * will code, and a coder cannot represent a symbol it believes impossible.
+ * It is checked rather than assumed because getting it wrong silently would
+ * produce a stream that decodes to the wrong bytes.
+ */
+LMZ_API long lmz_rans_encode_shared(const uint8_t *src, size_t n, uint8_t *dst,
+                                    size_t cap, const uint16_t *freqs)
+{
+    if (n == 0) return -1;
+    if (cap < lmz_rans_bound(n)) return -1;
+
+    uint32_t sum = 0;
+    for (int s = 0; s < 256; s++) sum += freqs[s];
+    if (sum != RANS_PROB_SCALE) return -1;
+
+    RansEncSym syms[256];
+    uint32_t start = 0, maxf = 0;
+    for (int s = 0; s < 256; s++) {
+        if (freqs[s]) {
+            rans_enc_sym_init(&syms[s], start, freqs[s]);
+            if (freqs[s] > maxf) maxf = freqs[s];
+            start += freqs[s];
+        }
+    }
+
+    /* Every symbol present must be representable. One pass over a 256-entry
+     * occupancy map, not over the data twice. */
+    uint8_t seen[256];
+    memset(seen, 0, sizeof seen);
+    for (size_t i = 0; i < n; i++) seen[src[i]] = 1;
+    for (int s = 0; s < 256; s++)
+        if (seen[s] && !freqs[s]) return -2;
+
+    uint8_t *end = dst + cap;
+    uint8_t *ptr;
+#if LMZ_X86
+    if (lmz_have_avx2() && maxf <= RANS_SIMD_MAX_FREQ && n >= RANS_SIMD_MIN)
+        ptr = rans_enc_body_avx2(src, n, end, syms, freqs);
+    else
+#elif LMZ_NEON_ENC
+    if (maxf <= RANS_SIMD_MAX_FREQ && n >= RANS_SIMD_MIN)
+        ptr = rans_enc_body_neon(src, n, end, syms, freqs);
+    else
+#endif
+    {
+        (void)maxf;
+        ptr = rans_enc_body(src, n, end, syms);
+    }
+
+    size_t coded = (size_t)(end - ptr);
+    if (coded > cap) return -1;
+    memmove(dst, ptr, coded);
+    return (long)coded;
+}
+
+
 /* The portable path on its own, so the two can be held side by side. The
  * vector path must write the same bytes as this one -- that is the whole
  * basis for it being a speed change rather than a format change, and it is
@@ -1405,21 +1485,17 @@ LMZ_API long lmz_rans_encode(const uint8_t *src, size_t n, uint8_t *dst, size_t 
     return rans_encode_impl(src, n, dst, cap, NULL, 1);
 }
 
-/* Decode exactly `n` bytes. Returns 0 on success, -1 on malformed input. */
-LMZ_API int lmz_rans_decode(const uint8_t *src, size_t src_len, uint8_t *dst, size_t n)
+/*
+ * Decode `n` bytes of a coded body against an already-parsed table.
+ *
+ * Split out from lmz_rans_decode so a shared-table stream -- one whose 516
+ * header bytes live once for a whole chunk rather than once per stream --
+ * decodes through exactly this code and not a second copy of it. `src` points
+ * at the coded bytes, past any header.
+ */
+static int rans_decode_body(const uint16_t *freqs, const uint8_t *src,
+                            size_t src_len, uint8_t *dst, size_t n)
 {
-    if (n == 0) return src_len == 0 ? 0 : -1;
-    if (src_len < RANS_HEADER + 4 * RANS_STREAMS) return -1;
-    if (src[0] != RANS_MAGIC0 || src[1] != RANS_MAGIC1) return -1;
-
-    uint16_t freqs[256];
-    uint32_t sum = 0;
-    for (int s = 0; s < 256; s++) {
-        freqs[s] = (uint16_t)(src[4 + 2 * s] | ((uint16_t)src[5 + 2 * s] << 8));
-        sum += freqs[s];
-    }
-    if (sum != RANS_PROB_SCALE) return -1;
-
     /* One 32-bit entry per probability slot: frequency, cumulative start and
      * symbol together, so a decode step is a single dependent load. 16 KiB,
      * kept on the stack because a per-call heap allocation here would sit in
@@ -1440,7 +1516,7 @@ LMZ_API int lmz_rans_decode(const uint8_t *src, size_t src_len, uint8_t *dst, si
     }
     if (start != RANS_PROB_SCALE) return -1;
 
-    const uint8_t *ptr = src + RANS_HEADER;
+    const uint8_t *ptr = src;
     const uint8_t *limit = src + src_len;
     uint32_t state[RANS_STREAMS];
     for (int k = 0; k < RANS_STREAMS; k++) rans_dec_init(&state[k], &ptr);
@@ -1527,6 +1603,43 @@ LMZ_API int lmz_rans_decode(const uint8_t *src, size_t src_len, uint8_t *dst, si
             return -1;
     }
     return 0;
+}
+
+/* Decode exactly `n` bytes. Returns 0 on success, -1 on malformed input. */
+LMZ_API int lmz_rans_decode(const uint8_t *src, size_t src_len, uint8_t *dst, size_t n)
+{
+    if (n == 0) return src_len == 0 ? 0 : -1;
+    if (src_len < RANS_HEADER + 4 * RANS_STREAMS) return -1;
+    if (src[0] != RANS_MAGIC0 || src[1] != RANS_MAGIC1) return -1;
+
+    uint16_t freqs[256];
+    uint32_t sum = 0;
+    for (int s = 0; s < 256; s++) {
+        freqs[s] = (uint16_t)(src[4 + 2 * s] | ((uint16_t)src[5 + 2 * s] << 8));
+        sum += freqs[s];
+    }
+    if (sum != RANS_PROB_SCALE) return -1;
+
+    return rans_decode_body(freqs, src + RANS_HEADER, src_len - RANS_HEADER,
+                            dst, n);
+}
+
+/*
+ * Decode a headerless stream against a caller-supplied table.
+ *
+ * Equivalent to prepending the 516-byte header and calling lmz_rans_decode,
+ * without building that prefix for every stream in a chunk.
+ */
+LMZ_API int lmz_rans_decode_shared(const uint8_t *src, size_t src_len,
+                                   uint8_t *dst, size_t n,
+                                   const uint16_t *freqs)
+{
+    if (n == 0) return src_len == 0 ? 0 : -1;
+    if (src_len < 4 * RANS_STREAMS) return -1;
+    uint32_t sum = 0;
+    for (int s = 0; s < 256; s++) sum += freqs[s];
+    if (sum != RANS_PROB_SCALE) return -1;
+    return rans_decode_body(freqs, src, src_len, dst, n);
 }
 
 /* ------------------------------------------------- whole-chunk plane decode */

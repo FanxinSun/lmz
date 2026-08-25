@@ -23,6 +23,11 @@ _state = "unloaded"
 
 SUPPORTED_ESIZES = (1, 2, 4, 8)
 
+# A rANS stream header: magic(2) + reserved(2) + 256 little-endian uint16
+# frequencies, matching RANS_HEADER in the kernel. It is a constant of the
+# format, so a shared table is exactly this many bytes however it is stored.
+RANS_HEADER = 516
+
 # Widest fixed-period record split_stride/merge_stride accept, matching
 # LMZ_MAX_PERIOD in the kernel. The widest GGUF block in use is Q6_K's 210.
 MAX_PERIOD = 256
@@ -109,6 +114,14 @@ def _load_native():
                                                      ctypes.c_size_t, v]
             lib.lmz_rans_decode.restype = ctypes.c_int
             lib.lmz_rans_decode.argtypes = [v, ctypes.c_size_t, v, ctypes.c_size_t]
+            lib.lmz_rans_table.restype = ctypes.c_int
+            lib.lmz_rans_table.argtypes = [v, v]
+            lib.lmz_rans_encode_shared.restype = ctypes.c_long
+            lib.lmz_rans_encode_shared.argtypes = [v, ctypes.c_size_t, v,
+                                                   ctypes.c_size_t, v]
+            lib.lmz_rans_decode_shared.restype = ctypes.c_int
+            lib.lmz_rans_decode_shared.argtypes = [v, ctypes.c_size_t, v,
+                                                   ctypes.c_size_t, v]
             _lib = lib
             _state = "native:" + lib.lmz_isa().decode()
         except Exception:
@@ -850,6 +863,85 @@ def rans_encode(src, hist=None, portable: bool = False) -> bytes | None:
     if written < 0:
         return None
     return bytes(memoryview(buf)[:written])
+
+
+def rans_table(hist) -> bytes | None:
+    """The 516-byte stream header for `hist`, to be shared by many streams.
+
+    This is byte-for-byte the header `rans_encode` would write into a single
+    stream, which is what makes the shared form cheap to verify: prepending it
+    to a stream from `rans_encode_shared` yields an ordinary lmz stream, so the
+    existing decoder is the oracle rather than a second implementation.
+
+    The counts must cover every stream the table will code. A symbol with zero
+    frequency cannot be represented at all, and `rans_encode_shared` refuses
+    rather than emitting a stream that decodes to the wrong bytes.
+    """
+    lib = _load_native()
+    if lib is None:
+        return None
+    freqs = (ctypes.c_uint16 * 256)()
+    if lib.lmz_rans_table(_counts_arg(hist), freqs) != 0:
+        return None
+    hdr = bytearray(RANS_HEADER)
+    hdr[0:2] = b"R1"
+    for s in range(256):
+        hdr[4 + 2 * s] = freqs[s] & 0xFF
+        hdr[5 + 2 * s] = freqs[s] >> 8
+    return bytes(hdr)
+
+
+def _freqs_from_table(table):
+    """Unpack a 516-byte header back into the array the kernel takes."""
+    if len(table) != RANS_HEADER:
+        raise ValueError(f"a shared table is {RANS_HEADER} bytes")
+    freqs = (ctypes.c_uint16 * 256)()
+    mv = memoryview(table)
+    for s in range(256):
+        freqs[s] = mv[4 + 2 * s] | (mv[5 + 2 * s] << 8)
+    return freqs
+
+
+def rans_encode_shared(src, table) -> bytes | None:
+    """Encode against a shared table, writing no per-stream header.
+
+    Returns None when the kernel is unavailable, the input is empty, or `src`
+    holds a symbol the table cannot represent -- the last of which is a caller
+    error, and is refused here rather than silently mis-coded.
+    """
+    lib = _load_native()
+    if lib is None or len(src) == 0:
+        return None
+    n = len(src)
+    cap = lib.lmz_rans_bound(n)
+    buf = getattr(_rans_scratch, "buf", None)
+    if buf is None or len(buf) < cap:
+        buf = _rans_scratch.buf = bytearray(cap)
+    src_addr, _a = _ptr(src)
+    dst_addr, _b = _ptr(buf)
+    written = lib.lmz_rans_encode_shared(src_addr, n, dst_addr, cap,
+                                         _freqs_from_table(table))
+    if written < 0:
+        return None
+    return bytes(memoryview(buf)[:written])
+
+
+def rans_decode_shared(payload, n: int, table, out=None):
+    """Decode a headerless rANS stream against a shared table."""
+    lib = _load_native()
+    if lib is None:
+        raise RuntimeError(
+            "this archive uses lmz's rANS coder, which needs the native kernel; "
+            "a C compiler (cc/gcc/clang) is required to build it")
+    dst = out if (out is not None and len(out) >= n) else bytearray(n)
+    if n == 0:
+        return memoryview(dst)[:0]
+    src_addr, _a = _ptr(payload)
+    dst_addr, _b = _ptr(dst)
+    if lib.lmz_rans_decode_shared(src_addr, len(payload), dst_addr, n,
+                                  _freqs_from_table(table)) != 0:
+        raise ValueError("malformed rANS stream")
+    return memoryview(dst)[:n]
 
 
 def rans_decode(payload, n: int, out=None):

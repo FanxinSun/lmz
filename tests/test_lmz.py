@@ -1417,6 +1417,101 @@ def test_pytorch_bin_layout_and_roundtrip():
         assert stats.ratio > 1.5, f"fp32-from-bf16 only reached {stats.ratio:.3f}x"
 
 
+def test_shared_table_streams_are_ordinary_streams():
+    """A shared-table stream must decode through the untouched decoder.
+
+    The whole basis of the shared form is that lifting the 516-byte header out
+    of a stream leaves the coded bytes unchanged: prepend the table again and
+    it is an ordinary lmz stream. That makes `lmz_rans_decode` -- which knows
+    nothing about any of this -- the oracle, so there is no second decoder to
+    keep in step with the first.
+    """
+    if not kernels.have_rans():
+        raise Skip("no native rANS kernel")
+
+    plane, nstr = 8192, 24
+    # Peaked, the way a quantised weight plane is: a shared table is only
+    # interesting where the streams resemble each other.
+    table_map = bytes((abs(i - 128) // 3 + 100) % 256 for i in range(256))
+    segs = [rand(plane, seed + 1).translate(table_map) for seed in range(nstr)]
+
+    total = [0] * 256
+    for seg in segs:
+        for i, c in enumerate(kernels.histogram(seg)):
+            total[i] += c
+    shared = kernels.rans_table(total)
+    assert shared is not None and len(shared) == kernels.RANS_HEADER
+    assert shared[:2] == b"R1"
+
+    per_stream = headerless = 0
+    for seg in segs:
+        own = kernels.rans_encode(seg, kernels.histogram(seg))
+        coded = kernels.rans_encode_shared(seg, shared)
+        assert coded is not None
+        per_stream += len(own)
+        headerless += len(coded)
+        # The oracle, and the direct path, must both give the bytes back.
+        assert bytes(kernels.rans_decode(shared + coded, plane)) == seg
+        assert bytes(kernels.rans_decode_shared(coded, plane, shared)) == seg
+
+    # 516 bytes a stream, paid once instead of nstr times. The coded bytes
+    # themselves are not identical to the per-stream form -- a shared table
+    # holds slightly different probabilities, so it codes slightly worse per
+    # stream and wins by not repeating the header.
+    assert headerless + len(shared) < per_stream
+
+    # Coding a stream against its own table is exactly the ordinary form with
+    # the header lifted off, which is the property the oracle above rests on.
+    lone = kernels.histogram(segs[0])
+    assert (len(kernels.rans_encode(segs[0], lone))
+            == len(kernels.rans_encode_shared(segs[0], kernels.rans_table(lone)))
+            + kernels.RANS_HEADER)
+
+
+def test_shared_table_refuses_what_it_cannot_code():
+    """A table that cannot represent a symbol must refuse, not mis-code.
+
+    A shared table comes from counts the caller gathered, and a caller that
+    gathers them over the wrong set produces a table with a zero frequency for
+    a symbol that really occurs. The coder cannot represent it; encoding
+    anyway would emit a stream that decodes to different bytes, which is the
+    one outcome an archiver must never produce.
+    """
+    if not kernels.have_rans():
+        raise Skip("no native rANS kernel")
+
+    partial = kernels.rans_table(kernels.histogram(bytes([1, 2, 3]) * 400))
+    assert partial is not None
+    assert kernels.rans_encode_shared(bytes([1, 2, 3]) * 400, partial) is not None
+    # 200 never appeared in the counts, so it has no frequency to code with.
+    assert kernels.rans_encode_shared(bytes([1, 2, 200]) * 400, partial) is None
+
+    # A table whose frequencies do not sum to the coder's scale is malformed
+    # in both directions.
+    broken = bytearray(partial)
+    broken[4] = (broken[4] + 1) & 0xFF
+    assert kernels.rans_encode_shared(bytes([1, 2, 3]) * 400, bytes(broken)) is None
+    try:
+        kernels.rans_decode_shared(b"\0" * 64, 64, bytes(broken))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a malformed table must not decode")
+
+    try:
+        kernels.rans_encode_shared(b"abc" * 100, partial[:-1])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a short table must be rejected")
+
+    # One symbol at the full probability scale is the edge the stream header
+    # biases for; it has to survive the shared path too.
+    one = kernels.rans_table(kernels.histogram(b"\x07" * 5000))
+    coded = kernels.rans_encode_shared(b"\x07" * 5000, one)
+    assert bytes(kernels.rans_decode_shared(coded, 5000, one)) == b"\x07" * 5000
+
+
 def test_stride_kernels():
     """The strided split must equal slicing and merge must undo it."""
     for period in (1, 2, 17, 34, 64, 144, 210, 256):
