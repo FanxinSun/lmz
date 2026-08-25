@@ -1418,6 +1418,171 @@ def test_pytorch_bin_layout_and_roundtrip():
         assert stats.ratio > 1.5, f"fp32-from-bf16 only reached {stats.ratio:.3f}x"
 
 
+def _pb_varint(v: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        out.append(b | (0x80 if v else 0))
+        if not v:
+            return bytes(out)
+
+
+def _pb_len(field: int, payload: bytes) -> bytes:
+    return _pb_varint(field << 3 | 2) + _pb_varint(len(payload)) + payload
+
+
+def _pb_int(field: int, value: int) -> bytes:
+    return _pb_varint(field << 3) + _pb_varint(value)
+
+
+def _onnx_tensor(name: str, dtype_id: int, dims, raw: bytes) -> bytes:
+    """One TensorProto, written the way an exporter writes it."""
+    return (b"".join(_pb_int(1, d) for d in dims)
+            + _pb_int(2, dtype_id)
+            + _pb_len(8, name.encode())
+            + _pb_len(9, raw))
+
+
+def _onnx_model(tensors) -> bytes:
+    graph = b"".join(_pb_len(5, t) for t in tensors) + _pb_len(2, b"main")
+    return _pb_int(1, 8) + _pb_len(7, graph) + _pb_len(8, b"test")
+
+
+def test_onnx_initializers_are_addressed_and_typed():
+    """ONNX is what perception ships in, and its weights must be typed.
+
+    Without a parse every initializer travels as opaque bytes, and the
+    byte-position planes cannot phase-align because nothing knows the element
+    width -- an fp16 exponent then smears across positions instead of
+    collecting in one plane. The offsets have to land on the real bytes, and
+    the dtypes have to reach the same splitter safetensors uses.
+    """
+    f32 = rand(4096, 3)
+    f16 = rand(2048, 5)
+    i8 = rand(256, 7)
+    model = _onnx_model([
+        _onnx_tensor("conv1.weight", 1, [16, 64], f32),      # FLOAT
+        _onnx_tensor("conv2.weight", 10, [8, 128], f16),     # FLOAT16
+        _onnx_tensor("quant.weight", 3, [16, 16], i8),       # INT8
+        _onnx_tensor("attn.weight", 16, [2, 2], rand(8, 11)),  # BFLOAT16
+    ])
+
+    layout = planner.probe(io.BytesIO(model), len(model))
+    assert layout.kind == "onnx", layout.kind
+    assert set(layout.tensors) == {"conv1.weight", "conv2.weight",
+                                   "quant.weight", "attn.weight"}
+    assert layout.tensors["conv1.weight"]["dtype"] == "F32"
+    assert layout.tensors["conv1.weight"]["shape"] == [16, 64]
+    assert layout.tensors["quant.weight"]["dtype"] == "I8"
+
+    # The offsets must point at the weights themselves, not at the message.
+    for name, payload in (("conv1.weight", f32), ("conv2.weight", f16),
+                          ("quant.weight", i8)):
+        start, end = layout.tensors[name]["offsets"]
+        assert model[start:end] == payload, name
+
+    # And each region must carry the element width its splitter needs.
+    widths = sorted((r.end - r.start, r.esize, r.kind) for r in layout.regions)
+    assert (len(i8), 1, planner.KIND_BYTES) in widths
+    assert (len(f16), 2, planner.KIND_BYTES) in widths
+    assert (len(f32), 4, planner.KIND_BYTES) in widths
+    # BF16 reaches the conditioned path, exactly as it does from safetensors.
+    assert (8, 2, planner.KIND_BF16) in widths
+
+
+def test_onnx_that_is_not_onnx_degrades_to_bytes():
+    """Anything unexpected must become opaque bytes, never an exception.
+
+    `probe` runs on every file that is compressed, so a parser that raises on
+    a malformed or merely unfamiliar file would take the whole archive with
+    it. ONNX has no magic number either, so this parser is offered every file
+    the earlier ones declined.
+    """
+    good = _onnx_model([_onnx_tensor("w", 1, [4], rand(16, 2))])
+    assert planner.probe(io.BytesIO(good), len(good)).kind == "onnx"
+
+    cases = {
+        "empty": b"",
+        "not a protobuf": b"\xff\xff\xff\xff" + b"x" * 100,
+        "starts right, says nothing": b"\x08" + b"\x00" * 50,
+        "truncated mid-field": (_pb_int(1, 8) + _pb_varint(7 << 3 | 2)
+                                + _pb_varint(1000) + b"short"),
+        "no initializers": _pb_int(1, 8) + _pb_len(7, _pb_len(2, b"main")),
+        "initializer with no data": _onnx_model(
+            [_onnx_tensor("w", 1, [4], b"")]),
+        "length prefix past the file": (_pb_int(1, 8) + _pb_varint(7 << 3 | 2)
+                                        + _pb_varint(1 << 40) + b"x" * 10),
+        "deprecated group wire type": (_pb_int(1, 8)
+                                       + _pb_len(7, _pb_varint(5 << 3 | 3)
+                                                 + b"\x00")),
+    }
+    for name, data in cases.items():
+        assert planner.probe(io.BytesIO(data), len(data)).kind == "raw", name
+
+    # External-data tensors name a sidecar instead of carrying raw_data. There
+    # is nothing in the file to address, so it is not an ONNX layout here.
+    external = _pb_int(1, 8) + _pb_len(7, _pb_len(
+        5, _pb_int(2, 1) + _pb_len(8, b"w") + _pb_len(12, b"weights.bin")))
+    assert planner.probe(io.BytesIO(external), len(external)).kind == "raw"
+
+    # A dtype this build does not know, and a payload that is not a whole
+    # number of elements, both fall back to untyped bytes -- still addressed,
+    # just not split.
+    for model in (_onnx_model([_onnx_tensor("w", 999, [4], b"abcd" * 4)]),
+                  _onnx_model([_onnx_tensor("w", 1, [1], b"abc")])):
+        layout = planner.probe(io.BytesIO(model), len(model))
+        assert layout.kind == "onnx"
+        assert layout.tensors["w"]["dtype"] == "U8"
+        assert all(r.esize == 1 for r in layout.regions)
+
+
+def test_onnx_round_trips_through_an_archive():
+    """The parse has to survive the whole path, not just the planner."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "m.onnx")
+        # fp16 weights with the structure real ones have: an exponent that
+        # occupies a handful of values and a mantissa that does not. Random
+        # bytes would only prove the parse survives, not that it helps.
+        payloads = []
+        for i in range(6):
+            noise = rand(1 << 16, i + 1)
+            payloads.append(bytes(
+                b if k % 2 == 0 else 0x38 | (b & 7)
+                for k, b in enumerate(noise)))
+        model = _onnx_model([
+            _onnx_tensor(f"layer{i}.weight", 10, [16, 2048], p)
+            for i, p in enumerate(payloads)])
+        with open(path, "wb") as fh:
+            fh.write(model)
+
+        archive = os.path.join(d, "m.lmz")
+        lmz.compress(path, archive)
+        out = os.path.join(d, "out.onnx")
+        lmz.decompress(archive, out)
+        assert digest(out) == digest(path)
+
+        info = lmz.info(archive)
+        assert info["members"][0]["kind"] == "onnx"
+        assert len(info["members"][0]["tensors"]) == 6
+
+        # Typed beats opaque, which is the whole reason to parse the
+        # container: without the element width the byte-position planes
+        # cannot phase-align, and an fp16 exponent smears across positions
+        # instead of collecting in one plane. Measured against the same bytes
+        # with the parser switched off.
+        real = planner.parse_onnx
+        try:
+            planner.parse_onnx = lambda f, size: None
+            blob = os.path.join(d, "blob.lmz")
+            lmz.compress(path, blob)
+            assert planner.probe(io.BytesIO(model), len(model)).kind == "raw"
+        finally:
+            planner.parse_onnx = real
+        assert os.path.getsize(archive) < os.path.getsize(blob), (
+            os.path.getsize(archive), os.path.getsize(blob))
+
+
 def test_int8_weights_are_coded_with_rans_not_zstd():
     """int8 planes must reach the coder the GPU can decode.
 

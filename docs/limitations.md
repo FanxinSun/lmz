@@ -110,6 +110,18 @@
 - GGUF block-quantised tensors are split on their ggml struct layout, which
   covers Q4_0 through Q8_1, every k-quant, the IQ types and the ternary ones.
   A layout this build does not recognise falls back to opaque bytes.
+- **ONNX is parsed only in its self-contained form.** The walk finds
+  `graph.initializer[]` and types each one from its `data_type` and
+  `raw_data` range, which is worth **4.3 points** on a real fp16 detector
+  against the same bytes as a blob — without the element width the
+  byte-position planes cannot phase-align, so an fp16 exponent smears across
+  positions instead of collecting in one plane. The **external-data** form,
+  where initializers name a sidecar file and carry no `raw_data`, is not
+  typed: those sidecars are flat and lmz codes them as raw regions, and
+  typing them needs the sidecar's own name resolved against the model's
+  directory. A dtype this build does not know, or a payload that is not a
+  whole number of elements, falls back to untyped bytes for that tensor
+  alone.
 - **CPython's bundled zstd is slow on macOS.** Measured on a GitHub
   `macos-latest` runner: 103 MiB/s compressing a 64 MiB BF16 sample through
   `compression.zstd`, against 767 MiB/s for the same work through the
@@ -143,7 +155,9 @@ conditioning is taken only when it wins and declines when the quants owe
 nothing to their sub-block, that a damaged sub-block descriptor is rejected
 rather than acted on, that structureless blocks decline the split,
 that v3's Q8_0-only block payload still decodes,
-safetensors/GGUF/PyTorch-zip/raw layout detection, tensor dedup within
+safetensors/GGUF/PyTorch-zip/ONNX/raw layout detection — including that a
+malformed or unfamiliar ONNX degrades to opaque bytes rather than raising,
+since `probe` runs on every file compressed — tensor dedup within
 and across files, delta coding against a near-copy (chosen, reversed, and
 declined when the files are unrelated), hostile ref and delta chunks
 (self-referencing, out of range, damaged difference), v1
