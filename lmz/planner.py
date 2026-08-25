@@ -6,8 +6,9 @@ dtype layout. Anything it cannot identify -- headers, padding, unknown
 formats -- becomes a 1-byte-element region, which still gets compressed,
 just without the split.
 
-Both readers are strictly best-effort: a file that does not parse is treated
-as opaque bytes rather than rejected.
+Every reader is strictly best-effort: a file that does not parse is treated
+as opaque bytes rather than rejected. That matters most for ONNX, which has
+no magic number, so its parser is offered every file the others declined.
 """
 
 from __future__ import annotations
@@ -546,9 +547,12 @@ def _pb_read_varint(f, limit: int):
 def _pb_scan_file(f, start: int, end: int):
     """Walk a protobuf message in a file, yielding (field, wire, a, b).
 
-    The same walk as `_pb_fields`, against a file rather than a buffer, so a
-    multi-gigabyte ONNX model can be traversed by seeking over its weight
-    payloads instead of reading them. Ranges are absolute file offsets.
+    Against the file rather than a buffer, so a multi-gigabyte ONNX model is
+    traversed by seeking over its weight payloads instead of reading them.
+    Ranges are absolute file offsets. For a length-delimited field, (a, b) is
+    the payload's range; for a varint it is (value, value). Groups are a
+    deprecated wire type ONNX does not use, and skipping one needs a matching
+    end marker, so hitting one abandons the parse.
     """
     i = start
     while i < end:
@@ -585,37 +589,6 @@ def _pb_find_from_file(f, start: int, end: int, want: int):
         if field == want and wire == 2:
             return a, b
     return None
-
-
-def _pb_fields(buf, start: int, end: int):
-    """Walk one protobuf message, yielding (field number, wire type, a, b).
-
-    For a length-delimited field, (a, b) is the payload's absolute range; for
-    a varint it is (value, value). Groups are not emitted -- they are a
-    deprecated wire type that ONNX does not use, and skipping one correctly
-    needs a matching end marker, so hitting one abandons the parse.
-    """
-    i = start
-    while i < end:
-        key, i = _pb_varint(buf, i)
-        field, wire = key >> 3, key & 7
-        if wire == 0:
-            val, i = _pb_varint(buf, i)
-            yield field, wire, val, val
-        elif wire == 1:
-            i += 8
-        elif wire == 2:
-            n, i = _pb_varint(buf, i)
-            if n < 0 or i + n > end:
-                raise ValueError("length-delimited field runs past its message")
-            yield field, wire, i, i + n
-            i += n
-        elif wire == 5:
-            i += 4
-        else:
-            raise ValueError(f"unsupported protobuf wire type {wire}")
-        if i > end:
-            raise ValueError("field runs past its message")
 
 
 def parse_onnx(f, size: int) -> Layout | None:
