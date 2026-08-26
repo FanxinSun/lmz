@@ -79,7 +79,8 @@ def cmd_compress(args) -> int:
     stats = api.compress(src, dst, level=args.level, workers=args.threads,
                          chunk_size=args.chunk_size, checksum=not args.no_checksum,
                          dedup=not args.no_dedup, delta=not args.no_delta,
-                         mapped=args.mapped, align=args.align, progress=bar)
+                         mapped=args.mapped, align=args.align, progress=bar,
+                         shared_tables=args.shared_tables)
     bar.done()
     if not args.quiet:
         print(f"{src} -> {dst}")
@@ -623,6 +624,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "own (default 64KiB; costs ~1 point of ratio)")
     c.add_argument("--align", action="store_true",
                    help="with --mapped, start every block on a 4KiB boundary")
+    c.add_argument("--shared-tables", action="store_true",
+                   help="fit one rANS table per plane kind and carry it in the "
+                        "manifest instead of in every stream; writes a v7 "
+                        "archive older builds cannot read")
     c.add_argument("-f", "--force", action="store_true", help="overwrite output")
     common(c)
     c.set_defaults(func=cmd_compress)

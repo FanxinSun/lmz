@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 import threading
 
 _lock = threading.Lock()
@@ -92,6 +93,11 @@ def _load_native():
             lib.lmz_decode_planes.argtypes = [
                 v, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
                 ctypes.c_uint32, ctypes.c_int, v, v, ctypes.c_size_t]
+            lib.lmz_decode_planes_shared.restype = ctypes.c_int
+            lib.lmz_decode_planes_shared.argtypes = [
+                v, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+                ctypes.c_uint32, ctypes.c_int, v, v, ctypes.c_size_t,
+                v, ctypes.c_uint32]
             lib.lmz_xor.restype = ctypes.c_int
             lib.lmz_xor.argtypes = [v, v, ctypes.c_size_t, v]
             lib.lmz_k4_scales.restype = ctypes.c_int
@@ -585,8 +591,43 @@ def _planes_buf(nbytes: int):
     return buf
 
 
+_flat_cache: dict[bytes, "ctypes.Array"] = {}
+
+
+def _flat_tables(tables, nplanes: int):
+    """One flat frequency array for a chunk's planes, and a have-bitmask.
+
+    A plane with no shared table still occupies its 256 slots so the kernel
+    can index by plane without a second length; the bitmask is what says the
+    slots are meaningless and the stream carries its own header.
+    """
+    have, parts = 0, []
+    for k in range(nplanes):
+        t = tables[k] if k < len(tables) else None
+        if t is None:
+            parts.append(b"\0" * 512)
+            continue
+        if len(t) != RANS_HEADER:
+            raise ValueError(f"a shared table is {RANS_HEADER} bytes")
+        have |= 1 << k
+        parts.append(bytes(t)[4:4 + 512])
+    blob = b"".join(parts)
+    got = _flat_cache.get(blob)
+    if got is None:
+        arr = ctypes.c_uint16 * (nplanes * 256)
+        if sys.byteorder == "little":
+            got = arr.from_buffer_copy(blob)
+        else:                                # the header is little-endian
+            got = arr()
+            for i in range(nplanes * 256):
+                got[i] = blob[2 * i] | (blob[2 * i + 1] << 8)
+        if len(_flat_cache) < 256:
+            _flat_cache[blob] = got
+    return got, have
+
+
 def decode_planes(payload, nplanes: int, nelem: int, methods: int,
-                  bf16: bool, out=None):
+                  bf16: bool, out=None, tables=None):
     """Decode and merge every plane of a split chunk in one native call.
 
     Returns a memoryview of the merged bytes, or None when the kernel will not
@@ -597,7 +638,10 @@ def decode_planes(payload, nplanes: int, nelem: int, methods: int,
     The point is not the arithmetic, which is identical, but the GIL: crossing
     once per plane and again to merge hands the interpreter three chances to
     hold up every other thread, and that is what made threaded reads slower
-    than serial ones.
+    than serial ones. `tables` is a per-plane list of shared tables, or None
+    entries where a plane carries its own header -- and it is here rather than
+    in a Python loop for exactly the reason above: decoding the shared form a
+    plane at a time measured 2.5x the cost of this call on a real checkpoint.
     """
     lib = _load_native()
     n = nplanes * nelem
@@ -609,8 +653,16 @@ def decode_planes(payload, nplanes: int, nelem: int, methods: int,
     pa, _a = _ptr(payload)
     da, _b = _ptr(dst)
     sa, _c = _ptr(scr)
-    rc = lib.lmz_decode_planes(pa, len(payload), nplanes, nelem, methods,
-                               1 if bf16 else 0, da, sa, need)
+    if tables is None:
+        rc = lib.lmz_decode_planes(pa, len(payload), nplanes, nelem, methods,
+                                   1 if bf16 else 0, da, sa, need)
+    else:
+        if not hasattr(lib, "lmz_decode_planes_shared"):
+            return None            # an older kernel built before this landed
+        flat, have = _flat_tables(tables, nplanes)
+        rc = lib.lmz_decode_planes_shared(pa, len(payload), nplanes, nelem,
+                                          methods, 1 if bf16 else 0, da, sa,
+                                          need, ctypes.byref(flat), have)
     return memoryview(dst)[:n] if rc == 0 else None
 
 
@@ -891,14 +943,38 @@ def rans_table(hist) -> bytes | None:
     return bytes(hdr)
 
 
+_FREQS = ctypes.c_uint16 * 256
+_freqs_cache: dict[bytes, "ctypes.Array"] = {}
+
+
 def _freqs_from_table(table):
-    """Unpack a 516-byte header back into the array the kernel takes."""
+    """Unpack a 516-byte header back into the array the kernel takes.
+
+    Cached on the table bytes, and copied wholesale rather than element by
+    element. Both matter more than they look: an archive has a handful of
+    shared tables and decodes them across thousands of planes, so a 256-step
+    Python loop per plane was the dominant cost of decoding a shared-table
+    chunk -- three times the cost of the coding itself.
+
+    The cache is keyed by value, so two identical tables share one array, and
+    a plain dict is enough for the races that can happen here: the worst
+    outcome of two threads missing at once is that both build the same
+    immutable array and one of them is discarded.
+    """
     if len(table) != RANS_HEADER:
         raise ValueError(f"a shared table is {RANS_HEADER} bytes")
-    freqs = (ctypes.c_uint16 * 256)()
-    mv = memoryview(table)
-    for s in range(256):
-        freqs[s] = mv[4 + 2 * s] | (mv[5 + 2 * s] << 8)
+    key = bytes(table)
+    got = _freqs_cache.get(key)
+    if got is not None:
+        return got
+    if sys.byteorder == "little":
+        freqs = _FREQS.from_buffer_copy(key[4:4 + 512])
+    else:                                   # the header is little-endian
+        freqs = _FREQS()
+        for s in range(256):
+            freqs[s] = key[4 + 2 * s] | (key[5 + 2 * s] << 8)
+    if len(_freqs_cache) < 256:             # an archive has a few, not many
+        _freqs_cache[key] = freqs
     return freqs
 
 

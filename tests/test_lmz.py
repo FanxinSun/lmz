@@ -26,7 +26,7 @@ import tracemalloc
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import lmz  # noqa: E402
-from lmz import codec, entropy, kernels, planner  # noqa: E402
+from lmz import codec, entropy, freqs, kernels, planner  # noqa: E402
 from lmz import format as lmzformat  # noqa: E402
 from lmz.format import ArchiveReader, FormatError  # noqa: E402
 
@@ -98,6 +98,26 @@ def weights_bf16_cond(nelem: int, seed: int = 1) -> bytes:
             mant &= 0x0F
         sign = (x >> 63) & 1
         out += ((sign << 15) | (exp << 7) | mant).to_bytes(2, "little")
+    return bytes(out)
+
+
+def weights_f32_from_f16(nelem: int, seed: int = 1, band: int = 0) -> bytes:
+    """FP32 words holding values that only ever had fp16 precision.
+
+    The shape whisper and bge-m3 really ship in, and the one shared tables are
+    for: the low 13 mantissa bits are zero, so byte 0 is constant and byte 1
+    takes eight values, while byte 3 carries the sign and exponent and so
+    moves with `band` -- a stand-in for the per-tensor scale that makes one
+    tensor's high byte a poor fit for another's.
+    """
+    out = bytearray()
+    x = seed | 1
+    for _ in range(nelem):
+        x = (x * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
+        mant = (x >> 11) & 0x3FF                     # 10 bits, as fp16 has
+        exp = 118 + band + ((x >> 40) % 5)
+        sign = (x >> 63) & 1
+        out += ((sign << 31) | (exp << 23) | (mant << 13)).to_bytes(4, "little")
     return bytes(out)
 
 
@@ -1758,6 +1778,140 @@ def test_shared_table_refuses_what_it_cannot_code():
     one = kernels.rans_table(kernels.histogram(b"\x07" * 5000))
     coded = kernels.rans_encode_shared(b"\x07" * 5000, one)
     assert bytes(kernels.rans_decode_shared(coded, 5000, one)) == b"\x07" * 5000
+
+
+def _shared_model(path, tensors=24, nelem=12000):
+    """A checkpoint whose tensors sit at different scales, as layers do."""
+    write_safetensors(path, [
+        (f"layer.{i}.weight", "F32", [nelem],
+         weights_f32_from_f16(nelem, seed=i + 1, band=(i % 7)))
+        for i in range(tensors)])
+
+
+def test_shared_tables_shrink_a_page_mapped_archive():
+    """The fixed cost a small archive cannot amortise, actually removed.
+
+    A 64 KiB block archive pays 516 bytes of frequency table per stream, and
+    on a model of a few megabytes that is a material fraction of the payload.
+    This is the whole justification for the format option, so it is asserted
+    as a size, not just as a round trip.
+    """
+    if not kernels.have_rans():
+        raise Skip("no native rANS kernel")
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "m.safetensors")
+        _shared_model(src)
+        before = digest(src)
+
+        sizes = {}
+        for tag, shared in (("own", False), ("shared", True)):
+            arc = os.path.join(d, f"{tag}.lmz")
+            out = os.path.join(d, f"out-{tag}")
+            lmz.compress(src, arc, mapped=True, shared_tables=shared)
+            lmz.decompress(arc, out, overwrite=True)
+            assert digest(out) == before, f"{tag} did not round-trip"
+            sizes[tag] = os.path.getsize(arc)
+
+        assert sizes["shared"] < sizes["own"], (
+            f"shared tables did not pay: {sizes['shared']} vs {sizes['own']}")
+
+
+def test_shared_tables_are_decided_per_plane():
+    """Pooling wins on some planes of a file and loses on others.
+
+    An fp32 checkpoint upcast from fp16 is the case: its low byte planes are
+    near-constant and pool perfectly, while its high byte carries a per-tensor
+    scale and pools badly. An all-or-nothing rule would throw away the planes
+    that did win, so the manifest is expected to hold *some* kinds and not
+    all of them -- and every chunk must still round-trip.
+    """
+    if not kernels.have_rans():
+        raise Skip("no native rANS kernel")
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "m.safetensors")
+        _shared_model(src)
+        arc = os.path.join(d, "a.lmz")
+        lmz.compress(src, arc, mapped=True, shared_tables=True)
+        with open(arc, "rb") as fh:
+            reader = lmzformat.ArchiveReader(fh)
+            kinds = set((reader.manifest.get("tables") or {}))
+            codecs = {c.codec for c in reader.chunks}
+        assert kinds, "no plane kind was worth a shared table"
+        assert kinds != {f"{lmzformat.CODEC_SPLIT}:4:{k}" for k in range(4)}, \
+            "every plane pooled; this fixture no longer tests the mixed case"
+        assert lmzformat.CODEC_SPLIT_ST in codecs, \
+            "tables were written but no chunk used them"
+
+
+def test_shared_table_chunk_needs_its_manifest():
+    """A v7 chunk without its tables is corruption, not a wrong answer.
+
+    The coded bytes carry no frequencies of their own, so a reader that has
+    lost the manifest's table set cannot decode them and must say so rather
+    than produce plausible garbage.
+    """
+    if not kernels.have_rans():
+        raise Skip("no native rANS kernel")
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "m.safetensors")
+        _shared_model(src)
+        arc = os.path.join(d, "a.lmz")
+        lmz.compress(src, arc, mapped=True, shared_tables=True)
+        with open(arc, "rb") as fh:
+            reader = lmzformat.ArchiveReader(fh)
+            chunk = next(c for c in reader.chunks
+                         if c.codec == lmzformat.CODEC_SPLIT_ST)
+            fh.seek(chunk.off)
+            payload = fh.read(chunk.clen)
+        try:
+            codec.decode_chunk(payload, chunk.codec, chunk.esize, chunk.flags,
+                               chunk.rlen, chunk.crc, True, tables=None)
+        except lmzformat.CorruptArchive:
+            pass
+        else:
+            raise AssertionError("a shared-table chunk decoded without tables")
+
+
+def test_version_stamp_follows_the_codecs_used():
+    """The stamp is a requirement on the reader, not a build number.
+
+    Writing the newest version unconditionally would make every ordinary
+    archive this build produces unreadable to the previous release, which can
+    decode all of it. Only an archive that really uses a v7 codec is v7.
+    """
+    if not kernels.have_rans():
+        raise Skip("no native rANS kernel")
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "m.safetensors")
+        _shared_model(src)
+        for shared, want in ((False, lmzformat.BASE_VERSION), (True, 7)):
+            arc = os.path.join(d, f"v{int(shared)}.lmz")
+            lmz.compress(src, arc, mapped=True, shared_tables=shared)
+            with open(arc, "rb") as fh:
+                _magic, ver = lmzformat.HEADER.unpack(
+                    fh.read(lmzformat.HEADER_SIZE))[:2]
+            assert ver == want, f"shared={shared} stamped v{ver}, wanted v{want}"
+
+
+def test_primer_declines_when_pooling_loses():
+    """The decision is a measurement, and it has to be able to say no.
+
+    Streams drawn from unrelated distributions cost more against one pooled
+    table than they do against their own, header included. A primer that
+    kept a table there would make the archive bigger, which is the failure
+    mode the whole-archive table showed on real models.
+    """
+    if not kernels.have_rans():
+        raise Skip("no native rANS kernel")
+    alike, unlike = freqs.Primer(), freqs.Primer()
+    for i in range(16):
+        same = bytes((j * 7 + 3) % 32 for j in range(4096))
+        alike.add("2:4:0", kernels.histogram(same))
+        # Each stream a narrow band of its own, disjoint from its neighbours'.
+        band = bytes((i * 16 + (j % 16)) & 0xFF for j in range(4096))
+        unlike.add("2:4:0", kernels.histogram(band))
+    assert alike.build(), "identical streams must pool"
+    assert not unlike.build(), "disjoint streams must not pool"
 
 
 def test_stride_kernels():

@@ -23,12 +23,14 @@ from dataclasses import dataclass, field
 
 from . import codec as _codec
 from . import entropy, kernels
-from .format import (CODEC_DELTA, CODEC_REF, FLAG_ALIGNED, FLAG_PAGE_MAPPED,
+from .format import (CODEC_DELTA, CODEC_REF, CODEC_SPLIT, FLAG_ALIGNED,
+                     FLAG_PAGE_MAPPED,
                      HEADER_SIZE, PAGE_ALIGN, ArchiveReader, ArchiveWriter,
                      CorruptArchive, FormatError, Member)
 from .parallel import (default_workers, gil_enabled, ordered_map,
                         unordered_map)
 from .planner import KIND_DELTA, KIND_REF, chunkify, probe
+from .freqs import Primer, TableSet, key as _tkey, sample_plan
 
 DEFAULT_CHUNK_SIZE = 8 << 20
 DEFAULT_LEVEL = 1
@@ -651,7 +653,8 @@ def _locate_output(members, off: int):
 def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
              workers: int | None = None, chunk_size: int | None = None,
              checksum: bool = True, dedup: bool = True, delta: bool = True,
-             mapped: bool = False, align: bool = False, progress=None) -> Stats:
+             mapped: bool = False, align: bool = False, progress=None,
+             shared_tables: bool = False) -> Stats:
     """Compress a file or directory into the archive at `dst`.
 
     `mapped` cuts the archive into small blocks so any byte range can be
@@ -659,6 +662,13 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
     demand-paging loader needs underneath it. `align` additionally starts
     every payload on a 4 KiB boundary; it costs the padding it writes and only
     repays it where reads bypass the page cache, so it is off by default.
+
+    `shared_tables` reads a bounded sample of the input first and fits one
+    rANS frequency table per plane kind, carried in the manifest instead of in
+    every stream. It writes a v7 archive that older builds cannot read, which
+    is why it is opt-in; where it wins is small archives, whose per-chunk
+    tables are a material fraction of the payload, and the GPU decoder, which
+    can hold one table in shared memory for a whole warp.
     """
     workers = workers or default_workers()
     if chunk_size is None:
@@ -743,6 +753,30 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
                   detail={"dedup_bytes": dedup_bytes,
                           "delta_bytes": delta_bytes})
 
+    # Priming. The tables have to exist before the first chunk is coded, so
+    # this is a real extra read -- but a bounded one, strided across the plan,
+    # and on anything small enough for the fixed costs to matter it is the
+    # whole input and the page cache serves the second pass from memory.
+    tset = TableSet()
+    if shared_tables and kernels.have_rans():
+        primer = Primer()
+        for i in sample_plan(plan):
+            idx, start, end, esize, kind, _ref, _bt, _ik = plan[i]
+            if kind in (KIND_REF, KIND_DELTA):
+                continue          # nothing of their own to count
+            data = os.pread(pool.get(idx), end - start, start)
+            if len(data) != end - start:
+                raise IOError(f"short read on {members[idx].path} at {start}")
+            planes = _codec.table_planes(data, esize, kind)
+            if planes is None:
+                continue
+            for k, plane in enumerate(planes):
+                primer.add(_tkey(CODEC_SPLIT, esize, k),
+                           kernels.histogram(plane))
+        tset = primer.build()
+        if tset:
+            manifest["tables"] = tset.to_json()
+
     def work(task):
         idx, start, end, esize, kind, ref_src, btype, ikind = task
         if kind == KIND_REF:
@@ -766,7 +800,7 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
                     esize, flags, crc)
         parts, cid, flags, crc = _codec.encode_chunk(data, esize, level, checksum,
                                                      kind=kind, btype=btype,
-                                                     tally=tally)
+                                                     tally=tally, tables=tset)
         return members[idx].dst + start, end - start, parts, cid, esize, flags, crc
 
     def work_batch(batch):
@@ -829,7 +863,7 @@ def _by_dst(chunks):
     return order() if order is not None else sorted(chunks, key=lambda c: c.dst)
 
 
-def _range_resolver(chunks, payload_of, verify_checksums: bool):
+def _range_resolver(chunks, payload_of, verify_checksums: bool, tables=None):
     """A function that materialises the bytes at any earlier output range.
 
     Source chunks are decoded straight from the archive rather than read back
@@ -853,7 +887,8 @@ def _range_resolver(chunks, payload_of, verify_checksums: bool):
                 raise CorruptArchive(
                     "a ref or delta chunk points at another one")
             data = _codec.decode_chunk(payload_of(c), c.codec, c.esize, c.flags,
-                                       c.rlen, c.crc, verify_checksums)
+                                       c.rlen, c.crc, verify_checksums,
+                                       tables=tables)
             a = pos - c.dst
             b = min(end - c.dst, c.rlen)
             out[pos - src:pos - src + (b - a)] = data[a:b]
@@ -864,9 +899,9 @@ def _range_resolver(chunks, payload_of, verify_checksums: bool):
     return resolve
 
 
-def _chunk_decoder(chunks, payload_of, verify_checksums: bool):
+def _chunk_decoder(chunks, payload_of, verify_checksums: bool, tables=None):
     """Decode any chunk, resolving ref and delta sources as needed."""
-    resolve = _range_resolver(chunks, payload_of, verify_checksums)
+    resolve = _range_resolver(chunks, payload_of, verify_checksums, tables)
 
     def decode(chunk, payload, out=None):
         if chunk.codec == CODEC_REF:
@@ -881,7 +916,7 @@ def _chunk_decoder(chunks, payload_of, verify_checksums: bool):
                                        chunk.crc, verify_checksums)
         return _codec.decode_chunk(payload, chunk.codec, chunk.esize,
                                    chunk.flags, chunk.rlen, chunk.crc,
-                                   verify_checksums, out=out)
+                                   verify_checksums, out=out, tables=tables)
 
     return decode
 
@@ -902,6 +937,7 @@ def decompress(src: str, dst: str, *, workers: int | None = None,
         members = reader.members
         chunks = reader.chunks
         manifest = reader.manifest
+        tables = TableSet.from_json(manifest.get("tables"))
 
     single = len(members) == 1 and "/" not in members[0].path
     if single and not os.path.isdir(dst):
@@ -937,7 +973,7 @@ def decompress(src: str, dst: str, *, workers: int | None = None,
             raise FormatError("archive is truncated")
         return payload
 
-    decode = _chunk_decoder(chunks, payload_of, verify_checksums)
+    decode = _chunk_decoder(chunks, payload_of, verify_checksums, tables)
 
     def work(batch):
         done_bytes = 0
@@ -1067,6 +1103,7 @@ def verify(src: str, *, workers: int | None = None, progress=None) -> Stats:
         reader = ArchiveReader(fh)
         chunks = reader.chunks
         members = reader.members
+        tables = TableSet.from_json(reader.manifest.get("tables"))
 
     total = sum(m.size for m in members)
     _check_coverage(chunks, total)
@@ -1101,7 +1138,7 @@ def verify(src: str, *, workers: int | None = None, progress=None) -> Stats:
             raise FormatError("archive is truncated")
         return payload
 
-    resolve = _range_resolver(chunks, payload_of, True)
+    resolve = _range_resolver(chunks, payload_of, True, tables)
 
     def work(batch):
         done_bytes = 0
@@ -1124,7 +1161,7 @@ def verify(src: str, *, workers: int | None = None, progress=None) -> Stats:
             else:
                 _codec.decode_chunk(payload, chunk.codec, chunk.esize,
                                     chunk.flags, chunk.rlen, chunk.crc, True,
-                                    out=_scratch(chunk.rlen))
+                                    out=_scratch(chunk.rlen), tables=tables)
             done_bytes += chunk.rlen
         return done_bytes
 
@@ -1224,7 +1261,9 @@ class MappedArchive:
         # is the one caller that genuinely wants every Chunk materialised.
         self._chunks = _by_dst(self._reader.chunks)
         self._starts = [c.dst for c in self._chunks]
-        self._decode = _chunk_decoder(self._chunks, self._payload_of, verify)
+        self._decode = _chunk_decoder(
+            self._chunks, self._payload_of, verify,
+            TableSet.from_json(self._reader.manifest.get("tables")))
         self._cache: "OrderedDict[int, bytes]" = OrderedDict()
         self._cap = max(1, cache_blocks)
         self._lock = threading.Lock()

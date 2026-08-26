@@ -37,10 +37,21 @@ TAIL = b"LMZTAIL\x01"
 # quantisation rather than one; v5 adds a field mode that codes a k-quant's
 # quants per sub-block class, described in the payload alongside the rest;
 # v6 adds delta chunks, which name an earlier output range the way a ref does
-# and carry the coded difference from it. Earlier archives contain none of the
-# newer codecs, so this build reads every version listed.
-FORMAT_VERSION = 6
-READABLE_VERSIONS = (1, 2, 3, 4, 5, 6)
+# and carry the coded difference from it; v7 adds a byte-plane split whose
+# rANS streams are coded against a table carried once in the manifest instead
+# of once per stream. Earlier archives contain none of the newer codecs, so
+# this build reads every version listed.
+FORMAT_VERSION = 7
+READABLE_VERSIONS = (1, 2, 3, 4, 5, 6, 7)
+
+# What an archive is stamped with when it uses none of the newest codecs.
+# The stamp is a *requirement on the reader*, not a build number: writing
+# FORMAT_VERSION unconditionally would make every ordinary archive this build
+# produces unreadable to the previous release, which can decode all of it. So
+# the writer stamps the lowest version that can read what it actually wrote,
+# and only a chunk below raises it.
+BASE_VERSION = 6
+CODEC_MIN_VERSION = {}
 
 HEADER = struct.Struct("<4sHHQQQ")  # magic, version, flags, original_size, 2x reserved
 HEADER_SIZE = 32
@@ -64,6 +75,14 @@ CODEC_BF16C = 5  # BF16 field split; sign+mantissa coded per exponent bucket
 CODEC_BLK = 6  # v3 Q8_0 block split; still decoded, no longer written
 CODEC_GBLK = 7  # block split whose field grouping is described in the payload
 CODEC_DELTA = 8  # payload names an earlier output range plus a coded difference
+# As CODEC_SPLIT, but every rANS plane is headerless and is decoded against
+# the archive's shared table for that plane kind. A separate codec id rather
+# than a flag bit because a split chunk's 16 flag bits are already two per
+# plane for eight planes, with nothing spare -- and because a reader that does
+# not know about shared tables must refuse the chunk rather than misread it,
+# which an unknown codec id gets for free.
+CODEC_SPLIT_ST = 9
+CODEC_MIN_VERSION[CODEC_SPLIT_ST] = 7
 
 # Header flags. Both are advisory: the chunk table already addresses every
 # payload by explicit (offset, length), so a reader that ignores these still
@@ -266,6 +285,8 @@ class ArchiveWriter:
         self.f = fileobj
         self.manifest = manifest
         self.chunks: list[Chunk] = list(chunks or ())
+        self.version = max((CODEC_MIN_VERSION.get(c.codec, BASE_VERSION)
+                            for c in self.chunks), default=BASE_VERSION)
         self.flags = flags
         self.align = align
         self.padding = 0
@@ -294,6 +315,9 @@ class ArchiveWriter:
             clen += len(part)
         self.chunks.append(Chunk(self.offset, dst, clen, rlen, crc,
                                  codec, esize, flags))
+        need = CODEC_MIN_VERSION.get(codec)
+        if need is not None and need > self.version:
+            self.version = need
         self.offset += clen
 
     def close(self, original_size: int) -> None:
@@ -317,7 +341,7 @@ class ArchiveWriter:
         self.end = self.offset + FOOTER_SIZE
 
         self.f.seek(0)
-        self.f.write(HEADER.pack(MAGIC, FORMAT_VERSION, self.flags,
+        self.f.write(HEADER.pack(MAGIC, self.version, self.flags,
                                  original_size, 0, 0))
         self.f.flush()
 

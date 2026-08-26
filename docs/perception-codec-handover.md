@@ -9,12 +9,15 @@ default with the GPU decoder on the other end of it, a container, and a
 fixed cost the GPU handover already wants removed. Written for whoever
 picks this up next.*
 
-**Status.** Three of the four items have landed, and the fourth changed
-shape under measurement. What is done: **int8 now routes to rANS** (§1), so
+**Status.** All four items have landed, two of them after the measurements
+changed their shape. What is done: **int8 now routes to rANS** (§1), so
 the GPU decoder can read it; **ONNX is parsed** (§2), worth 4.3 measured
 points; the `limitations.md` INT8 claim is **corrected**, and `lmz compress`
-now says when zstd is missing. What remains is the shared table (§4), whose
-design the measurements changed — see the note there. Original measurements
+now says when zstd is missing; and the **shared table** (§4) is a format
+option, `--shared-tables`, measured on these models in
+[portable-decoder-handover.md](portable-decoder-handover.md) §1. What remains
+is not in this document: external-data ONNX is still opaque (§2), and the GPU
+kernel does not read the shared-table format yet. Original measurements
 are E5, `experiments/e5_perception_codec/`, in the parent repository — probe,
 conditions, raw JSON; the numbers added while implementing are marked as
 such.
@@ -200,7 +203,7 @@ lossless fp16 is 16–18% total; a third of a Q4 LLM's story, and worth
 having mostly because perception models are small enough that the work is
 too.
 
-## 4. Small archives — the fixed costs the sentinel classes cannot amortise
+## 4. Small archives — the fixed costs the sentinel classes cannot amortise — **done**
 
 A sentinel model is 3–10 MB; a watch-tier detector 14–90. At those sizes
 the archive's fixed costs stop hiding:
@@ -221,6 +224,21 @@ points. One format option now carries both arguments; it should land
 first. What needs **no** work: tensor coalescing already sweeps a
 detector's hundreds of sub-64 KiB tensors into shared chunks (476 tensors,
 440 under 64 KiB, 1.5 MB — handled), and should not be touched.
+
+### Landed, and measured on these models
+
+`--shared-tables` writes the format; the numbers, the three surprises and the
+decode cost are in
+[portable-decoder-handover.md](portable-decoder-handover.md) §1. On the
+models above, at 64 KiB blocks: mobilenet_v3_small **+0.96 points**,
+whisper_tiny **+0.93**, and **+3.10** on whisper in the aligned form, which
+is the one this section was written about. ssdlite320 gains nothing and now
+correctly writes no tables at all — the estimator that said otherwise was
+counting noise planes that are never coded.
+
+These are below this section's predictions because those are entropy figures
+with tables uncharged, per `CONDITIONS.md`; the ones above are files on disk
+with verified round trips.
 
 ### The coder primitives are landed; the format is not, and its design changed
 
@@ -254,10 +272,18 @@ chunks within a plane kind**; whisper fp32 gains +2.24 points the same way.
 
 So the format work is **archive-level tables in the manifest, keyed by plane
 kind**, not a per-chunk or per-archive table. That means `decode_chunk`,
-which is deliberately context-free today, has to be handed the archive's
-table set — five call sites in `api.py`, `codec.py` and `cli.py`. It is the
-one piece of this handover that is a real format change, and it is the
-reason it did not land alongside the other three.
+which was deliberately context-free, has to be handed the archive's table
+set — five call sites in `api.py`, `codec.py` and `cli.py`. It is the one
+piece of this handover that is a real format change, which is why it landed
+after the other three rather than alongside them.
+
+**And it needed one refinement this paragraph does not have.** Keying by
+plane kind is right, but *keeping* a table per plane kind is not: on the
+same models, sharing wins on an fp32 checkpoint's low byte planes and loses
+on its high byte, which carries a per-tensor scale. So the table set is
+sparse, the manifest is the authority on which kinds are in it, and a plane
+whose kind is absent carries its own header exactly as before — no flag bit
+anywhere says which, because both sides read the same set.
 
 ## 5. What the residency layer will ask of a perception archive
 

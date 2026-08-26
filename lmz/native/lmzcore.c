@@ -1663,10 +1663,24 @@ LMZ_API int lmz_rans_decode_shared(const uint8_t *src, size_t src_len,
  * `scratch` holds the decoded planes followed by whatever lmz_merge_planes
  * needs, so nothing is allocated here.
  */
-LMZ_API int lmz_decode_planes(const uint8_t *payload, size_t plen,
+/*
+ * The body of both entry points below. `tables`, when non-NULL, is nplanes
+ * blocks of 256 frequencies laid end to end, and `have` says which of those
+ * blocks are real -- a plane whose bit is clear carries its own 516-byte
+ * header and is decoded exactly as it always was.
+ *
+ * Shared-table planes have to be decoded here rather than one ctypes call at
+ * a time for the same reason the rest of this function exists: crossing per
+ * plane and again to merge hands the interpreter three chances to hold up
+ * every other thread. Measured on a 151 MB fp32 checkpoint, decoding the
+ * shared form from Python cost 2.5x what the per-stream form cost through
+ * this function -- all of it interpreter, none of it coding.
+ */
+static int decode_planes_impl(const uint8_t *payload, size_t plen,
                               size_t nplanes, size_t nelem, uint32_t methods,
                               int bf16, uint8_t *dst, uint8_t *scratch,
-                              size_t scratch_len)
+                              size_t scratch_len, const uint16_t *tables,
+                              uint32_t have)
 {
     if (nplanes == 0 || nplanes > 16 || nelem == 0) return -1;
     if (bf16 && nplanes != 2) return -1;
@@ -1694,7 +1708,12 @@ LMZ_API int lmz_decode_planes(const uint8_t *payload, size_t plen,
             planes[k] = p;
         } else if (m == 3) {                       /* rANS */
             uint8_t *d = scratch + k * nelem;
-            if (lmz_rans_decode(p, lens[k], d, nelem) != 0) return -1;
+            if (tables != NULL && (have >> k) & 1u) {
+                if (lmz_rans_decode_shared(p, lens[k], d, nelem,
+                                           tables + k * 256) != 0) return -1;
+            } else if (lmz_rans_decode(p, lens[k], d, nelem) != 0) {
+                return -1;
+            }
             planes[k] = d;
         } else {
             return -2;                             /* zstd/deflate: not here */
@@ -1708,4 +1727,23 @@ LMZ_API int lmz_decode_planes(const uint8_t *payload, size_t plen,
     const size_t need = lmz_scratch_size(nelem, nplanes);
     if (scratch_len < nplanes * nelem + need) return -1;
     return lmz_merge_planes(planes, dst, nelem, nplanes, mscratch);
+}
+
+LMZ_API int lmz_decode_planes(const uint8_t *payload, size_t plen,
+                              size_t nplanes, size_t nelem, uint32_t methods,
+                              int bf16, uint8_t *dst, uint8_t *scratch,
+                              size_t scratch_len)
+{
+    return decode_planes_impl(payload, plen, nplanes, nelem, methods, bf16,
+                              dst, scratch, scratch_len, NULL, 0);
+}
+
+LMZ_API int lmz_decode_planes_shared(const uint8_t *payload, size_t plen,
+                                     size_t nplanes, size_t nelem,
+                                     uint32_t methods, int bf16, uint8_t *dst,
+                                     uint8_t *scratch, size_t scratch_len,
+                                     const uint16_t *tables, uint32_t have)
+{
+    return decode_planes_impl(payload, plen, nplanes, nelem, methods, bf16,
+                              dst, scratch, scratch_len, tables, have);
 }

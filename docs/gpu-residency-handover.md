@@ -2,8 +2,8 @@
 
 *The pieces of work in lmz between a fast kernel and a residency layer, why
 each one is load-bearing, what is already measured about it, and where the
-boundary is between lmz and the thing that consumes it. Two of the four have
-landed; this says what they cost and what they left. Written for whoever picks
+boundary is between lmz and the thing that consumes it. Three of the four
+have landed; this says what they cost and what they left. Written for whoever picks
 this up next, so that none of it has to be rediscovered.*
 
 [← back to the README](../README.md)
@@ -21,9 +21,9 @@ The kernel is now also *shipped*: `lmz.gpu` is in the package, and item 2
 below records what that took. The index can now be opened at the size a
 residency layer opens it at — item 3, which was the precondition the rest
 waited on. What still does not exist is a layer that can put the kernel to
-work: the fast path needs a format option that is still an experiment, and
-nothing can ask an archive where a tensor's blocks are. That is two pieces of
-work, and neither is research.
+work: the format option the fast path needs is now written (item 1), but
+nothing can yet ask an archive where a tensor's blocks are. That is one piece
+of work, and it is not research.
 
 The consumer is a residency engine that keeps weights coded in VRAM, in
 page-locked host RAM and on NVMe, and decodes them on the GPU. Its charter,
@@ -34,7 +34,7 @@ and the PCIe link into it at 28.8, so compression on that path is free by
 
 That engine is not lmz's job. This is the part that is.
 
-## 1. The shared frequency table, as a format option
+## 1. The shared frequency table, as a format option — **done**
 
 **Measured, and it is free in both directions.** A table shared across chunks
 instead of one per chunk is **1.7× of the GPU decode speed** — a per-stream
@@ -64,6 +64,17 @@ choosing between per-chunk and shared on measured cross-entropy rather than
 by assumption, and the round-trip in the test suite. This is the one item
 that touches the format, and it is the one that should land first, because
 everything else can be built against a stream that already exists.
+
+**The format side has now landed too, and what it cost is in
+[portable-decoder-handover.md](portable-decoder-handover.md) §1** — including
+three things this section did not anticipate: sharing has to be decided per
+*plane* rather than per chunk, the decision has to exclude planes the encoder
+stores as noise (counting them predicted +1.9 points on a real detector and
+delivered nothing), and a shared-table chunk needs its own native plane
+decoder, because `lmz_decode_planes` reads a per-stream header that is no
+longer there. `CODEC_SPLIT_ST` is the byte-plane split in that form;
+`--shared-tables` writes it. **The GPU kernel does not read it yet**, which
+is where the 3.8x below still sits.
 
 **The coder side is now promoted, and the format side has a design it did
 not have here.** `lmz_rans_table`, `lmz_rans_encode_shared` and
