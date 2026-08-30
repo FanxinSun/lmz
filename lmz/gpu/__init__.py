@@ -23,8 +23,9 @@ import subprocess
 import sys
 import threading
 
-__all__ = ["available", "backend", "decode_batch", "grain", "header_bytes",
-           "last_error", "pad_bytes", "state", "verify"]
+__all__ = ["available", "backend", "cost_model", "decode_batch",
+           "decode_batch_dev", "grain", "header_bytes", "last_error",
+           "pad_bytes", "state", "verify"]
 
 # Kept in step with ABI_VERSION in lmzgpu.cu. A library built from an older
 # source is ignored rather than called with the wrong argument list.
@@ -266,6 +267,79 @@ def pad_bytes() -> int:
     return _const("lmz_gpu_pad_bytes", 576)
 
 
+def cost_model() -> dict:
+    """What the decoder costs, so a caller can predict it on its own machine.
+
+    A consumer deciding whether decoding beats not compressing needs the
+    kernel's constants, not lmz's opinion about their machine. These are the
+    constants; the curve built from them -- against that machine's bandwidth,
+    clock and storage rate -- belongs to the caller.
+
+    Every value carries its provenance, and where a value is not pinned to a
+    point the interval is given rather than a midpoint, so uncertainty
+    propagates instead of being inherited as fact.
+
+    Keys:
+
+    `lanes`, `grain`, `bytes_per_symbol`, `states` -- exact properties of the
+    format and the kernel, true on every device.
+
+    `k_cycles_per_byte` -- (low, high) lane-cycles of compute per decoded
+    byte. **An interval, and latency-bound rather than throughput-bound**: the
+    inner loop is a dependent shared-memory load feeding a state update
+    feeding the next load, so this does not scale with a device's FP32 rate
+    and must not be estimated from it. Occupancy hides part of the chain,
+    which is why it is a range and not a constant.
+
+    `expansion` -- decoded bytes out per coded byte in, on the archive named
+    in provenance. A caller wanting DRAM traffic per decoded byte uses
+    1 + 1/expansion: the plaintext is written and the coded bytes are read.
+
+    `bound` -- which resource binds, and where the crossover sits. This is the
+    part a consumer most needs and cannot derive: below the named occupancy
+    the kernel is compute-bound and rate tracks resident lanes; above it the
+    rate saturates against achieved bandwidth.
+
+    Nothing here is measured on the calling machine -- that would be a policy
+    measurement, which is the caller's. `verify()` reports what this device
+    actually did.
+    """
+    return {
+        "lanes": 8,
+        "states": 8,
+        "grain": grain(),
+        "bytes_per_symbol": 1,
+        "k_cycles_per_byte": (230, 330),
+        "expansion": 2.88,
+        "bound": {
+            "compute_below_threads": 192,
+            "saturates_at_fraction_of_peak_dram": 0.59,
+        },
+        "provenance": {
+            "kernel": "lmzgpu.cu k_shared, shared frequency table",
+            "device": "NVIDIA GeForce RTX 5080, sm_120, 84 SMs, "
+                      "256-bit GDDR7, ~960 GB/s peak, ~2.66 GHz sustained",
+            "machine": "9800X3D, WSL2, CUDA 13.2, driver 610.88",
+            "archive": "936.4 MB of real BF16 exponent planes from a Llama "
+                       "checkpoint, 325.2 MB coded, 32768-byte streams",
+            "method": "occupancy sweep at fixed byte traffic -- threads per "
+                      "block 64..384 over identical input, two runs agreeing "
+                      "within 1%. Bytes moved are the same in every row, so "
+                      "the 1.70x spread is compute alone.",
+            "k_derivation": "measured, not derived: lanes resident x "
+                            "sustained clock / decode rate, over the rows "
+                            "below saturation. Resident lanes come from the "
+                            "kernel's own shared-memory request (16 KiB LUT "
+                            "plus 640 B a group) against the device's 99 KiB "
+                            "opt-in block.",
+            "status": "one device. k is a property of this kernel rather than "
+                      "of the host, but the interval was taken on a single "
+                      "high-bandwidth card; a device with a low FLOP-per-byte "
+                      "ratio would tighten it and has not been measured.",
+        },
+    }
+
+
 # Byte-value distributions that break frequency tables, as translate() tables
 # over uniform random bytes -- exact shapes at C speed. Shared with the test
 # suite's idea of what is worth checking.
@@ -426,3 +500,45 @@ def decode_batch(streams, offsets, nstr: int, plane: int, out=None, header=None)
     if rc == EBADSTREAM:
         raise ValueError("malformed rANS stream")
     return None
+
+
+def decode_batch_dev(streams, offsets, nstr: int, plane: int, out,
+                     header=None, stream=None, tpb: int = 0) -> int:
+    """Decode a batch that is already in device memory. Returns a status code.
+
+    Every pointer is the caller's: `streams`, `offsets`, `out` and `header` are
+    device addresses as plain integers, and `stream` is a CUDA stream handle,
+    or None for the default stream. This allocates nothing, copies nothing,
+    creates no context and **does not synchronise** -- when it returns, the
+    work has been enqueued and not necessarily done. The caller decides when
+    the result is needed, because the caller owns the stream.
+
+    That is the whole reason this exists next to `decode_batch`. A consumer
+    that has already built a context, a staging ring and an event chain cannot
+    share a device with a library that quietly builds its own; the host-array
+    form above allocates and synchronises by construction, which makes it the
+    wrong shape for anyone driving the device themselves.
+
+    The caller also owns the padding: the kernel prefetches past its cursor, so
+    `streams` must have `pad_bytes()` of readable slack after the last stream.
+    `decode_batch` adds that on the device itself; here it cannot, because the
+    allocation is not this function's to make.
+
+    Returns OK, or one of ENODEV / EUNSUPPORTED / EBADSTREAM / ECUDA -- the
+    same codes the C ABI uses, with `last_error()` carrying the sentence. A
+    status rather than an exception because the caller is mid-pipeline and the
+    decision to fall back is theirs.
+    """
+    lib = _load()
+    if lib is None:
+        return ENODEV
+    if nstr == 0:
+        return OK
+    if nstr < 0:
+        raise ValueError("nstr is negative")
+    if out is None or streams is None or offsets is None:
+        raise ValueError("streams, offsets and out are device pointers")
+    return lib.lmz_gpu_decode_batch_dev(
+        ctypes.c_void_p(header or 0), ctypes.c_void_p(streams),
+        ctypes.c_void_p(offsets), nstr, plane, ctypes.c_void_p(out),
+        ctypes.c_void_p(stream or 0), tpb)

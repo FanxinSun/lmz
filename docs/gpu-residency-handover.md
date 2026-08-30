@@ -92,6 +92,59 @@ perception models. So the manifest needs a table *set* keyed by plane kind,
 and `decode_chunk` needs it threaded in. The numbers are in
 [perception-codec-handover.md](perception-codec-handover.md).
 
+## 1b. What the decoder costs, published — **done**
+
+A downstream consumer asked for the decoder's cost constants, because it has
+to decide whether the coded route beats the plain one *on its machine* and
+could only do that by guessing at lmz's kernel. The request noted that one
+point on one device — 418 GB/s, shared table, RTX 5080 — fits two readings
+that agree here and differ by 8× on a 2-CU integrated GPU: 84% of a
+bandwidth bound, or k = 128 cycles per byte if compute binds.
+
+**Measured, and neither reading was right.** The separator does not need a
+second device: the block size is a compute knob at *fixed byte traffic*.
+Every row below decodes the same 936.4 MB from the same 325.2 MB of coded
+bytes; only the number of resident lanes changes.
+
+| threads/block | GB/s | DRAM traffic | % of ~960 GB/s peak |
+|---|---|---|---|
+| 64 | 245.7 | 331 GB/s | 34% |
+| 96 | 262.9 | 354 | 37% |
+| 128 | 324.0 | 437 | 45% |
+| 160 | 397.5 | 536 | 56% |
+| **192** | **414.4** | 558 | 58% |
+| 256 | 404.6 | 545 | 57% |
+| 384 | 417.3 | 562 | 59% |
+
+Two runs, agreeing within 1% at every point, on an otherwise idle card.
+
+**Below 192 threads compute binds** — the rate tracks resident lanes, a
+1.70× spread bought by occupancy alone. **At and above 192 it saturates**,
+and adding 2× more lanes (192 → 384) buys nothing. So the ceiling is
+bandwidth, but at **59% of peak DRAM, not 84%**: the earlier figure counted
+only the 936 MB written and forgot the 325 MB read, and traffic per decoded
+byte is 1 + 1/2.88 = 1.347, not 1.
+
+**k is 230–330 lane-cycles per decoded byte**, from the rows below
+saturation, using each row's resident lanes against the kernel's own shared
+memory request (a 16 KiB LUT plus 640 B a group, against the device's 99 KiB
+opt-in block) and a 2.66 GHz sustained clock. It is published as an interval
+because it is one: occupancy hides part of the cost and the amount hidden
+varies with the block size.
+
+**It is latency-bound, not throughput-bound**, which is the part that
+travels to other devices. The inner loop is a dependent shared-memory load
+feeding a state update feeding the next load; the cost is a pointer chase,
+not arithmetic. So **k must not be scaled by a device's FP32 rate** — the
+consumer's instinct that FP32 FMA is the wrong unit for integer rANS is
+correct, and this says why.
+
+`lmz.gpu.cost_model()` publishes all of it with provenance. What is still
+missing is the low-FLOP-per-byte device the request asked for: this box's
+iGPU is not reachable from WSL2 (no `/dev/dri`, no Vulkan, no OpenCL) and
+locking clocks needs privileges this session does not have, so the interval
+is from one high-bandwidth card and is marked that way in `provenance`.
+
 ## 2. The GPU decoder as a library, not a benchmark — **done**
 
 `lmz/gpu/` is the kernel promoted out of its benchmark. The entry point is a
@@ -268,21 +321,40 @@ can address.
 
 ## Where the boundary is
 
-Not lmz's, and it should stay that way:
+Not lmz's, and it should stay that way. This table had two columns when
+there were two parties; there are now three, and the middle one is where
+most of the ambiguity lived — a transport layer that decides *when* bytes
+move is neither the codec nor the residency engine:
 
 | | whose |
 |---|---|
 | the placement solver, the tier budgets, eviction | the engine |
-| prefetch, queue depth, stream and event choreography | the engine |
-| page-locked staging buffers, the copy/compute overlap | the engine |
 | adapters for PyTorch, vLLM, llama.cpp | the engine |
 | a *fused* decode-into-GEMV kernel | the engine — it owns the matrix kernel |
+| prefetch, queue depth, stream and event choreography | **the transport layer** |
+| page-locked staging buffers, the copy/compute overlap | **the transport layer** |
+| measuring the machine and choosing the route | **the transport layer** |
 | the coded stream, its table, its blocks, its index | **lmz** |
 | a standalone GPU decoder with a stable ABI | **lmz** |
+| decoding all the way to plaintext, planes merged | **lmz** |
+| the decoder's own cost constants | **lmz** |
 | tensor → block addressing | **lmz** |
 
 The dividing line that keeps holding: lmz produces bytes and can turn them
 back into bytes as fast as anyone. It does not decide *when*.
+
+**The purity rule that follows, stated where a contributor will hit it.**
+lmz's decode path is bytes in, bytes out. A new entry point that opens a
+file, starts a thread pool, or measures the machine in order to choose a
+policy belongs to the caller instead — there is one rate model in the stack
+and it is the transport layer's. `cost_model()` is the shape that stays on
+lmz's side: it publishes what the *kernel* costs, with provenance and with
+an interval where the value is not pinned, and says nothing about the
+machine it is called on. `Store`'s fixed readahead is the one place inside
+lmz that looks like policy; it is a constant with no probe and no
+adaptation, which keeps it on the right side of the line. The day it wants
+to time a disk, it should take the model from downstream rather than grow a
+second one.
 
 ## What is already right and should not be touched
 

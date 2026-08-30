@@ -2887,6 +2887,114 @@ def test_gpu_decode_over_distributions_and_shapes():
     assert checked >= 20, f"only {checked} shapes actually ran"
 
 
+def test_gpu_cost_model_is_publishable():
+    """The cost model is a contract, so its shape is checked even with no GPU.
+
+    A consumer builds a rate curve from these constants and decides whether
+    the coded route beats the plain one on its machine. A key that changes
+    name or a point published where the truth is an interval both land as a
+    wrong decision downstream rather than as an error, so the shape is pinned
+    here and the provenance is required to be present.
+    """
+    from lmz import gpu
+
+    cm = gpu.cost_model()
+    for key in ("lanes", "states", "grain", "bytes_per_symbol",
+                "k_cycles_per_byte", "expansion", "bound", "provenance"):
+        assert key in cm, key
+
+    # Exact properties of the format: 8 interleaved states is what makes one
+    # stream 8 lanes of work, and the grain follows from it.
+    assert cm["lanes"] == 8 and cm["states"] == 8
+    assert cm["bytes_per_symbol"] == 1
+    assert cm["grain"] == gpu.grain()
+
+    # k is not pinned to a point, and must not be published as one.
+    lo, hi = cm["k_cycles_per_byte"]
+    assert 0 < lo < hi, cm["k_cycles_per_byte"]
+
+    assert cm["expansion"] > 1
+    assert cm["bound"]["compute_below_threads"] > 0
+    assert 0 < cm["bound"]["saturates_at_fraction_of_peak_dram"] <= 1
+
+    # A number without its conditions is not a measurement.
+    prov = cm["provenance"]
+    for key in ("kernel", "device", "machine", "archive", "method",
+                "k_derivation", "status"):
+        assert prov.get(key), key
+
+
+def test_gpu_device_entry_point_owns_nothing():
+    """The device path must take the caller's memory and synchronise nothing.
+
+    A consumer that has built its own context, staging ring and event chain
+    cannot share a device with a library that quietly builds its own. This is
+    the entry point that lets it drive lmz instead, so what is checked is that
+    it exists, that it is exported, and -- where there is a GPU -- that it
+    decodes correctly against pointers the caller allocated in a context the
+    caller created.
+    """
+    from lmz import gpu
+
+    assert "decode_batch_dev" in gpu.__all__
+    assert callable(gpu.decode_batch_dev)
+    # Declining without a device is a status, not an exception: the caller is
+    # mid-pipeline and the decision to fall back is theirs.
+    assert gpu.decode_batch_dev(1, 1, 0, 128, 1) == gpu.OK  # nstr == 0
+
+    ok, _why = gpu.available()
+    if not ok:
+        assert gpu.decode_batch_dev(1, 1, 4, 128, 1) == gpu.ENODEV
+        raise Skip("no GPU decoder")
+
+    import ctypes
+    import struct
+
+    cuda = ctypes.CDLL("libcuda.so.1")
+    assert cuda.cuInit(0) == 0
+    dev, ctx = ctypes.c_int(), ctypes.c_void_p()
+    assert cuda.cuDeviceGet(ctypes.byref(dev), 0) == 0
+    assert cuda.cuCtxCreate_v2(ctypes.byref(ctx), 0, dev) == 0
+    try:
+        plane, nstr = 4096, 32
+        table = bytes((abs(i - 128) // 3 + 100) % 256 for i in range(256))
+        segs = [rand(plane, i + 1).translate(table) for i in range(nstr)]
+        streams, offsets = bytearray(), bytearray()
+        for seg in segs:
+            coded = kernels.rans_encode(seg, kernels.histogram(seg))
+            offsets += struct.pack("<QQ", len(streams), len(coded))
+            streams += coded
+        # The caller owns the padding here, because the allocation is the
+        # caller's -- decode_batch adds it on the device, this cannot.
+        blob = bytes(streams) + b"\0" * gpu.pad_bytes()
+
+        ptrs = []
+
+        def alloc(n):
+            p = ctypes.c_void_p()
+            assert cuda.cuMemAlloc_v2(ctypes.byref(p), ctypes.c_size_t(n)) == 0
+            ptrs.append(p)
+            return p
+
+        d_streams, d_off, d_out = alloc(len(blob)), alloc(len(offsets)), \
+            alloc(nstr * plane)
+        cuda.cuMemcpyHtoD_v2(d_streams, blob, ctypes.c_size_t(len(blob)))
+        cuda.cuMemcpyHtoD_v2(d_off, bytes(offsets), ctypes.c_size_t(len(offsets)))
+
+        rc = gpu.decode_batch_dev(d_streams.value, d_off.value, nstr, plane,
+                                  d_out.value)
+        assert rc == gpu.OK, (rc, gpu.last_error())
+        # It did not synchronise; the caller does, which is the point.
+        assert cuda.cuCtxSynchronize() == 0
+        host = ctypes.create_string_buffer(nstr * plane)
+        cuda.cuMemcpyDtoH_v2(host, d_out, ctypes.c_size_t(nstr * plane))
+        assert host.raw[:nstr * plane] == b"".join(segs)
+    finally:
+        for p in ptrs:
+            cuda.cuMemFree_v2(p)
+        cuda.cuCtxDestroy_v2(ctx)
+
+
 def test_gpu_verify_reports_this_machine():
     """`lmz doctor --gpu-verify` is the field report, so it has to be right.
 
