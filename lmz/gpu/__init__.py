@@ -456,6 +456,14 @@ def cost_model(kernel: str = "shared") -> dict:
                       "block 64..384 over identical input, two runs agreeing "
                       "within 1%. Bytes moved are the same in every row, so "
                       "the 1.70x spread is compute alone.",
+            "scaling": "k is dependent-load latency partly hidden by "
+                       "occupancy, not an issue rate: the decode rate is "
+                       "linear in resident lanes across an 84x range, where "
+                       "an issue-limited kernel would flatten once the issue "
+                       "slots filled. So scale it by resident lanes x clock. "
+                       "Never by a device's FP32 rate -- the inner loop is a "
+                       "dependent shared-memory load feeding a state update, "
+                       "and FMA throughput says nothing about it.",
             "k_derivation": "measured, not derived: lanes resident x "
                             "sustained clock / decode rate, over the rows "
                             "below saturation. Resident lanes come from the "

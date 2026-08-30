@@ -427,6 +427,35 @@ suite now asserts the ordering and a sane bound on the ratio, since the
 per-chunk kernel costing *less* per byte would mean one of them was measured
 wrong.
 
+**The consequence that reaches furthest: the two readings collapse.** A
+consumer's gate has carried two interpretations of the single 418 GB/s point —
+that it is ~84% of a bandwidth bound, or that it defines a compute constant —
+which agree on the card that produced them and differ by 8× on a 2-CU adapter.
+It refused to choose, correctly, because one point cannot.
+
+The grid sweep does choose, by showing that **both are true in different
+places and which one binds is a property of the device**. The model is
+`min(compute, bandwidth)`; the crossing on this card is around 48,000 resident
+lanes. For a small part the compute term is nowhere near it:
+
+| | resident lanes | lanes needed to reach the bandwidth ceiling | margin |
+|---|---|---|---|
+| 2 CU, 1.5 GHz, 30 GB/s | ~768 | 5,800 | 7.6× |
+| 2 CU, 2.0 GHz, 30 GB/s | ~768 | 4,400 | 5.7× |
+| 2 CU, 1.5 GHz, 100 GB/s | ~768 | 19,500 | 25× |
+
+So on any device with few compute units **the compute term binds**, by a
+margin of at least ~6× under the least favourable assumptions, and the
+bandwidth reading is not live there at all. That is what makes the ambiguity
+collapsible: not that one reading was wrong, but that the regimes are now
+separated empirically and small devices are unambiguously in one of them.
+
+**What that does not settle**, and it is narrower and sharper than "small
+devices are unverified": whether the linear-in-lanes relation *extends* down to
+2 CUs, or meets a cache, scheduler or driver wall on the way; and how a
+unified-memory part behaves with a CPU contending for the same bus. Those are
+the two things that still require running on such a device.
+
 **What this instrument is not.** A 5080 held to a few blocks is a 5080 with
 less compute and **the same ~960 GB/s of DRAM behind it, and no CPU contending
 for the bus**. It validates the model's *shape* and the constant's *value on
@@ -670,31 +699,46 @@ wrong weight. Keep them, keep them cheap, and keep them on by default.
 ## Before you measure anything
 
 Every defect this project found in one day came from the measurement setup
-rather than the code, and they are one family: **a number is only as good as
-the variable it is attributed to.** Read these before running a sweep, not
-after publishing one.
+rather than the code. Two families: **you can measure the wrong object** (1),
+or **measure the right one and attribute its cost to the wrong variable**
+(2–6). Both produce numbers that are reproducible, tight, and wrong, which is
+the shape that gets published. Read these before running a sweep, not after
+publishing one.
 
-1. **Tune where the knob binds.** An optimum reached on the development box is
+1. **An instrument must reproduce the thing it claims to measure.** This is a
+   class above the rest: they are about attributing a cost to the wrong
+   variable, this one is about measuring the wrong object. A grid-stride
+   rewrite of `k_shared` decoded byte-identically at every grid size, scaled
+   linearly, and produced a tight reproducible `k` of 638–664 — and it was
+   2.4× slower than the shipped kernel, so its constant was wrong by more than
+   the error it was built to correct, and would have shipped *as the
+   correction* with more confidence than the value it replaced. The check that
+   caught it cost one run: at a full grid the wrapper has to match the kernel
+   it wraps (414.6 against 409.8–418). **Byte-identity proves the output and
+   says nothing about whether you are measuring the kernel you ship.** Compare
+   them in the regime where they can be compared, before any sweep means
+   anything.
+2. **Tune where the knob binds.** An optimum reached on the development box is
    evidence the box cannot tell the choices apart, not evidence the choice is
    right. `pick_tpb` maximised block width for a latency-bound kernel and
    survived a full occupancy sweep, because this card saturates on bandwidth
    at 192 threads and no measurement taken on it could see the difference.
-2. **Reproduce, then reorder.** A number reproducible twice can still be an
+3. **Reproduce, then reorder.** A number reproducible twice can still be an
    artifact of sweep order. The per-chunk sweep reported 84 GB/s at one block
    size across two runs; every row launches identically, and running the same
    value seven times shows no 84 anywhere. Reversing a sweep is cheap and
    should not wait until something looks wrong — the shared-table sweep was
    re-run in reverse for exactly that reason and held.
-3. **A sweep that collapses to a point cannot bracket an interval.** The
+4. **A sweep that collapses to a point cannot bracket an interval.** The
    per-chunk sweep produced one launch, so its `k` interval is run-to-run
    spread rather than a range over occupancy. Published as such
    (`k_is_single_point_fit`), because the field name is identical to the
    shared kernel's and the claim is not.
-4. **Assert what the machine has, not what yours has.** A test that asserts
+5. **Assert what the machine has, not what yours has.** A test that asserts
    this box's answer is testing the box; the environments that disagree are
    the ones you cannot see. `LMZ_NO_GPU=1` before pushing, and the same rule
    in `tests/test_lmz.py`'s docstring.
-5. **Fix the byte traffic across a sweep.** Every row of the occupancy sweeps
+6. **Fix the byte traffic across a sweep.** Every row of the occupancy sweeps
    decodes the identical archive; anything that moves is therefore the
    variable under test and not the workload.
 
