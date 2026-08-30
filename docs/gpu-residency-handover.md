@@ -417,6 +417,18 @@ A 4 KiB LUT is worth **1.8× the resident lanes on a 32 KiB budget** and almost
 nothing here — which is exactly why this card could not have shown it, and why
 the convergence of two independent analyses was worth more than either.
 
+**What that change now costs, which is more than composing two verified
+pieces.** `cost_model()`'s residency formula omits the per-unit thread limit,
+on the stated grounds that shared memory binds first at every block size — and
+that is true *because* the fixed LUT is 16 KiB. **A narrow table removes the
+very margin that makes the simplification hold**, so the `min()` term becomes
+live, every residency projection has to be re-checked against it, including the
+ones a consumer has already built, and the published formula changes. A test
+asserts shm still binds first precisely so this cannot happen quietly: whoever
+takes the LUT will trip it on their first commit, which is exactly when they
+should be reminded. Still days rather than weeks, but it is a contract change
+as well as a kernel change.
+
 **A side effect worth naming: the narrow table's cost is now measured.** With
 both kernels' constants taken in the compute-bound regime, they separate —
 **217–248 shared against 257–291 per-chunk**. That gap is the second dependent
@@ -713,9 +725,10 @@ wrong weight. Keep them, keep them cheap, and keep them on by default.
 Every defect this project found in one day came from the measurement setup
 rather than the code — none from computing a wrong answer. Two families: **you
 can measure the wrong object** (1, 6), or **measure the right one and attribute
-its cost to the wrong variable** (2–5, 8) — and one that is neither, where a
-number acquires authority by crossing a boundary and coming back (7). All
-produce numbers that are
+its cost to the wrong variable** (2–5, 9) — and two that are neither, where a
+number acquires authority by crossing a boundary and coming back (7), or where
+the machine silently edits the model by omitting a term that does not bind on
+it (8). All produce numbers that are
 reproducible, tight, and wrong, which is the shape that gets published.
 
 That the defects cluster this way is partly a fact about the work and partly a
@@ -781,7 +794,24 @@ beyond suspicion.
    and a published boundary is precisely what makes it possible. Before
    publishing a number, ask where it came from, and if the answer is "the
    consumer", either measure it or attribute it.
-8. **Fix the byte traffic across a sweep.** Every row of the occupancy sweeps
+8. **A term that does not bind on your machine is invisible in your model.**
+   `cost_model()`'s residency formula shipped without the per-unit *thread*
+   limit, and without saying which shared-memory budget to divide by. Neither
+   was a reasoning error: on this card shared memory binds first at every
+   block size, so the thread term is inert, and its per-block cap and per-unit
+   pool are a kilobyte apart, so the divisor is unambiguous *here*. Both gaps
+   were found by a consumer substituting a different device's numbers — one of
+   which made the ambiguity a 2.3× error, the other of which would make the
+   omitted term bind. **The machine edits the model by omission**, and it does
+   so in the one place built to escape the machine.
+
+   That is also the argument for publishing a *formula* rather than constants,
+   which was not obvious before it happened twice: a published constant cannot
+   reveal a missing term, while a published formula gets substituted into by
+   someone whose numbers make the missing term bind, and then it tells you.
+   Write down the terms that are inert here, marked as inert, rather than
+   leaving them out.
+9. **Fix the byte traffic across a sweep.** Every row of the occupancy sweeps
    decodes the identical archive; anything that moves is therefore the
    variable under test and not the workload.
 
