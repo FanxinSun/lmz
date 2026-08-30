@@ -361,6 +361,67 @@ codec means answering the question. A test asserts every codec has an entry —
 without it a new codec would default to unreadable and silently make archives
 look unroutable.
 
+## 3c. Fusing the plane merge into the decode — measured, not built
+
+The GPU decoder returns byte planes plane-major; the plaintext is the
+transpose. A downstream consumer holds that transpose as a loaned kernel and
+asked lmz to take it back, either as a second launch or fused into the decode.
+lmz's own CPU path already merges inside itself, so the asymmetry is real
+whichever way this lands. What follows is the measurement that decides *how*.
+
+**The merge is already free as a kernel.** On this card, 936 MB of 4-byte
+elements:
+
+| | ms | GB/s of output |
+|---|---|---|
+| merge, plane-major → interleaved | 2.45 | 400.3 |
+| a plain copy of the same bytes | 2.43 | 403.5 |
+
+Within 0.8% of a pure copy. The scatter costs nothing — it is bandwidth-bound
+like any copy, and the loaned kernel's 264 GB/s is a different measurement of
+the same thing rather than a penalty to be engineered away.
+
+**So the prize is not the merge, it is the round trip.** Fused, the plaintext
+is written once instead of written, read back and written again — the merge's
+own 2×936 MB of traffic disappears rather than being made faster:
+
+| layout | decode | + merge | fusing worth up to |
+|---|---|---|---|
+| shared table, 409.8 GB/s measured | 2.29 ms | 4.74 ms | **2.07×** |
+| per-chunk, 107.1 GB/s measured — what archives hold today | 8.74 ms | 11.19 ms | **1.28×** |
+
+**And it is worth least on exactly the device the argument is aimed at.**
+Projecting both terms from the same device parameters — decode from the
+published `k` = 230–330 against lanes × clock, merge from bandwidth — gives a
+result that inverts the intuition:
+
+| device | decode (k-model) | merge | fusing |
+|---|---|---|---|
+| RTX 5080 (measured 2.29 ms; model says 1.67–2.40) | 1.67–2.40 ms | 3.34 ms | 2.39–3.00× |
+| 8-CU iGPU, ~1.8 GHz, ~100 GB/s — *projected* | 38.9–55.9 ms | 18.7 ms | 1.34–1.48× |
+| 2-CU iGPU, ~1.5 GHz, ~50 GB/s — *projected* | 187–268 ms | 37.5 ms | **1.14–1.20×** |
+
+The merge is a fixed bandwidth cost; the decode is not. On a compute-bound
+part the decode dominates so completely that removing the merge barely
+registers. The model is worth the weight given: it predicts 1.67–2.40 ms on
+the card where 2.29 was measured. The iGPU rows are projections and no such
+device is reachable from here.
+
+**The design cost, for whoever builds it.** A fused kernel must transpose in
+shared memory, which needs all `esize` planes of a chunk resident in one
+block — and today `gid` is a flat stream index, so that holds only when the
+group count divides the plane count. At `tpb` 96 and 160 it does not for
+8-byte elements, and `pick_tpb` can choose 160. So a fused kernel either
+constrains the block size, taking back the residency freedom `d989c49` just
+won, or carries a fallback for the cases that straddle.
+
+**Verdict: not built, and the second launch is the right shape for now.** The
+merge is free, the round trip is the only prize, that prize is smallest on the
+device class this is for, and buying it costs the block-size freedom that a
+small device needs most. What should not be lost is that the merge belongs to
+lmz either way — the plane split is lmz's format, and a decoder that stops one
+step short of plaintext is unfinished however fast it is.
+
 ## 4. Tensor-level addressing
 
 A residency manager asks one question — *where are the blocks for this

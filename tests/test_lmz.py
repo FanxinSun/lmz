@@ -3,6 +3,29 @@
 Runs standalone (`python3 tests/test_lmz.py`) and under pytest. Every
 round-trip check compares bytes, not just sizes: the whole point of the tool
 is that decompression reproduces the input exactly.
+
+**A test that asserts what this machine returns is testing the machine.** The
+environments that disagree are the ones you cannot see from here: no GPU, no
+nvcc, no zstd binding, a different Python, an interpreter with no free
+threading. Assert the *contract* -- what the code promises given what the
+machine has -- rather than the answer this box happens to give. Two ways that
+goes wrong, both of which have shipped:
+
+- asserting the present-hardware answer unconditionally. `decode_batch_dev`
+  with an empty batch returns OK where the library loaded and ENODEV where it
+  did not, because the load is checked first; asserting OK turned every
+  GPU-less runner red.
+- asserting which coder wins. Before 3.14 there is no stdlib zstd, so naming
+  zstd in an assertion tests which Python is running rather than which coder
+  is better.
+
+Before pushing, run the suite the way the runners will:
+
+    LMZ_NO_GPU=1 python3 tests/test_lmz.py
+
+It takes the same minute as the ordinary run and covers the environment
+difference that no amount of local passing will reveal. A GPU test that does
+not `raise Skip` on a machine without one is a bug in the test.
 """
 
 from __future__ import annotations
