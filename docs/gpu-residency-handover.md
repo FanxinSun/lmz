@@ -702,8 +702,15 @@ Every defect this project found in one day came from the measurement setup
 rather than the code — none from computing a wrong answer. Two families: **you
 can measure the wrong object** (1, 6), or **measure the right one and attribute
 its cost to the wrong variable** (2–5, 7). Both produce numbers that are
-reproducible, tight, and wrong, which is the shape that gets published. Read
-these before running a sweep, not after publishing one.
+reproducible, tight, and wrong, which is the shape that gets published.
+
+That the defects cluster this way is partly a fact about the work and partly a
+fact about the tests: a coder that computes a wrong answer is caught by a
+byte-identity check, and this suite has 292 of them across 120 tests, so those
+defects die in the suite and never reach a report. What survives to be found by
+hand is the measurement around the code. Read these before running a sweep, not
+after publishing one — and do not read the clustering as evidence the coder is
+beyond suspicion.
 
 1. **An instrument must reproduce the thing it claims to measure.** This is a
    class above the rest: they are about attributing a cost to the wrong
