@@ -361,6 +361,42 @@ codec means answering the question. A test asserts every codec has an entry —
 without it a new codec would default to unreadable and silently make archives
 look unroutable.
 
+## 1c. The per-chunk kernel's cost model — **done**, and its sweep is degenerate
+
+`cost_model("per_chunk")` publishes the other kernel's constants, because a
+gate routing an ordinary archive was otherwise quoting the shared kernel's and
+would predict about four times the real throughput.
+
+| | shared | per-chunk |
+|---|---|---|
+| shared memory | 16 KiB fixed + 640 B a group | **0 fixed + 5760 B a group** |
+| resident lanes (this card) | 21504–64512 | **10752, always** |
+| `k` lane-cycles/byte | 230–330 | **257–283** |
+| measured | 409.8 GB/s | 107–111 GB/s |
+
+**The sweep has one real row, not seven.** At 5.6 KiB a group this kernel
+cannot exceed 128 threads inside a 99 KiB block, and `pick_tpb` resolves
+*every* requested block size to the same launch — 32 threads, 4 blocks a unit.
+Asking for a wider block does nothing, which is worth publishing: a caller
+tuning this kernel by block size is tuning nothing.
+
+**So the 3.8× gap is mostly occupancy, not the second dependent load.** §1
+attributes it to the narrow table's extra shared load on the critical path.
+That is real but secondary: the two `k` intervals overlap (230–330 against
+257–283), which says the two kernels cost about the same per byte. What
+differs is that one keeps up to 6× more lanes resident. The fix for the gap is
+therefore a smaller per-group table, not a cheaper inner loop.
+
+**A measurement trap found while doing this, and it invalidated a published
+row.** The per-chunk sweep reported 84 GB/s at 96 threads against 110 either
+side — reproducibly, across two runs. It is an artifact of *sweep order*, not
+of block size: every row launches identically, and re-running the same value
+seven times gives 99–101 GB/s with no 84 anywhere. The shared-table sweep in
+§1b was re-run in reverse order as a check and holds its shape (384 fast, 64
+slow, same values within noise), so the `k` interval published there stands.
+The lesson for the next sweep: **a reproducible number is not an attributed
+one** — reproduce it, then reorder it.
+
 ## 3c. Fusing the plane merge into the decode — measured, not built
 
 The GPU decoder returns byte planes plane-major; the plaintext is the

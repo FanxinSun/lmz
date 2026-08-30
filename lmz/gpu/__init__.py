@@ -278,8 +278,76 @@ def pad_bytes() -> int:
     return _const("lmz_gpu_pad_bytes", 576)
 
 
-def cost_model() -> dict:
+def _cost_model_per_chunk() -> dict:
+    """The per-chunk kernel's constants. See `cost_model`.
+
+    Reported separately because the two kernels differ in the thing that
+    decides throughput. This one builds a narrow table per group -- 4 KiB of
+    slot->symbol plus 1 KiB of symbol->(start, freq) -- with no fixed cost, so
+    a block's request scales entirely with its group count. The shared-table
+    kernel pays 16 KiB once and 640 B a group.
+
+    The consequence is occupancy, not arithmetic. At 5.6 KiB a group this
+    kernel cannot exceed 128 threads inside a 99 KiB block, and on the card it
+    was measured on `pick_tpb` lands on 32 threads at 4 blocks a unit for every
+    request -- 10752 resident lanes against the shared kernel's 21504 to 64512.
+    That ~6x is most of the gap between 110 and 418 GB/s, rather than the
+    second dependent shared load the two-table design was expected to cost.
+
+    So `blocks_per_unit_at_measurement` is a single value here and not a range:
+    there was only ever one launch to measure.
+    """
+    return {
+        "lanes": 8,
+        "states": 8,
+        "grain": grain(),
+        "bytes_per_symbol": 1,
+        "kernel": "per_chunk",
+        "k_cycles_per_byte": (257, 283),
+        "expansion": 2.79,
+        "bound": {
+            # There is no crossover to report: every block size the caller can
+            # ask for resolves to the same launch, so nothing here is tunable.
+            "compute_below_threads": None,
+            "saturates_at_fraction_of_peak_dram": 0.15,
+        },
+        "shmem_lut_bytes": 0,
+        "shmem_per_group_bytes": PROB_SCALE + 256 * 4 + GRAIN + BUFB,
+        "blocks_per_unit_at_measurement": (4, 4),
+        "provenance": {
+            "kernel": "lmzgpu.cu k_perstream, a frequency table per chunk",
+            "device": "NVIDIA GeForce RTX 5080, sm_120, 84 SMs, "
+                      "256-bit GDDR7, ~960 GB/s peak, ~2.66 GHz sustained",
+            "machine": "9800X3D, WSL2, CUDA 13.2, driver 610.88",
+            "archive": "936.4 MB of real BF16 exponent planes from a Llama "
+                       "checkpoint, 336.1 MB coded, 32768-byte streams",
+            "method": "block-size sweep at fixed byte traffic, two runs "
+                      "agreeing within 0.3%. Every requested size resolves to "
+                      "the same launch, so the sweep has one real row rather "
+                      "than seven -- a caller cannot tune this kernel by "
+                      "asking for a wider block.",
+            "k_derivation": "measured: resident lanes x sustained clock / "
+                            "decode rate, at the single launch pick_tpb "
+                            "chooses (32 threads, 4 blocks a unit). It "
+                            "overlaps the shared kernel's 230-330, which is "
+                            "the expected result -- same algorithm, same cost "
+                            "a byte, different residency.",
+            "status": "one device, and one launch on it. The interval is "
+                      "narrower than the shared kernel's because there was no "
+                      "occupancy to vary, not because it is better known.",
+        },
+    }
+
+
+def cost_model(kernel: str = "shared") -> dict:
     """What the decoder costs, so a caller can predict it on its own machine.
+
+    `kernel` selects which of the two lmz ships: "shared", for a batch given
+    one frequency table, and "per_chunk", for streams that each carry their
+    own -- which is what every archive written today holds. They are the same
+    algorithm and cost about the same per byte; what differs is how many lanes
+    a device can keep resident, and that is most of the throughput gap between
+    them.
 
     A consumer deciding whether decoding beats not compressing needs the
     kernel's constants, not lmz's opinion about their machine. These are the
@@ -315,11 +383,16 @@ def cost_model() -> dict:
     measurement, which is the caller's. `verify()` reports what this device
     actually did.
     """
+    if kernel not in ("shared", "per_chunk"):
+        raise ValueError(f"kernel must be 'shared' or 'per_chunk', not {kernel!r}")
+    if kernel == "per_chunk":
+        return _cost_model_per_chunk()
     return {
         "lanes": 8,
         "states": 8,
         "grain": grain(),
         "bytes_per_symbol": 1,
+        "kernel": "shared",
         "k_cycles_per_byte": (230, 330),
         "expansion": 2.88,
         "bound": {

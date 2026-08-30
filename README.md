@@ -177,11 +177,17 @@ a 5080 tells you about a 5080. `gpu.cost_model()` gives you the mechanism
 instead, so you can compute the answer for your own device:
 
 ```python
-gpu.cost_model()
+gpu.cost_model()              # the shared-table kernel
+gpu.cost_model("per_chunk")   # what an ordinary archive actually uses
 # k_cycles_per_byte: (230, 330)   -- an interval, because it is one
 # shmem_lut_bytes / shmem_per_group_bytes / blocks_per_unit_at_measurement
 # expansion, bound, and provenance for every number
 ```
+
+Ask for the kernel you will actually run: the two cost about the same per byte
+and differ by up to 6× in how many lanes a device keeps resident, so quoting
+the shared-table constants for an ordinary archive over-predicts it about
+fourfold.
 
 `k` is published as a range rather than a midpoint because occupancy hides part
 of the cost and how much varies with the block size — and it is **latency-bound

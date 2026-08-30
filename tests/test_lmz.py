@@ -3103,6 +3103,30 @@ def test_gpu_cost_model_is_publishable():
     """
     from lmz import gpu
 
+    # Both kernels publish a model, and a caller routing an ordinary archive
+    # needs the per-chunk one -- quoting the shared kernel's constants for a
+    # per-chunk archive would predict roughly four times the real throughput.
+    assert gpu.cost_model()["kernel"] == "shared"
+    for kern in ("shared", "per_chunk"):
+        assert gpu.cost_model(kern)["kernel"] == kern
+    try:
+        gpu.cost_model("fused")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown kernel name must be refused")
+
+    per = gpu.cost_model("per_chunk")
+    # Its table is per group with no fixed cost; the shared kernel is the
+    # reverse. That difference is the occupancy story, so it has to survive.
+    assert per["shmem_lut_bytes"] == 0
+    assert per["shmem_per_group_bytes"] > gpu.cost_model()["shmem_per_group_bytes"]
+    # Same algorithm, so the two intervals must overlap. If they ever stop
+    # overlapping, one of them was measured wrong.
+    a_lo, a_hi = gpu.cost_model()["k_cycles_per_byte"]
+    b_lo, b_hi = per["k_cycles_per_byte"]
+    assert a_lo <= b_hi and b_lo <= a_hi, (a_lo, a_hi, b_lo, b_hi)
+
     cm = gpu.cost_model()
     for key in ("lanes", "states", "grain", "bytes_per_symbol",
                 "k_cycles_per_byte", "expansion", "bound", "provenance"):
