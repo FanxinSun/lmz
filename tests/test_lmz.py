@@ -3203,6 +3203,22 @@ def test_gpu_cost_model_is_publishable():
                 blocks.add(pool // shm)
         assert lo in blocks and hi in blocks, (kern, lo, hi, sorted(blocks))
 
+    # The formula omits the per-unit thread limit on the stated grounds that
+    # shared memory binds first for this kernel. That is a claim about the
+    # footprint, not a law, so it is checked: if a smaller table ever makes
+    # threads the binding limit, the formula needs the min() term it currently
+    # says can be dropped.
+    for kern in ("shared", "per_chunk"):
+        m = gpu.cost_model(kern)
+        cap, pool, threads_per_unit = 101376, 102400, 1536
+        for threads in (32, 64, 96, 128, 160, 192, 256, 384):
+            shm = m["shmem_lut_bytes"] + (threads // m["lanes"]) * m["shmem_per_group_bytes"]
+            if shm > cap:
+                continue
+            assert pool // shm <= threads_per_unit // threads, (
+                kern, threads, "threads now bind before shared memory; "
+                "residency_formula must take the min")
+
     # Those constants mirror the kernel, so they are checked against what the
     # library itself reports rather than trusted. `grain` is the one the C ABI
     # exposes directly; if it disagrees, the mirror has drifted.
