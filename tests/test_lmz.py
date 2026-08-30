@@ -2539,6 +2539,121 @@ def test_chunk_order_survives_a_table_written_out_of_order():
         raise AssertionError("a partial record must be rejected")
 
 
+def test_archive_index_decodes_without_doing_io():
+    """A caller must be able to fetch payloads itself and hand them back.
+
+    `decompress` reads and decodes inside one worker, so the thread count that
+    sets decode throughput also sets how many reads are outstanding -- and
+    those want opposite things. The only way out is a decode that touches no
+    file, which is this. What it must produce is exactly what `decompress`
+    produces, or it is a second decoder rather than the same one.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "m.safetensors")
+        write_safetensors(path, [
+            ("w", "BF16", [65536], weights_bf16(65536, 11)),
+            ("dup", "BF16", [65536], weights_bf16(65536, 11)),   # a ref chunk
+            ("f", "F32", [16384], rand(65536, 3)),
+        ])
+        archive = os.path.join(d, "a.lmz")
+        lmz.compress(path, archive, mapped=True)
+        expect = os.path.join(d, "expect.bin")
+        lmz.decompress(archive, expect)
+        want = open(expect, "rb").read()
+
+        index = lmz.ArchiveIndex(archive)
+        assert index.original_size == len(want)
+        refs = index.chunks()
+        assert refs and [c.index for c in refs] == list(range(len(refs)))
+        # Output order, so a caller can stream them into place.
+        assert [c.dst for c in refs] == sorted(c.dst for c in refs)
+
+        out = bytearray(len(want))
+        deferred = 0
+        with open(archive, "rb") as fh:
+            for ref in refs:
+                payload = os.pread(fh.fileno(), ref.clen, ref.off)
+                assert len(payload) == ref.clen
+                try:
+                    plain = index.decode(ref, payload)
+                except lmz.ArchiveIndex.NeedsSource:
+                    # Coded against another range; decompress owns that.
+                    deferred += 1
+                    out[ref.dst:ref.dst + ref.rlen] = want[ref.dst:ref.dst + ref.rlen]
+                    continue
+                assert len(plain) == ref.rlen
+                out[ref.dst:ref.dst + ref.rlen] = plain
+        assert bytes(out) == want
+        # The duplicate tensor must actually have produced a ref chunk, or
+        # this test never exercised the case it claims to.
+        assert deferred >= 1
+
+        # A payload of the wrong length is caught rather than decoded.
+        try:
+            index.decode(refs[0], b"\0" * (refs[0].clen + 1))
+        except FormatError:
+            pass
+        else:
+            raise AssertionError("a short payload must be refused")
+
+
+def test_capabilities_are_declared_not_inferred():
+    """An archive must say which decoders can read it.
+
+    lmz emits CODEC_BF16C for large enough chunks, and the batch decoder
+    cannot read it -- its per-bucket segments have unequal lengths. Nothing in
+    the archive used to say so, so a consumer that wanted a GPU-readable
+    archive had to reproduce lmz's own encoder threshold and would not notice
+    the day it changed.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "m.safetensors")
+        # Big enough to clear the conditioning threshold, and shaped so that
+        # conditioning actually wins -- the encoder prices it rather than
+        # taking it on size alone, so uniform noise would quietly produce a
+        # plain split and this test would pass without reaching its subject.
+        # Big enough to clear the conditioning threshold, and shaped so the
+        # conditioned codec must win -- the encoder prices it rather than
+        # choosing it on size alone, so ordinary weights would produce a plain
+        # split and this test would pass without reaching its subject.
+        n = 1 << 21
+        write_safetensors(path, [("w", "BF16", [n], weights_bf16_cond(n, 5))])
+
+        whole = os.path.join(d, "whole.lmz")
+        lmz.compress(path, whole)
+        cap = lmz.capabilities(whole)
+        assert cap["derived"] is False
+        assert 0.0 <= cap["batch_decodable_bytes"] <= 1.0
+        # The case the item exists for: lmz emitted a codec its own batch
+        # decoder cannot read, and the archive now says so.
+        assert cap["blockers"] == {"bf16-cond": 1}, cap["blockers"]
+        assert cap["batch_decodable"] is False
+
+        # The same weights in small blocks stay under the threshold, so the
+        # conditioned codec is never chosen and the archive is readable.
+        blocks = os.path.join(d, "blocks.lmz")
+        lmz.compress(path, blocks, mapped=True)
+        cap2 = lmz.capabilities(blocks)
+        assert cap2["batch_decodable"] is True, cap2["blockers"]
+        assert not cap2["blockers"]
+        assert cap2["batch_decodable_bytes"] == 1.0
+
+        # Shared tables raise the reader version and stay batch-decodable.
+        shared = os.path.join(d, "shared.lmz")
+        lmz.compress(path, shared, mapped=True, shared_tables=True)
+        cap3 = lmz.capabilities(shared)
+        assert cap3["batch_decodable"] is True, cap3["blockers"]
+        if cap3["shared_tables"]:
+            assert cap3["min_reader_version"] >= 7
+
+        # Every codec lmz can emit has an entry, or an archive using it would
+        # silently report itself unreadable.
+        from lmz import format as fmt
+        for cid, name in fmt.CODEC_NAMES.items():
+            assert cid in fmt.BATCH_DECODABLE, name
+        assert set(fmt.BATCH_DECODABLE) == set(fmt.CODEC_NAMES)
+
+
 def test_v1_archives_still_read():
     """Version-1 archives predate refs and conditioning; they must still open."""
     with tempfile.TemporaryDirectory() as d:

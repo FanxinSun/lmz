@@ -26,9 +26,9 @@ expanded onto disk:
 
 __version__ = "1.2.0"
 
-from .api import (DEFAULT_CHUNK_SIZE, DEFAULT_LEVEL, Option, Stats, backends,
-                  compress, decompress, encode_options, info, read_tensor,
-                  verify)
+from .api import (DEFAULT_CHUNK_SIZE, DEFAULT_LEVEL, ArchiveIndex, ChunkRef,
+                  Option, Stats, backends, capabilities, compress, decompress,
+                  encode_options, info, read_tensor, verify)
 from .api import MappedArchive, append, extract  # noqa: F401
 from .format import FormatError
 from .lmzfs import LmzFS  # noqa: F401
@@ -38,5 +38,6 @@ __all__ = [
     "compress", "decompress", "verify", "info", "read_tensor", "backends",
     "MappedArchive", "append", "extract", "Store", "mount", "LmzFS",
     "Stats", "Option", "encode_options", "FormatError",
+    "ArchiveIndex", "ChunkRef", "capabilities",
     "DEFAULT_LEVEL", "DEFAULT_CHUNK_SIZE", "__version__",
 ]

@@ -23,8 +23,9 @@ from dataclasses import dataclass, field
 
 from . import codec as _codec
 from . import entropy, kernels
-from .format import (CODEC_DELTA, CODEC_REF, CODEC_SPLIT, FLAG_ALIGNED,
-                     FLAG_PAGE_MAPPED,
+from .format import (BATCH_DECODABLE, CODEC_DELTA, CODEC_MIN_VERSION,
+                     CODEC_NAMES, CODEC_REF, CODEC_SPLIT, CODEC_STORED,
+                     FLAG_ALIGNED, FLAG_PAGE_MAPPED,
                      HEADER_SIZE, PAGE_ALIGN, ArchiveReader, ArchiveWriter,
                      CorruptArchive, FormatError, Member)
 from .parallel import (default_workers, gil_enabled, ordered_map,
@@ -1263,6 +1264,61 @@ def verify(src: str, *, workers: int | None = None, progress=None) -> Stats:
 # --------------------------------------------------------------- inspection
 
 
+def capabilities(src: str) -> dict:
+    """Which decoders can read this archive, declared rather than inferred.
+
+    A consumer choosing a route needs to know whether lmz's batch decoder can
+    take an archive's chunks before it commits to a device path. Until this
+    existed the only way to find out was to reproduce lmz's own encoder
+    threshold downstream -- a copy of a constant that goes stale silently the
+    day the encoder changes it.
+
+    Returns::
+
+        {"batch_decodable": bool,        # every coded chunk can ride the batch
+         "batch_decodable_bytes": float, # share of plaintext that can, 0..1
+         "blockers": {name: chunks},     # codecs standing in the way
+         "min_reader_version": int,
+         "shared_tables": bool,
+         "derived": False}
+
+    `derived` is False because this is read from the archive's own chunk table
+    rather than guessed from a chunk size or a dtype. A consumer that infers
+    the same answer some other way should report True, so that a cached
+    inference is never mistaken for a declaration -- the same discipline as
+    marking a projection a projection.
+
+    A chunk that is not coded at all (stored, or a ref to bytes elsewhere) is
+    not a blocker: there is nothing for a decoder to do, and a route that
+    handles the coded chunks handles the archive. `batch_decodable_bytes`
+    counts only what is coded, so an archive of entirely stored chunks reports
+    True with a share of 1.0.
+    """
+    with open(src, "rb") as fh:
+        reader = ArchiveReader(fh)
+        blockers: dict[str, int] = {}
+        coded = ok = 0
+        for c in reader.chunks:
+            if c.codec in (CODEC_STORED, CODEC_REF):
+                continue          # nothing coded here for any decoder to read
+            coded += c.rlen
+            if BATCH_DECODABLE.get(c.codec, False):
+                ok += c.rlen
+            else:
+                name = CODEC_NAMES.get(c.codec, f"codec {c.codec}")
+                blockers[name] = blockers.get(name, 0) + 1
+        return {
+            "batch_decodable": not blockers,
+            "batch_decodable_bytes": (ok / coded) if coded else 1.0,
+            "blockers": blockers,
+            "min_reader_version": max(
+                (CODEC_MIN_VERSION.get(c.codec, 1) for c in reader.chunks),
+                default=1),
+            "shared_tables": bool(reader.manifest.get("tables")),
+            "derived": False,
+        }
+
+
 def info(src: str) -> dict:
     """Archive metadata: members, tensors, and how the chunks were encoded."""
     with open(src, "rb") as fh:
@@ -1271,9 +1327,7 @@ def info(src: str) -> dict:
         payload_bytes = 0
         for c in reader.chunks:
             payload_bytes += c.clen
-            name = {0: "stored", 1: "entropy", 2: "split", 3: "bf16-split",
-                    4: "ref", 5: "bf16-cond", 6: "q8-block",
-                    7: "blk-split", 8: "delta"}.get(c.codec, "?")
+            name = CODEC_NAMES.get(c.codec, f"codec {c.codec}")
             slot = by_codec.setdefault(name, [0, 0, 0])
             slot[0] += 1
             slot[1] += c.rlen
@@ -1292,6 +1346,92 @@ def info(src: str) -> dict:
             "methods": reader.manifest.get("methods") or {},
             "payload_bytes": payload_bytes,
         }
+
+
+@dataclass(frozen=True)
+class ChunkRef:
+    """Where a chunk's payload is, and what it decodes to.
+
+    Enough to fetch the bytes yourself and hand them back to `decode`, and
+    nothing more: the offsets are into the archive file, `rlen` is the
+    plaintext length, and `codec` says which decoders can read it.
+    """
+
+    index: int
+    off: int           # byte offset of the payload in the archive
+    clen: int          # coded length
+    dst: int           # where the plaintext belongs in the output
+    rlen: int          # plaintext length
+    codec: int
+    batch_decodable: bool
+
+
+class ArchiveIndex:
+    """An archive's chunk table and tables, with a decode that does no I/O.
+
+    `decompress` reads and decodes inside one worker, which ties the thread
+    count that sets decode throughput to the number of reads outstanding.
+    Those want opposite things -- an NVMe device reaches its rated rate only
+    with a dozen requests in flight, while past two threads lmz's own
+    interpreter overhead turns into GIL contention. That coupling cannot be
+    tuned from outside; it can only be escaped by decoding a payload the
+    caller fetched. This is that escape.
+
+    It opens the archive to read the chunk table and the manifest, then holds
+    no file: `chunks()` says where every payload is, the caller fetches them
+    however it likes -- one thread, twelve, io_uring, over a network -- and
+    `decode` turns bytes into bytes with no I/O and no threads of its own.
+
+        idx = ArchiveIndex("model.lmz")
+        for c in idx.chunks():
+            payload = my_reader.pread(c.off, c.clen)
+            plain = idx.decode(c, payload)
+
+    Ref and delta chunks are the exception and say so: they are defined as a
+    difference from an earlier output range, so decoding one needs bytes from
+    elsewhere in the archive. `decode` raises `NeedsSource` for those rather
+    than reaching for the file behind the caller's back, and `decompress`
+    remains the thing to use when you want lmz to handle it.
+    """
+
+    class NeedsSource(FormatError):
+        """This chunk is defined against another range; use `decompress`."""
+
+    def __init__(self, path: str):
+        self.path = path
+        with open(path, "rb") as fh:
+            reader = ArchiveReader(fh)
+            self._chunks = reader.chunks.order_by_dst()
+            self.manifest = reader.manifest
+            self.members = reader.members
+            self.tables = TableSet.from_json(reader.manifest.get("tables"))
+            self.original_size = reader.original_size
+
+    def chunks(self) -> list["ChunkRef"]:
+        """Every chunk, in output order, with where to read it from."""
+        return [ChunkRef(i, c.off, c.clen, c.dst, c.rlen, c.codec,
+                         BATCH_DECODABLE.get(c.codec, False))
+                for i, c in enumerate(self._chunks)]
+
+    def decode(self, ref: "ChunkRef", payload, *, verify: bool = True,
+               out=None):
+        """Turn one chunk's coded bytes into its plaintext. No I/O, no threads.
+
+        `payload` is the `clen` bytes at `ref.off`, however the caller got
+        them. `verify` checks the chunk's CRC, which is on by default because
+        a silently wrong weight is worse than a slow one.
+        """
+        chunk = self._chunks[ref.index]
+        if len(payload) != chunk.clen:
+            raise FormatError(
+                f"chunk {ref.index} is {chunk.clen} coded bytes, got {len(payload)}")
+        if chunk.codec in (CODEC_REF, CODEC_DELTA):
+            raise self.NeedsSource(
+                f"chunk {ref.index} is coded against an earlier range; "
+                f"use decompress() or MappedArchive, which can fetch it")
+        return _codec.decode_chunk(payload, chunk.codec, chunk.esize,
+                                   chunk.flags, chunk.rlen, chunk.crc,
+                                   verify, out=out, tables=self.tables)
 
 
 class MappedArchive:

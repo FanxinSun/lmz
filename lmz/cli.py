@@ -172,6 +172,15 @@ def cmd_info(args) -> int:
                 by = (1 - m["contested_coded"] / alt) * 100 if alt else 0
                 print(f"  {'':10s} {m['contested']:7d} of those ran against the "
                       f"other coder and won by {by:.1f}%")
+    # Which decoders can read it, because "will my GPU take this archive" is
+    # otherwise answered by reproducing lmz's encoder thresholds downstream.
+    cap = api.capabilities(args.input)
+    if cap["blockers"]:
+        blocked = ", ".join(f"{n} x{c}" for n, c in sorted(cap["blockers"].items()))
+        print(f"batch       no -- {blocked} "
+              f"({cap['batch_decodable_bytes'] * 100:.0f}% of coded bytes can)")
+    else:
+        print("batch       yes -- every coded chunk can ride the batch decoder")
     print(f"members     {len(data['members'])}")
     for m in data["members"][:args.limit]:
         ntensors = len(m.get("tensors") or {})

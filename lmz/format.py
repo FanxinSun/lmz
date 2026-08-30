@@ -84,6 +84,54 @@ CODEC_DELTA = 8  # payload names an earlier output range plus a coded difference
 CODEC_SPLIT_ST = 9
 CODEC_MIN_VERSION[CODEC_SPLIT_ST] = 7
 
+# Short names for the codec ids, for anything that reports what an archive
+# holds. Here rather than in a caller so that adding a codec updates every
+# report at once -- the previous inline copy silently printed "?" for
+# CODEC_SPLIT_ST from the day it was added.
+CODEC_NAMES = {
+    CODEC_STORED: "stored",
+    CODEC_ZSTD: "entropy",
+    CODEC_SPLIT: "split",
+    CODEC_BF16: "bf16-split",
+    CODEC_REF: "ref",
+    CODEC_BF16C: "bf16-cond",
+    CODEC_BLK: "q8-block",
+    CODEC_GBLK: "blk-split",
+    CODEC_DELTA: "delta",
+    CODEC_SPLIT_ST: "split-shared",
+}
+
+# Which codecs a batch decoder can read, and which only the CPU can.
+#
+# lmz's GPU decoder takes a *batch of equal-length rANS streams* -- that is
+# the shape that fills a device, since one stream is only 8 lanes of work. A
+# codec whose payload is that shape can ride it; one whose payload is a single
+# stream, a pointer, or segments of unequal length cannot, and no amount of
+# effort on the decoder's side changes that. It is a property of the chunk
+# layout, so it is declared here rather than inferred by a consumer from a
+# chunk size or a dtype.
+#
+# The one that matters is CODEC_BF16C: it codes sign+mantissa per exponent
+# bucket, so its segments have unequal lengths by construction. A consumer
+# that wants an archive its GPU can read has to make lmz not emit it, and
+# until this table existed the only way to know that was to reproduce lmz's
+# own encoder threshold.
+#
+# `False` here does not mean slow or unsupported -- every codec decodes
+# correctly on the CPU. It means the batch decoder cannot take this chunk.
+BATCH_DECODABLE = {
+    CODEC_STORED: False,   # not coded at all
+    CODEC_ZSTD: False,     # one stream, whatever coder produced it
+    CODEC_SPLIT: True,     # esize equal-length planes
+    CODEC_BF16: True,      # two equal-length planes
+    CODEC_REF: False,      # a pointer; decoding is a copy from elsewhere
+    CODEC_BF16C: False,    # per-bucket segments, unequal by construction
+    CODEC_BLK: True,       # equal-length stride lanes
+    CODEC_GBLK: False,     # field groups of differing widths
+    CODEC_DELTA: False,    # a source range plus a difference
+    CODEC_SPLIT_ST: True,  # equal-length planes; table comes from the manifest
+}
+
 # Header flags. Both are advisory: the chunk table already addresses every
 # payload by explicit (offset, length), so a reader that ignores these still
 # decodes the archive correctly. They exist so a reader can tell whether

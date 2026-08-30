@@ -315,6 +315,52 @@ What is still true: a caller that walks the whole table repeatedly should
 hoist it into a list, and `verify` and `mount` do, since they were going to
 materialise everything anyway.
 
+## 3b. Decoding a payload the caller fetched, and saying who can read it — **done**
+
+Two interfaces a downstream transport layer was reaching across the boundary
+for, both on the CPU side and both now public.
+
+**`ArchiveIndex` — a decode that does no I/O.** `decompress` reads and decodes
+inside one worker, so the thread count that sets decode throughput also sets
+how many reads are outstanding, and those want opposite things: an NVMe device
+reaches its rated rate only with a dozen requests in flight, while past two
+threads lmz's own interpreter overhead becomes GIL contention. That coupling
+cannot be tuned from outside — only escaped, by decoding a payload the caller
+fetched.
+
+    idx = lmz.ArchiveIndex("model.lmz")
+    for c in idx.chunks():                  # ChunkRef: off, clen, dst, rlen
+        plain = idx.decode(c, my_reader.pread(c.off, c.clen))
+
+It opens the archive once for the chunk table and manifest, then holds no
+file. Ref and delta chunks raise `NeedsSource` rather than reaching for the
+file behind the caller's back — they are *defined* as a difference from an
+earlier output range, so decoding one needs bytes from elsewhere, and
+`decompress` remains the thing that handles that.
+
+**`capabilities()` — the archive declares which decoders can read it.** lmz
+emits `CODEC_BF16C` when a chunk is large enough and the conditioning wins,
+and **the batch decoder cannot read it**: its per-bucket segments have unequal
+lengths by construction, which is not the shape `decode_batch` takes. Nothing
+in the archive said so, so a consumer wanting a GPU-readable archive had to
+reproduce lmz's own encoder threshold and would not notice the day it moved.
+
+    {"batch_decodable": False, "batch_decodable_bytes": 0.0,
+     "blockers": {"bf16-cond": 1}, "min_reader_version": 1,
+     "shared_tables": False, "derived": False}
+
+`derived` is False because this is read from the chunk table rather than
+guessed; a consumer inferring the same answer some other way should report
+True, so a cached inference is never mistaken for a declaration. `lmz info`
+prints it as a `batch` line. The declaration is the general answer rather than
+the invariant "every codec lmz emits is readable by every decoder lmz ships",
+because it survives a third decoder backend, which the invariant does not.
+
+`format.BATCH_DECODABLE` is the table, beside the codec ids so that adding a
+codec means answering the question. A test asserts every codec has an entry —
+without it a new codec would default to unreadable and silently make archives
+look unroutable.
+
 ## 4. Tensor-level addressing
 
 A residency manager asks one question — *where are the blocks for this
