@@ -132,6 +132,20 @@ opt-in block) and a 2.66 GHz sustained clock. It is published as an interval
 because it is one: occupancy hides part of the cost and the amount hidden
 varies with the block size.
 
+**And an interval is only a bracket where the occupancy holds**, which is why
+`cost_model()` publishes the shared-memory layout as numbers rather than
+prose: `shmem_lut_bytes` (16384), `shmem_per_group_bytes` (640) and
+`blocks_per_unit_at_measurement` (3, 4). A caller divides its own device's
+per-unit shared-memory budget by the block request to learn how many blocks
+it can hold, and compares. **Hold at least as many as the measurement did and
+the interval brackets that device; hold fewer and less of the dependent-load
+chain is hidden, so 330 is a floor with no published ceiling.** That is the
+case on a small integrated adapter — 128 KiB per unit gives four resident
+blocks and a two-sided bracket, 64 KiB gives two and the row collapses to a
+floor — and it is exactly the case the interval must not be quoted as a
+bracket for. The three numbers exist so a consumer can decide that
+automatically instead of a reader remembering the caveat.
+
 **It is latency-bound, not throughput-bound**, which is the part that
 travels to other devices. The inner loop is a dependent shared-memory load
 feeding a state update feeding the next load; the cost is a pointer chase,

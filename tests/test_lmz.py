@@ -2990,6 +2990,29 @@ def test_gpu_cost_model_is_publishable():
                 "k_derivation", "status"):
         assert prov.get(key), key
 
+    # The shared-memory layout, as numbers rather than prose. A consumer
+    # divides its own device's budget by these to learn how many blocks it can
+    # hold, and compares that against the occupancy k was measured at: hold at
+    # least as many and the interval brackets the device, hold fewer and it is
+    # only a floor. Prose in provenance cannot be computed with, and a
+    # consumer restating it in its own constants is a copy that drifts.
+    assert cm["shmem_lut_bytes"] == gpu.PROB_SCALE * 4
+    assert cm["shmem_per_group_bytes"] == gpu.GRAIN + gpu.BUFB
+    lo_blocks, hi_blocks = cm["blocks_per_unit_at_measurement"]
+    assert 0 < lo_blocks <= hi_blocks
+
+    # Those constants mirror the kernel, so they are checked against what the
+    # library itself reports rather than trusted. `grain` is the one the C ABI
+    # exposes directly; if it disagrees, the mirror has drifted.
+    assert gpu.GRAIN == gpu.grain()
+    assert gpu.NST == cm["lanes"] == cm["states"]
+
+    # A block's request must be positive and must actually fit somewhere: a
+    # layout needing more than the 48 KiB every CUDA device grants without
+    # opting in would decline on hardware the kernel claims to support.
+    one_group = cm["shmem_lut_bytes"] + cm["shmem_per_group_bytes"]
+    assert 0 < one_group <= 99 * 1024
+
 
 def test_gpu_device_entry_point_owns_nothing():
     """The device path must take the caller's memory and synchronise nothing.

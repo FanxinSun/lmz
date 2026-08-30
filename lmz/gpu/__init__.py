@@ -31,6 +31,17 @@ __all__ = ["available", "backend", "cost_model", "decode_batch",
 # source is ignored rather than called with the wrong argument list.
 ABI_VERSION = 1
 
+# The shared-table kernel's shared-memory layout, mirroring lmzgpu.cu. A block
+# asks for one LUT plus a slice per 8-lane group, and how many blocks a device
+# can hold is what decides whether the published k interval brackets that
+# device or only floors it. The values are checked against the kernel's own
+# reported constants in the test suite, so this cannot drift silently.
+PROB_SCALE = 1 << 12       # 4096 probability slots, one 32-bit LUT entry each
+NST = 8                    # lanes in a group; the format's interleave
+STAGE_ITERS = 16
+GRAIN = NST * STAGE_ITERS  # 128 bytes a group retires per outer step
+BUFB = 512                 # the cp.async ring, four 128-byte slots
+
 OK = 0
 ENODEV = -1
 EUNSUPPORTED = -2
@@ -315,6 +326,23 @@ def cost_model() -> dict:
             "compute_below_threads": 192,
             "saturates_at_fraction_of_peak_dram": 0.59,
         },
+        # What a block of the shared-table kernel asks for, so a caller can
+        # work out how many fit in its own device's budget. Both come from
+        # the kernel's own constants rather than being restated here.
+        "shmem_lut_bytes": PROB_SCALE * 4,
+        "shmem_per_group_bytes": GRAIN + BUFB,
+        # Resident blocks per unit across the rows k was taken from -- a
+        # range, because it is one: the low end of k came from a row holding
+        # 4 blocks and the high end from a row holding 3.
+        #
+        # This is the field that says whether k is a bracket or a floor. A
+        # device that holds at least the low end hides at least as much of
+        # the dependent-load chain as the measurement did, so the interval
+        # brackets it. A device that holds fewer hides less, and k should be
+        # read as a floor with no upper bound published -- which is the case
+        # on a small integrated adapter, and exactly the case the interval
+        # must not be quoted as a bracket for.
+        "blocks_per_unit_at_measurement": (3, 4),
         "provenance": {
             "kernel": "lmzgpu.cu k_shared, shared frequency table",
             "device": "NVIDIA GeForce RTX 5080, sm_120, 84 SMs, "
