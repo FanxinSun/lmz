@@ -12,6 +12,15 @@
  * that, including why fusing is worth least on the small devices it was
  * proposed for.
  *
+ * ONE TERM THIS DOES NOT MEASURE, and it matters on the devices the question
+ * is aimed at. Here the merge has VRAM to itself, so its cost is device
+ * bandwidth. On a unified-memory part the round trip shares one bus with the
+ * host and with whatever is fetching the next chunk, so it costs more than
+ * this benchmark or the model in 3c will tell you -- a downstream consumer's
+ * plan was 29% wrong on exactly this, treating overlapped stages as free while
+ * they contended for one bus. Re-running this on an integrated GPU measures
+ * the uncontended floor, not what a real pipeline pays.
+ *
  *   nvcc -O3 -arch=native -o mergebench mergebench.cu && ./mergebench
  */
 #include <cstdio>

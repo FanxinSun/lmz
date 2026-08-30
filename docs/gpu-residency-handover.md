@@ -367,7 +367,20 @@ The GPU decoder returns byte planes plane-major; the plaintext is the
 transpose. A downstream consumer holds that transpose as a loaned kernel and
 asked lmz to take it back, either as a second launch or fused into the decode.
 lmz's own CPU path already merges inside itself, so the asymmetry is real
-whichever way this lands. What follows is the measurement that decides *how*.
+whichever way this lands.
+
+**The design cost decides it, and it holds without any measurement.** A fused
+kernel must transpose in shared memory, which needs all `esize` planes of a
+chunk resident in one block. Today `gid` is a flat stream index, so that holds
+only where the group count divides the plane count — and at `tpb` 96 and 160
+it does not for 8-byte elements, while `pick_tpb` can choose 160. Fusing
+therefore takes back the block-size freedom `d989c49` won, on the class of
+device that needs it most. That argument would stand even if every number
+below came out the other way.
+
+The measurement is what makes it *safe* to stop rather than merely defensible,
+and it is recorded because whoever re-asks this will re-run `mergebench.cu`
+and find the throughput, not the divisibility.
 
 **The merge is already free as a kernel.** On this card, 936 MB of 4-byte
 elements:
@@ -407,13 +420,22 @@ registers. The model is worth the weight given: it predicts 1.67–2.40 ms on
 the card where 2.29 was measured. The iGPU rows are projections and no such
 device is reachable from here.
 
-**The design cost, for whoever builds it.** A fused kernel must transpose in
-shared memory, which needs all `esize` planes of a chunk resident in one
-block — and today `gid` is a flat stream index, so that holds only when the
-group count divides the plane count. At `tpb` 96 and 160 it does not for
-8-byte elements, and `pick_tpb` can choose 160. So a fused kernel either
-constrains the block size, taking back the residency freedom `d989c49` just
-won, or carries a fallback for the cases that straddle.
+**One term in that model is optimistic on exactly the smallest row, and it is
+the row the verdict rests on.** The merge cost above is drawn from device
+bandwidth, which on a discrete card is right — VRAM traffic nothing else
+contends for. On a **unified-memory part it is not private**: the round trip
+shares one bus with the host, and specifically with the fetch stage feeding
+the decoder. That is not hypothetical. A downstream consumer's plan was 29%
+wrong on precisely this, its `max()` over overlapped stages treating them as
+free while a CPU decode and the DMA engine shared a bus. So 37.5 ms on the
+2-CU row is a **floor**, and under contention the merge costs more than the
+model says — which pushes *toward* fusing on the device where this table says
+fusing is worth least.
+
+It does not flip the verdict: 1.14–1.20× before contention is not worth
+`pick_tpb`'s freedom, and the contention would have to be severe to close that
+gap. But anyone re-asking this question on a unified-memory device needs the
+term, or they will re-derive the table and inherit the same optimism.
 
 **Verdict: not built, and the second launch is the right shape for now.** The
 merge is free, the round trip is the only prize, that prize is smallest on the

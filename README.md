@@ -93,10 +93,13 @@ a phone changes both numbers. What travels is the comparison, not the 3.9×.
 
 The 418 GB/s is a bandwidth ceiling rather than a compute one — 59% of this
 card's ~960 GB/s peak, because decoding moves 1.347 bytes of DRAM traffic per
-decoded byte: the plaintext out plus the coded bytes in. The fused whole-BF16
-kernel in `scratchpad/gpu/` measures the end-to-end consequence: cold disk to
-VRAM, plain safetensors 0.373 s against lmz's 0.256 — **1.46× faster**,
-converting 98% of the ratio into load speed.
+decoded byte: the plaintext out plus the coded bytes in.
+
+What that is worth end to end was measured with a research kernel in
+`scratchpad/gpu/`, not the shipped one: cold disk to VRAM, plain safetensors
+0.373 s against lmz's 0.256 — **1.46× faster**, converting 98% of the ratio
+into load speed. That is the prize for a caller that wires the pieces together,
+which is a different thing from what `pip install lmzip` does for you today.
 
 ```python
 from lmz import gpu
