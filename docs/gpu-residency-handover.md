@@ -345,7 +345,7 @@ lengths by construction, which is not the shape `decode_batch` takes. Nothing
 in the archive said so, so a consumer wanting a GPU-readable archive had to
 reproduce lmz's own encoder threshold and would not notice the day it moved.
 
-    {"batch_decodable": False, "batch_decodable_bytes": 0.0,
+    {"batch_decodable": False, "batch_decodable_fraction": 0.0,
      "blockers": {"bf16-cond": 1}, "min_reader_version": 1,
      "shared_tables": False, "derived": False}
 

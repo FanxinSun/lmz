@@ -1276,7 +1276,7 @@ def capabilities(src: str) -> dict:
     Returns::
 
         {"batch_decodable": bool,        # every coded chunk can ride the batch
-         "batch_decodable_bytes": float, # share of plaintext that can, 0..1
+         "batch_decodable_fraction": float, # share of it that can, 0..1
          "blocker_bytes": int,           # plaintext behind those chunks
          "blockers": {name: chunks},     # codecs standing in the way
          "min_reader_version": int,
@@ -1291,18 +1291,22 @@ def capabilities(src: str) -> dict:
 
     A chunk that is not coded at all (stored, or a ref to bytes elsewhere) is
     not a blocker: there is nothing for a decoder to do, and a route that
-    handles the coded chunks handles the archive. `batch_decodable_bytes`
+    handles the coded chunks handles the archive. `batch_decodable_fraction`
     counts only what is coded, so an archive of entirely stored chunks reports
-    True with a share of 1.0.
+    True with a share of 1.0. It is a fraction and not a byte count -- the
+    name says so because it sits beside `blocker_bytes`, which is bytes, and a
+    router misreading one for the other would send the wrong work to a
+    device.
 
     **Read the bytes, not only the boolean.** `batch_decodable` is True only
     when *every* coded chunk can ride the batch decoder, and a single small
     chunk makes it False -- a safetensors JSON header is one general-purpose
     stream and is enough on its own. On a real 1.87 GB checkpoint that is
     12 KB against 1873 MB: the boolean says no, and 99.999% of the output is
-    still batch-decodable. `blocker_bytes` and `batch_decodable_bytes` are
-    there so a caller can tell "one header" from "224 weight chunks" and route
-    the bulk on the device either way.
+    still batch-decodable. `blocker_bytes` (a count) and
+    `batch_decodable_fraction` (a share) are there so a caller can tell "one
+    header" from "224 weight chunks" and route the bulk on the device either
+    way.
     """
     with open(src, "rb") as fh:
         reader = ArchiveReader(fh)
@@ -1320,7 +1324,7 @@ def capabilities(src: str) -> dict:
                 blockers[name] = blockers.get(name, 0) + 1
         return {
             "batch_decodable": not blockers,
-            "batch_decodable_bytes": (ok / coded) if coded else 1.0,
+            "batch_decodable_fraction": (ok / coded) if coded else 1.0,
             "blocker_bytes": blocked,
             "blockers": blockers,
             "min_reader_version": max(

@@ -54,7 +54,7 @@
   repository and does not suit shipping one model to one user. It also needs
   matching tensor names, dtype and size: a fine-tune that switches from BF16
   to F16 has no byte-level relationship to its base at all, and gets nothing.
-- **The GPU decoder ships, but nothing routes to it yet.** `lmz.gpu` is in
+- **The GPU decoder is a component, not a faster `lmz decompress`.** `lmz.gpu` is in
   the package and builds itself with `nvcc` on first use, the same bargain
   `lmz.native` makes with a C compiler: the wheel carries a `.cu` and no
   CUDA, installing needs no toolkit, and a machine with neither nvcc nor a
@@ -66,7 +66,11 @@
   hardware this project has never run on. What it does not give you is a faster
   `lmz decompress`: nothing in the archive path calls it, because the useful
   thing to do with a GPU decode is leave the result in VRAM, and deciding
-  when to do that belongs to the layer above. Two further limits are real.
+  when to do that belongs to the caller. That is a division rather than a gap
+  -- `capabilities()`, `ArchiveIndex`, `decode_batch_dev` and `cost_model()`
+  are what a caller needs to make the decision -- but it does mean installing
+  lmz on a machine with a GPU makes nothing you already run faster. Two
+  further limits are real.
   **One stream is 8 lanes of work**, so a GPU is filled by many streams at
   once and never by one, however large — that is the format's 8-state
   interleave, not the kernel's. And **an archive written today codes a

@@ -178,7 +178,7 @@ def cmd_info(args) -> int:
     if cap["blockers"]:
         blocked = ", ".join(f"{n} x{c}" for n, c in sorted(cap["blockers"].items()))
         print(f"batch       no -- {blocked} "
-              f"({cap['batch_decodable_bytes'] * 100:.0f}% of coded bytes can)")
+              f"({cap['batch_decodable_fraction'] * 100:.0f}% of coded bytes can)")
     else:
         print("batch       yes -- every coded chunk can ride the batch decoder")
     print(f"members     {len(data['members'])}")

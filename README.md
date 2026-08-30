@@ -14,8 +14,9 @@ on one 8B model**.
 
 Nothing is approximated. Every byte comes back.
 
-And the decoder now runs on the GPU — **111 GB/s** from an ordinary archive
-against a 28.8 GB/s PCIe link, shipped in the wheel. [Jump to it](#on-a-gpu).
+And the decoder now runs on the GPU — **111 GB/s** on an RTX 5080 from an
+ordinary archive, against a 28.8 GB/s PCIe link, shipped in the wheel.
+[Jump to it](#on-a-gpu).
 
 ```
 pip install lmzip
@@ -73,8 +74,14 @@ archive is a third smaller, so a storage-bound load moves a third fewer bytes.
 
 `pip install lmzip` ships a CUDA decoder. On an RTX 5080 it decodes lmz's own
 rANS at **111 GB/s** out of an archive written today, and **418 GB/s** when
-the frequency table is shared across chunks — both verified byte-identical to
-the CPU decoder over 936 MB of real BF16 planes.
+one frequency table is handed to the batch API for the whole batch — both
+verified byte-identical to the CPU decoder over 936 MB of real BF16 planes.
+
+That second number is what the kernel can do, not what an archive gives you
+today: it is reached by passing a shared table to `decode_batch`, and the
+kernel does not yet read the shared-table archives `--shared-tables` writes.
+**111 GB/s is the number to plan around**; the 418 is the headroom that
+connecting the two would recover.
 
 **The ratio to the link is the point, and it is a ratio you can recompute.**
 On this machine PCIe Gen4 x16 delivers 28.8 GB/s, so a decoder running at 111
@@ -118,7 +125,7 @@ say so.
 ```python
 lmz.capabilities("model.lmz")
 # {'batch_decodable': False, 'blockers': {'bf16-cond': 224, 'entropy': 1},
-#  'blocker_bytes': 1872871856, 'batch_decodable_bytes': 0.0, ...}
+#  'blocker_bytes': 1872871856, 'batch_decodable_fraction': 0.0, ...}
 ```
 
 `lmz info` prints the same thing as a `batch` line. If it says no and you
@@ -131,8 +138,11 @@ under the conditioning threshold, so that codec is never chosen. Measured on a
 Read the bytes and not only the boolean. That last 12 KB chunk is the
 safetensors JSON header — one general-purpose stream, enough on its own to
 make `batch_decodable` False while 99.999% of the output is still
-batch-decodable. `blocker_bytes` is there so you can tell one header from two
-hundred weight chunks and route the bulk on the device either way.
+batch-decodable. `blocker_bytes` (a count) and `batch_decodable_fraction` (a
+share of 0..1) are there so you can tell one header from two hundred weight
+chunks, and route the bulk on the device either way. The boolean stays strict
+on purpose: it means *every* chunk, because one that meant "mostly" would be
+worse than none.
 
 **Decode bytes you already have.** `ArchiveIndex` exists because of a coupling
 worth naming, since it is not specific to lmz: `decompress` reads and decodes

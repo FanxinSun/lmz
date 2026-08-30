@@ -2623,7 +2623,7 @@ def test_capabilities_are_declared_not_inferred():
         lmz.compress(path, whole)
         cap = lmz.capabilities(whole)
         assert cap["derived"] is False
-        assert 0.0 <= cap["batch_decodable_bytes"] <= 1.0
+        assert 0.0 <= cap["batch_decodable_fraction"] <= 1.0
         # The case the item exists for: lmz emitted a codec its own batch
         # decoder cannot read, and the archive now says so.
         assert cap["blockers"] == {"bf16-cond": 1}, cap["blockers"]
@@ -2636,7 +2636,7 @@ def test_capabilities_are_declared_not_inferred():
         cap2 = lmz.capabilities(blocks)
         assert cap2["batch_decodable"] is True, cap2["blockers"]
         assert not cap2["blockers"]
-        assert cap2["batch_decodable_bytes"] == 1.0
+        assert cap2["batch_decodable_fraction"] == 1.0
 
         # Shared tables raise the reader version and stay batch-decodable.
         shared = os.path.join(d, "shared.lmz")
