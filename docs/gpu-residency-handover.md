@@ -408,9 +408,10 @@ wrong weight. Keep them, keep them cheap, and keep them on by default.
 
 **The 8-state interleave.** It is what let 8 lanes replace 8 chains. See above.
 
-## Two traps, carried forward
+## Three traps, carried forward
 
-Both are from `vectorising-the-coder.md` and both apply here unchanged.
+The first two are from `vectorising-the-coder.md` and apply here unchanged;
+the third was found in this kernel.
 
 **Do not benchmark one stream twice.** The two-chunk test in `coderbench`
 originally decoded the same stream into two buffers and reported a clean 2×
@@ -423,6 +424,27 @@ two of the ablations in `scratchpad/gpu/README.md` contradicted a confident
 guess outright — coalescing the refill loads gained *exactly nothing*,
 because the cost was latency on the dependency chain and not transaction
 count.
+
+**A tuning knob measured only where it does not bind will be tuned wrong.**
+`pick_tpb` chose the widest block that fits, which is the wrong quantity for a
+latency-bound kernel -- what covers a dependent load is lanes resident on a
+unit, so a block twice as wide that therefore fits only once is a loss. It
+also read only the per-block cap and never the per-unit pool
+(`sharedMemPerMultiprocessor`, 100 KiB here against the 99 KiB a block may
+opt into), so it could not have reasoned about residency even in principle.
+
+The reason it survived a full occupancy sweep is the trap: **this card
+saturates on bandwidth at 192 threads**, so residency past that buys nothing
+here and no measurement taken on it could see the defect. It bites only where
+the kernel is compute-bound, which is every small device the "decode where it
+lands" argument is aimed at and none of the ones it was measured on. It was
+caught by a downstream consumer's arithmetic about a 2-CU adapter nobody in
+this project owns.
+
+The rule that follows: when a knob's optimum is reached on the development
+box, that is evidence the box cannot distinguish the choices -- not evidence
+the choice is right. Reason about what the knob *means* on a device where the
+binding resource is different.
 
 ## How to measure
 
