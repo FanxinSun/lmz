@@ -3121,6 +3121,15 @@ def test_gpu_cost_model_is_publishable():
     # reverse. That difference is the occupancy story, so it has to survive.
     assert per["shmem_lut_bytes"] == 0
     assert per["shmem_per_group_bytes"] > gpu.cost_model()["shmem_per_group_bytes"]
+    # Both must say whether their interval is a bracket or a point estimate.
+    # The two fields are named the same and mean different things -- the
+    # shared kernel's spans two occupancies, the per-chunk kernel's is
+    # run-to-run spread on the one launch pick_tpb allows -- and a consumer
+    # that cannot tell them apart will read noise as a range a device might
+    # land anywhere inside.
+    assert gpu.cost_model()["k_is_single_point_fit"] is False
+    assert per["k_is_single_point_fit"] is True
+
     # Same algorithm, so the two intervals must overlap. If they ever stop
     # overlapping, one of them was measured wrong.
     a_lo, a_hi = gpu.cost_model()["k_cycles_per_byte"]

@@ -383,9 +383,29 @@ tuning this kernel by block size is tuning nothing.
 **So the 3.8× gap is mostly occupancy, not the second dependent load.** §1
 attributes it to the narrow table's extra shared load on the critical path.
 That is real but secondary: the two `k` intervals overlap (230–330 against
-257–283), which says the two kernels cost about the same per byte. What
+257–291), which says the two kernels cost about the same per byte. What
 differs is that one keeps up to 6× more lanes resident. The fix for the gap is
 therefore a smaller per-group table, not a cheaper inner loop.
+
+**And that conclusion arrives twice, from opposite ends.** A downstream
+consumer, working out whether the published `k` brackets a 2-CU adapter, found
+that the shared kernel's *fixed* 16 KiB LUT is half of a 32 KiB budget and
+caps residency at one block there — two blocks would need 2 × 16384 with
+nothing left for groups, so it is a wall rather than a tuning problem. That
+analysis was about a device nobody here owns, for an unrelated purpose, and it
+lands on the same instruction as this one: **shrink the per-group and fixed
+shared-memory footprint.** Two independent routes to one answer is the closest
+thing this project has to an unforced verification, and it names the next
+kernel change without needing hardware neither party has.
+
+**One caution about the interval above, because the two are not the same kind
+of number.** The shared kernel's 230–330 brackets two occupancies — the low
+end from a 4-block row, the high from a 3-block row — so a device inside that
+range lands inside the interval. The per-chunk 257–291 cannot mean that: the
+sweep collapses to one launch, so there is one configuration and the width is
+run-to-run spread across twelve runs (98.2–111.2 GB/s). `cost_model()` carries
+`k_is_single_point_fit` for exactly this, because the field name is the same
+and the claim is weaker.
 
 **A measurement trap found while doing this, and it invalidated a published
 row.** The per-chunk sweep reported 84 GB/s at 96 threads against 110 either
@@ -572,6 +592,37 @@ reason to relayout anything to be more sequential.
 wrong weight. Keep them, keep them cheap, and keep them on by default.
 
 **The 8-state interleave.** It is what let 8 lanes replace 8 chains. See above.
+
+## Before you measure anything
+
+Every defect this project found in one day came from the measurement setup
+rather than the code, and they are one family: **a number is only as good as
+the variable it is attributed to.** Read these before running a sweep, not
+after publishing one.
+
+1. **Tune where the knob binds.** An optimum reached on the development box is
+   evidence the box cannot tell the choices apart, not evidence the choice is
+   right. `pick_tpb` maximised block width for a latency-bound kernel and
+   survived a full occupancy sweep, because this card saturates on bandwidth
+   at 192 threads and no measurement taken on it could see the difference.
+2. **Reproduce, then reorder.** A number reproducible twice can still be an
+   artifact of sweep order. The per-chunk sweep reported 84 GB/s at one block
+   size across two runs; every row launches identically, and running the same
+   value seven times shows no 84 anywhere. Reversing a sweep is cheap and
+   should not wait until something looks wrong — the shared-table sweep was
+   re-run in reverse for exactly that reason and held.
+3. **A sweep that collapses to a point cannot bracket an interval.** The
+   per-chunk sweep produced one launch, so its `k` interval is run-to-run
+   spread rather than a range over occupancy. Published as such
+   (`k_is_single_point_fit`), because the field name is identical to the
+   shared kernel's and the claim is not.
+4. **Assert what the machine has, not what yours has.** A test that asserts
+   this box's answer is testing the box; the environments that disagree are
+   the ones you cannot see. `LMZ_NO_GPU=1` before pushing, and the same rule
+   in `tests/test_lmz.py`'s docstring.
+5. **Fix the byte traffic across a sweep.** Every row of the occupancy sweeps
+   decodes the identical archive; anything that moves is therefore the
+   variable under test and not the workload.
 
 ## Three traps, carried forward
 

@@ -303,7 +303,12 @@ def _cost_model_per_chunk() -> dict:
         "grain": grain(),
         "bytes_per_symbol": 1,
         "kernel": "per_chunk",
-        "k_cycles_per_byte": (257, 283),
+        # 257-291, and it is a SINGLE-POINT FIT, not a bracket. There is only
+        # one launch to measure -- see `k_derivation` -- so this width is
+        # run-to-run spread on one configuration, where the shared kernel's
+        # interval brackets 3 and 4 resident blocks. Same field, weaker claim.
+        "k_cycles_per_byte": (257, 291),
+        "k_is_single_point_fit": True,
         "expansion": 2.79,
         "bound": {
             # There is no crossover to report: every block size the caller can
@@ -331,7 +336,14 @@ def _cost_model_per_chunk() -> dict:
                             "chooses (32 threads, 4 blocks a unit). It "
                             "overlaps the shared kernel's 230-330, which is "
                             "the expected result -- same algorithm, same cost "
-                            "a byte, different residency.",
+                            "a byte, different residency. THE WIDTH MEANS "
+                            "SOMETHING DIFFERENT THOUGH: the shared kernel's "
+                            "interval brackets two occupancies, this one is "
+                            "run-to-run spread over 12 runs of one launch "
+                            "(98.2-111.2 GB/s). A sweep that collapses to a "
+                            "point cannot bracket an interval, so treat this "
+                            "as a point estimate with noise, not a range a "
+                            "device might land anywhere inside.",
             "status": "one device, and one launch on it. The interval is "
                       "narrower than the shared kernel's because there was no "
                       "occupancy to vary, not because it is better known.",
@@ -394,6 +406,12 @@ def cost_model(kernel: str = "shared") -> dict:
         "bytes_per_symbol": 1,
         "kernel": "shared",
         "k_cycles_per_byte": (230, 330),
+        # A real bracket: the low end came from a row holding 4 resident
+        # blocks and the high end from one holding 3, so a device inside that
+        # occupancy range lands inside the interval. Contrast the per-chunk
+        # kernel, where the sweep collapses to one launch and the same field
+        # is a point estimate with noise around it.
+        "k_is_single_point_fit": False,
         "expansion": 2.88,
         "bound": {
             "compute_below_threads": 192,
