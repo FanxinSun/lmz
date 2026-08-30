@@ -383,15 +383,55 @@ LMZ_GPU_API int lmz_gpu_validate(const void *streams_v, const void *off_v, unsig
     return LMZ_GPU_OK;
 }
 
-/* Largest thread count whose shared-memory footprint the device will grant,
- * walking down from `want` in whole warps. */
-static int pick_tpb(size_t per_group, size_t fixed, int want, size_t optin, size_t *shm_out)
+/*
+ * Block size to launch with: the one that keeps the most lanes resident on a
+ * unit, not merely the widest that fits.
+ *
+ * Those are the same choice on a card with room to spare and different on one
+ * without. This kernel is latency-bound -- a dependent shared-memory load
+ * feeds a state update that feeds the next load -- so what hides the chain is
+ * lanes resident per unit, and a block twice as wide that therefore fits only
+ * once is a loss. Taking the widest block that fits is the natural rule and it
+ * is wrong exactly where the kernel is compute-bound, which is small devices:
+ * with a 64 KiB pool the shared-table layout at 384 threads occupies 46 KiB
+ * and lands one block, 384 lanes, while 192 threads occupies 31 KiB and lands
+ * two, also 384 lanes but with twice as much of the latency covered.
+ *
+ * `pool` is the per-unit shared memory a device will hand out, and `cap` the
+ * most any single block may have. They differ -- on Blackwell the pool is
+ * 100 KiB and a block may opt into 99 -- and using the cap for both is what
+ * hid this. A device that reports no pool falls back to the cap, which
+ * restores the old behaviour rather than guessing.
+ *
+ * Ties on resident lanes go to *more blocks*, not the wider one. At 64 KiB
+ * both 384-in-one and 192-in-two put 384 lanes on the unit, and they are not
+ * equivalent: two blocks give the scheduler two independent instruction
+ * streams to interleave, and interleaving is the only thing that covers a
+ * dependent load. One wide block has more warps but they are all waiting on
+ * the same barrier structure.
+ */
+static int pick_tpb(size_t per_group, size_t fixed, int want, size_t cap,
+                    size_t pool, size_t *shm_out)
 {
+    if (pool < cap) pool = cap;
+    int best_tpb = 0;
+    size_t best_shm = 0, best_lanes = 0, best_blocks = 0;
     for (int tpb = want; tpb >= 32; tpb -= 32) {
         size_t shm = fixed + (size_t)(tpb / NST) * per_group;
-        if (shm <= optin) { *shm_out = shm; return tpb; }
+        if (shm > cap) continue;
+        size_t blocks = pool / shm;
+        if (!blocks) continue;
+        size_t lanes = blocks * (size_t)tpb;
+        if (lanes > best_lanes || (lanes == best_lanes && blocks > best_blocks)) {
+            best_lanes = lanes;
+            best_blocks = blocks;
+            best_tpb = tpb;
+            best_shm = shm;
+        }
     }
-    return 0;
+    if (!best_tpb) return 0;
+    *shm_out = best_shm;
+    return best_tpb;
 }
 
 /*
@@ -425,6 +465,10 @@ LMZ_GPU_API int lmz_gpu_decode_batch_dev(const void *d_hdr, const void *d_stream
     CK("cudaGetDeviceProperties", cudaGetDeviceProperties(&prop, 0));
     size_t optin = (size_t)prop.sharedMemPerBlockOptin;
     if (optin == 0) optin = (size_t)prop.sharedMemPerBlock;
+    /* The per-unit pool, which is what decides how many blocks are resident.
+     * It is not the per-block cap: on Blackwell the pool is 100 KiB and a
+     * single block may opt into 99. */
+    size_t pool = (size_t)prop.sharedMemPerMultiprocessor;
 
     cudaStream_t cs = (cudaStream_t)cuda_stream;
     size_t shm = 0;
@@ -435,7 +479,7 @@ LMZ_GPU_API int lmz_gpu_decode_batch_dev(const void *d_hdr, const void *d_stream
          * at 256 and 325 at 128. pick_tpb walks down from here in whole warps
          * until the shared-memory request is one the device will grant. */
         threads = pick_tpb(GRAIN + BUFB, (size_t)PROB_SCALE * 4,
-                           tpb ? (int)tpb : 384, optin, &shm);
+                           tpb ? (int)tpb : 384, optin, pool, &shm);
         if (!threads)
             return fail_msg(LMZ_GPU_EUNSUPPORTED, "shared table needs more shared memory than the device grants");
         CK("cudaFuncSetAttribute(k_shared)",
@@ -450,7 +494,7 @@ LMZ_GPU_API int lmz_gpu_decode_batch_dev(const void *d_hdr, const void *d_stream
          * 99 KiB a block may opt into, and it measured 110 GB/s against
          * 111 at 64 -- flat, so take the wider block. */
         threads = pick_tpb((size_t)PROB_SCALE + 256 * 4 + GRAIN + BUFB, 0,
-                           tpb ? (int)tpb : 128, optin, &shm);
+                           tpb ? (int)tpb : 128, optin, pool, &shm);
         if (!threads)
             return fail_msg(LMZ_GPU_EUNSUPPORTED, "per-chunk tables need more shared memory than the device grants");
         CK("cudaFuncSetAttribute(k_perstream)",
