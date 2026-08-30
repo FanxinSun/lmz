@@ -330,7 +330,13 @@ def _cost_model_per_chunk() -> dict:
             "cap = max shared memory for one block (CUDA "
             "sharedMemPerBlockOptin), pool = shared memory per compute unit "
             "(CUDA sharedMemPerMultiprocessor). They agree on discrete NVIDIA "
-            "parts and diverge on integrated ones, which is where it matters."
+            "parts and diverge on integrated ones, which is where it matters. "
+            "NOT EVERY API REPORTS BOTH: Vulkan's "
+            "maxComputeSharedMemorySize is a per-workgroup cap and core "
+            "Vulkan exposes no pool figure at all, so on a Vulkan-only device "
+            "the formula cannot be fully evaluated. Substituting the cap for "
+            "the pool is the most pessimistic reading, not a neutral one -- "
+            "it assumes one resident block. Say which you used."
         ),
         "provenance": {
             "kernel": "lmzgpu.cu k_perstream, a frequency table per chunk",
@@ -484,7 +490,13 @@ def cost_model(kernel: str = "shared") -> dict:
             "cap = max shared memory for one block (CUDA "
             "sharedMemPerBlockOptin), pool = shared memory per compute unit "
             "(CUDA sharedMemPerMultiprocessor). They agree on discrete NVIDIA "
-            "parts and diverge on integrated ones, which is where it matters."
+            "parts and diverge on integrated ones, which is where it matters. "
+            "NOT EVERY API REPORTS BOTH: Vulkan's "
+            "maxComputeSharedMemorySize is a per-workgroup cap and core "
+            "Vulkan exposes no pool figure at all, so on a Vulkan-only device "
+            "the formula cannot be fully evaluated. Substituting the cap for "
+            "the pool is the most pessimistic reading, not a neutral one -- "
+            "it assumes one resident block. Say which you used."
         ),
         "provenance": {
             "kernel": "lmzgpu.cu k_shared, shared frequency table",
