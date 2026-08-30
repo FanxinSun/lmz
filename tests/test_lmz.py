@@ -3185,6 +3185,24 @@ def test_gpu_cost_model_is_publishable():
     lo_blocks, hi_blocks = cm["blocks_per_unit_at_measurement"]
     assert 0 < lo_blocks <= hi_blocks
 
+    # The residency formula must be published, and must reproduce the
+    # residency figures published beside it. A consumer cannot infer the
+    # divisor from the three shared-memory fields -- dividing by a per-unit
+    # pool where the kernel used a per-block cap over-predicts, and the error
+    # hides on a card that is bandwidth-bound anyway and surfaces on the small
+    # devices the projections are about.
+    for kern in ("shared", "per_chunk"):
+        m = gpu.cost_model(kern)
+        assert "pool" in m["residency_formula"] and "cap" in m["residency_formula"]
+        cap, pool = 101376, 102400          # the device the figures were taken on
+        lo, hi = m["blocks_per_unit_at_measurement"]
+        blocks = set()
+        for threads in (32, 64, 96, 128, 160, 192, 384):
+            shm = m["shmem_lut_bytes"] + (threads // m["lanes"]) * m["shmem_per_group_bytes"]
+            if shm <= cap and pool // shm:
+                blocks.add(pool // shm)
+        assert lo in blocks and hi in blocks, (kern, lo, hi, sorted(blocks))
+
     # Those constants mirror the kernel, so they are checked against what the
     # library itself reports rather than trusted. `grain` is the one the C ABI
     # exposes directly; if it disagrees, the mirror has drifted.

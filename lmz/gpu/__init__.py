@@ -319,6 +319,19 @@ def _cost_model_per_chunk() -> dict:
         "shmem_lut_bytes": 0,
         "shmem_per_group_bytes": PROB_SCALE + 256 * 4 + GRAIN + BUFB,
         "blocks_per_unit_at_measurement": (4, 4),
+        # Same formula as the shared kernel; see cost_model() for why both the
+        # per-block cap and the per-unit pool are needed rather than either
+        # alone. Here the fixed term is zero, so shm is entirely per-group --
+        # which is why this kernel cannot exceed 128 threads a block inside a
+        # 99 KiB cap and lands on 32 whatever the caller asks for.
+        "residency_formula": (
+            "blocks = floor(pool / shm) if shm <= cap else 0, where "
+            "shm = shmem_lut_bytes + (threads / lanes) * shmem_per_group_bytes, "
+            "cap = max shared memory for one block (CUDA "
+            "sharedMemPerBlockOptin), pool = shared memory per compute unit "
+            "(CUDA sharedMemPerMultiprocessor). They agree on discrete NVIDIA "
+            "parts and diverge on integrated ones, which is where it matters."
+        ),
         "provenance": {
             "kernel": "lmzgpu.cu k_perstream, a frequency table per chunk",
             "device": "NVIDIA GeForce RTX 5080, sm_120, 84 SMs, "
@@ -441,6 +454,38 @@ def cost_model(kernel: str = "shared") -> dict:
         # on a small integrated adapter, and exactly the case the interval
         # must not be quoted as a bracket for.
         "blocks_per_unit_at_measurement": (3, 4),
+        # HOW TO USE THE THREE FIELDS ABOVE, because the divisor is not
+        # inferable from them and a consumer that guesses it wrong finds out
+        # only on a device where it matters.
+        #
+        #     shm    = shmem_lut_bytes + (threads / lanes) * shmem_per_group_bytes
+        #     blocks = shm <= cap ? floor(pool / shm) : 0
+        #
+        # where `cap` is the most shared memory ONE BLOCK may have -- opting in
+        # if the API requires it, CUDA's sharedMemPerBlockOptin -- and `pool`
+        # is what a compute unit hands out in total, CUDA's
+        # sharedMemPerMultiprocessor. Both are needed: the cap decides whether
+        # a block size is legal at all, the pool decides how many fit.
+        #
+        # On every discrete NVIDIA part they are within a kilobyte of each
+        # other (this card: 101376 and 102400) and either answers. They
+        # diverge exactly where the answer matters -- an integrated adapter
+        # capping a block at 32 KiB out of a 64 KiB pool holds 1 block by the
+        # cap and 3 by the pool -- so the formula uses both rather than
+        # whichever is to hand.
+        #
+        # The figures published here were taken that way. A caller that
+        # reproduces them and does not get 4 blocks at 64 threads and 2 at 384
+        # on an RTX 5080 is using a different divisor, and the projection it
+        # builds will be wrong in proportion.
+        "residency_formula": (
+            "blocks = floor(pool / shm) if shm <= cap else 0, where "
+            "shm = shmem_lut_bytes + (threads / lanes) * shmem_per_group_bytes, "
+            "cap = max shared memory for one block (CUDA "
+            "sharedMemPerBlockOptin), pool = shared memory per compute unit "
+            "(CUDA sharedMemPerMultiprocessor). They agree on discrete NVIDIA "
+            "parts and diverge on integrated ones, which is where it matters."
+        ),
         "provenance": {
             "kernel": "lmzgpu.cu k_shared, shared frequency table",
             "device": "NVIDIA GeForce RTX 5080, sm_120, 84 SMs, "
