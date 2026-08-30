@@ -3164,8 +3164,15 @@ def test_gpu_cost_model_is_publishable():
     # A number without its conditions is not a measurement.
     prov = cm["provenance"]
     for key in ("kernel", "device", "machine", "archive", "method",
-                "k_derivation", "status"):
+                "k_derivation", "scaling", "status"):
         assert prov.get(key), key
+
+    # A published constant that moves has to say why, or a consumer cannot
+    # tell a refinement from a contradiction and will either re-derive the
+    # reasoning or carry its own guess. `supersedes` is that statement, and it
+    # names the old value so the connection is findable.
+    assert "230" in prov["supersedes"], prov["supersedes"]
+    assert str(cm["k_cycles_per_byte"][0]) in prov["supersedes"]
 
     # The shared-memory layout, as numbers rather than prose. A consumer
     # divides its own device's budget by these to learn how many blocks it can
