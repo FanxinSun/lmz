@@ -699,11 +699,11 @@ wrong weight. Keep them, keep them cheap, and keep them on by default.
 ## Before you measure anything
 
 Every defect this project found in one day came from the measurement setup
-rather than the code. Two families: **you can measure the wrong object** (1),
-or **measure the right one and attribute its cost to the wrong variable**
-(2–6). Both produce numbers that are reproducible, tight, and wrong, which is
-the shape that gets published. Read these before running a sweep, not after
-publishing one.
+rather than the code — none from computing a wrong answer. Two families: **you
+can measure the wrong object** (1, 6), or **measure the right one and attribute
+its cost to the wrong variable** (2–5, 7). Both produce numbers that are
+reproducible, tight, and wrong, which is the shape that gets published. Read
+these before running a sweep, not after publishing one.
 
 1. **An instrument must reproduce the thing it claims to measure.** This is a
    class above the rest: they are about attributing a cost to the wrong
@@ -738,7 +738,15 @@ publishing one.
    this box's answer is testing the box; the environments that disagree are
    the ones you cannot see. `LMZ_NO_GPU=1` before pushing, and the same rule
    in `tests/test_lmz.py`'s docstring.
-6. **Fix the byte traffic across a sweep.** Every row of the occupancy sweeps
+6. **Verify the artifact that shipped, not the one you built.** A local build
+   and a CI build of the same commit are not the same file: lmz 1.3.0's wheel
+   matched byte for byte and its sdist did not, because CI rebuilt from the
+   tag. Inspecting a local tarball and concluding the published one is clean is
+   an inference about the artifact rather than an observation of it. The check
+   is `pip download --no-binary :all:` and it costs one command. (The 257-byte
+   difference turned out to be gzip framing — all 32 files byte-identical by
+   sha256 — but that is the answer, not the assumption.)
+7. **Fix the byte traffic across a sweep.** Every row of the occupancy sweeps
    decodes the identical archive; anything that moves is therefore the
    variable under test and not the workload.
 
