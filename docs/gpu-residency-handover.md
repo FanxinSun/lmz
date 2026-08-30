@@ -361,6 +361,80 @@ codec means answering the question. A test asserts every codec has an entry —
 without it a new codec would default to unreadable and silently make archives
 look unroutable.
 
+## 1d. The cost model validated at more than one operating point
+
+`1b` measured `k` on a card that saturates on bandwidth at 192 threads, which
+is the one regime where a compute constant is invisible. This tests it where it
+is visible, by shrinking the **grid** at fixed byte traffic: same streams, same
+936.4 MB, fewer resident blocks, so the kernel has to leave the bandwidth-bound
+corner. `scratchpad/gpu/cuda/gridsweep.cu`, 14 grid sizes from 1 block to 1191,
+byte-identical at every one.
+
+| blocks | GB/s | linear in blocks | binds |
+|---|---|---|---|
+| 1 | 2.3 | — | compute |
+| 8 | 18.8 | 1.02 | compute |
+| 32 | 74.7 | 1.01 | compute |
+| 84 | 186.7 | 0.97 | compute |
+| 168 | 331.6 | 0.86 | mixed |
+| 252 | 401.1 | 0.69 | bandwidth |
+| 1191 | 414.6 | 0.15 | bandwidth |
+
+**The model's shape is confirmed.** Rate is linear in resident blocks to within
+3% across 1–84 blocks, then bends over as bandwidth takes the ceiling — which
+is what `rate = min(lanes × clock ÷ k, BW ÷ (1 + 1/expansion))` predicts, and
+the crossing is where it says.
+
+**The constant was wrong, and this is how.** `k` measured in the compute-bound
+region is **217–248**, tight across ten grid sizes. The published 230–330 came
+from full-size runs where bandwidth binds: dividing a bandwidth-limited rate by
+resident lanes does not yield a compute constant, it yields whatever makes the
+arithmetic close. Direction right, interval skewed — every measured point sat
+~20% above the old band's midpoint, and the narrowed one fits 12 of 14 points
+against 7. `cost_model()` now publishes 217–248 with the grid sweep in its
+provenance.
+
+**And the instrument nearly produced a confident wrong answer.** The first
+version hand-rewrote `k_shared`'s body around a grid-stride loop and measured
+2.4× slower at the same occupancy — it was a *different kernel*, and its `k` of
+638–664 would have been published as a correction. What caught it was checking
+the instrument against the thing it claims to measure: at a full grid it must
+reproduce the shipped kernel's rate. It did not. The version in the repo
+extracts the body verbatim and reproduces 414.6 against the shipped 409.8–418,
+and its header says to make that check first.
+
+**The per-group table, priced.** Both this work and a downstream consumer's
+independent analysis point at shrinking the shared-memory footprint. Now that
+rate is *measured* linear in resident lanes, the arithmetic converts directly:
+
+| budget | 16 KiB LUT (today) | 4 KiB LUT | no fixed LUT |
+|---|---|---|---|
+| 32 KiB per workgroup | 192 lanes | **352** | 384 |
+| 64 KiB pool / 32 KiB cap | 384 lanes | **704** | 800 |
+| 100 KiB (this card) | 1024 lanes | 1152 | 1280 |
+
+A 4 KiB LUT is worth **1.8× the resident lanes on a 32 KiB budget** and almost
+nothing here — which is exactly why this card could not have shown it, and why
+the convergence of two independent analyses was worth more than either.
+
+**A side effect worth naming: the narrow table's cost is now measured.** With
+both kernels' constants taken in the compute-bound regime, they separate —
+**217–248 shared against 257–291 per-chunk**. That gap is the second dependent
+shared load the narrow table buys its size with, which §1 asserted from the
+design and nobody had priced. It is about 20% of cycles a byte, not a factor,
+which is why occupancy rather than the inner loop dominates the 3.8× gap. The
+suite now asserts the ordering and a sane bound on the ratio, since the
+per-chunk kernel costing *less* per byte would mean one of them was measured
+wrong.
+
+**What this instrument is not.** A 5080 held to a few blocks is a 5080 with
+less compute and **the same ~960 GB/s of DRAM behind it, and no CPU contending
+for the bus**. It validates the model's *shape* and the constant's *value on
+this kernel and this card*. It does not produce integrated-GPU numbers, and no
+row above should be read as one. The projections in `1b`, `3c` and elsewhere
+remain projections; what changed is that the model underneath them has now been
+checked at 14 operating points instead of assumed from one.
+
 ## 1c. The per-chunk kernel's cost model — **done**, and its sweep is degenerate
 
 `cost_model("per_chunk")` publishes the other kernel's constants, because a

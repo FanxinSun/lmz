@@ -3130,11 +3130,17 @@ def test_gpu_cost_model_is_publishable():
     assert gpu.cost_model()["k_is_single_point_fit"] is False
     assert per["k_is_single_point_fit"] is True
 
-    # Same algorithm, so the two intervals must overlap. If they ever stop
-    # overlapping, one of them was measured wrong.
+    # The per-chunk kernel must cost *more* per byte than the shared one, and
+    # not wildly more. It reads a narrow table, which is a second dependent
+    # shared load per symbol; that is the whole trade the two-table design
+    # makes, so its k being lower would mean one of them was measured wrong,
+    # and its being several times higher would mean the narrow table costs far
+    # more than a load. Both intervals were measured in the compute-bound
+    # regime, which is the only place either is visible.
     a_lo, a_hi = gpu.cost_model()["k_cycles_per_byte"]
     b_lo, b_hi = per["k_cycles_per_byte"]
-    assert a_lo <= b_hi and b_lo <= a_hi, (a_lo, a_hi, b_lo, b_hi)
+    assert b_lo > a_lo, (a_lo, b_lo)
+    assert b_hi < 2 * a_hi, (a_hi, b_hi)
 
     cm = gpu.cost_model()
     for key in ("lanes", "states", "grain", "bytes_per_symbol",

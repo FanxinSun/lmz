@@ -405,10 +405,17 @@ def cost_model(kernel: str = "shared") -> dict:
         "grain": grain(),
         "bytes_per_symbol": 1,
         "kernel": "shared",
-        "k_cycles_per_byte": (230, 330),
-        # A real bracket: the low end came from a row holding 4 resident
-        # blocks and the high end from one holding 3, so a device inside that
-        # occupancy range lands inside the interval. Contrast the per-chunk
+        # Validated across 1191x of compute by shrinking the grid at fixed
+        # byte traffic, which is the only way to reach the compute-bound
+        # regime on a card that saturates on bandwidth at 192 threads. The
+        # first published interval, (230, 330), was derived from full-size
+        # runs where bandwidth binds -- dividing a bandwidth-limited rate by
+        # resident lanes does not yield a compute constant. It was right in
+        # direction and 20% wide in the wrong place; this is the same
+        # quantity measured where it is actually visible.
+        "k_cycles_per_byte": (217, 248),
+        # A real bracket: 14 grid sizes from 1 block to 1191, 217-248 across
+        # the ten that are genuinely compute-bound. Contrast the per-chunk
         # kernel, where the sweep collapses to one launch and the same field
         # is a point estimate with noise around it.
         "k_is_single_point_fit": False,
@@ -441,7 +448,11 @@ def cost_model(kernel: str = "shared") -> dict:
             "machine": "9800X3D, WSL2, CUDA 13.2, driver 610.88",
             "archive": "936.4 MB of real BF16 exponent planes from a Llama "
                        "checkpoint, 325.2 MB coded, 32768-byte streams",
-            "method": "occupancy sweep at fixed byte traffic -- threads per "
+            "method": "grid sweep at fixed byte traffic -- 1 to 1191 blocks "
+                      "over identical input, byte-identical at every size, "
+                      "linear in resident blocks to within 3% below 84 "
+                      "blocks and bending as bandwidth takes over. Also an "
+                      "occupancy sweep -- threads per "
                       "block 64..384 over identical input, two runs agreeing "
                       "within 1%. Bytes moved are the same in every row, so "
                       "the 1.70x spread is compute alone.",
