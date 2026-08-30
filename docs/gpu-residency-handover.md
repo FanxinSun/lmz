@@ -645,6 +645,18 @@ move is neither the codec nor the residency engine:
 The dividing line that keeps holding: lmz produces bytes and can turn them
 back into bytes as fast as anyone. It does not decide *when*.
 
+**And the boundary only works if the reasoning crosses it too.** `cost_model()`
+was built so nobody downstream would carry a copy of lmz's constants or a guess
+at them — and its first version left the single most useful fact about them
+outside the mechanism: *why* the published `k` had moved, and therefore whether
+a consumer was looking at a refinement or a contradiction. That reasoning lived
+in a message and a report, which do not survive a context boundary. A consumer
+wiring against the constants did the correct thing with what they had — they
+reconstructed the argument and labelled it as their own inference — and that is
+the only reason the gap was visible at all. `provenance["supersedes"]` is where
+it lives now. The general form: **if a consumer would have to re-derive it, it
+belongs in the artifact, not in the conversation that produced the artifact.**
+
 **The purity rule that follows, stated where a contributor will hit it.**
 lmz's decode path is bytes in, bytes out. A new entry point that opens a
 file, starts a thread pool, or measures the machine in order to choose a
@@ -701,7 +713,9 @@ wrong weight. Keep them, keep them cheap, and keep them on by default.
 Every defect this project found in one day came from the measurement setup
 rather than the code — none from computing a wrong answer. Two families: **you
 can measure the wrong object** (1, 6), or **measure the right one and attribute
-its cost to the wrong variable** (2–5, 7). Both produce numbers that are
+its cost to the wrong variable** (2–5, 8) — and one that is neither, where a
+number acquires authority by crossing a boundary and coming back (7). All
+produce numbers that are
 reproducible, tight, and wrong, which is the shape that gets published.
 
 That the defects cluster this way is partly a fact about the work and partly a
@@ -753,7 +767,21 @@ beyond suspicion.
    is `pip download --no-binary :all:` and it costs one command. (The 257-byte
    difference turned out to be gzip framing — all 32 files byte-identical by
    sha256 — but that is the answer, not the assumption.)
-7. **Fix the byte traffic across a sweep.** Every row of the occupancy sweeps
+7. **A number that crosses the boundary and comes back is not independent
+   evidence.** The first draft of `cost_model()`'s `supersedes` field said the
+   old sweep's compute ceiling was "above 1200". That figure traces to a
+   *consumer's* inferred k = 128, which lmz was about to publish as its own
+   finding and hand back to them — after which they would have cited lmz for a
+   value they supplied, and an unchecked inference would have acquired the
+   authority of a published constant. It happened also to be wrong (the real
+   ceilings across that sweep are 264–791), but **the wrongness is not the
+   point: a correct value acquired that way is just as unfounded.** This is not
+   rules 1 or 6 — nothing was measured badly, and the artifact was the right
+   one. It is a fact with no independent source acquiring one by round trip,
+   and a published boundary is precisely what makes it possible. Before
+   publishing a number, ask where it came from, and if the answer is "the
+   consumer", either measure it or attribute it.
+8. **Fix the byte traffic across a sweep.** Every row of the occupancy sweeps
    decodes the identical archive; anything that moves is therefore the
    variable under test and not the workload.
 
