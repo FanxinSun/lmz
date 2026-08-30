@@ -76,10 +76,18 @@ rANS at **111 GB/s** out of an archive written today, and **418 GB/s** when
 the frequency table is shared across chunks — both verified byte-identical to
 the CPU decoder over 936 MB of real BF16 planes.
 
-The ratio to the link is the point. PCIe Gen4 x16 delivers 28.8 GB/s, so a
-decoder 3.9× faster than that makes compression on the path into VRAM free,
-and every point of lmz's ratio becomes a point of load bandwidth. The fused
-whole-BF16 kernel in `scratchpad/gpu/` measures the end of it: cold disk to
+**The ratio to the link is the point, and it is a ratio you can recompute.**
+On this machine PCIe Gen4 x16 delivers 28.8 GB/s, so a decoder running at 111
+is 3.9× faster than the link it feeds — and once decoding is faster than the
+link, compression on the path into VRAM is free, with every point of lmz's
+ratio becoming a point of load bandwidth. Both halves are machine-dependent: a
+Gen5 host doubles the link, a unified-memory Mac has no such link at all, and
+a phone changes both numbers. What travels is the comparison, not the 3.9×.
+
+The 418 GB/s is a bandwidth ceiling rather than a compute one — 59% of this
+card's ~960 GB/s peak, because decoding moves 1.347 bytes of DRAM traffic per
+decoded byte: the plaintext out plus the coded bytes in. The fused whole-BF16
+kernel in `scratchpad/gpu/` measures the end-to-end consequence: cold disk to
 VRAM, plain safetensors 0.373 s against lmz's 0.256 — **1.46× faster**,
 converting 98% of the ratio into load speed.
 
@@ -92,6 +100,103 @@ gpu.decode_batch(streams, offsets, nstr, plane)    # a batch in, plaintext out
 
 A batch, not a stream: lmz's 8 interleaved rANS states are 8 lanes of work, so
 one stream never fills a GPU however large it is, and many streams at once do.
+
+## Building on lmz
+
+New in 1.3.0, and the reason to upgrade if you are writing the layer above:
+lmz stopped requiring anyone to reach inside it. A runtime that wants to
+schedule reads, drive its own device, or predict lmz's cost on hardware nobody
+here owns can now ask, instead of copying a constant out of the source and
+hoping it does not move.
+
+**The archive says who can read it.** Not plumbing — a footgun with a fix.
+Once a chunk is big enough and conditioning wins, lmz emits `CODEC_BF16C`,
+whose per-bucket segments have unequal lengths — and **the GPU decoder cannot
+read it**, because a batch decode needs equal-length streams. Nothing used to
+say so.
+
+```python
+lmz.capabilities("model.lmz")
+# {'batch_decodable': False, 'blockers': {'bf16-cond': 224, 'entropy': 1},
+#  'blocker_bytes': 1872871856, 'batch_decodable_bytes': 0.0, ...}
+```
+
+`lmz info` prints the same thing as a `batch` line. If it says no and you
+wanted a GPU-readable archive, compress with `--mapped`: 64 KiB blocks stay
+under the conditioning threshold, so that codec is never chosen. Measured on a
+1.87 GB BF16 checkpoint on this box, that moved 224 blocking chunks and
+1.87 GB down to one 12 KB chunk, and cost **0.89 points** of ratio (32.91% →
+32.02%).
+
+Read the bytes and not only the boolean. That last 12 KB chunk is the
+safetensors JSON header — one general-purpose stream, enough on its own to
+make `batch_decodable` False while 99.999% of the output is still
+batch-decodable. `blocker_bytes` is there so you can tell one header from two
+hundred weight chunks and route the bulk on the device either way.
+
+**Decode bytes you already have.** `ArchiveIndex` exists because of a coupling
+worth naming, since it is not specific to lmz: `decompress` reads and decodes
+inside one worker, so a single thread count sets both decode throughput *and*
+read queue depth — and those want opposite things. An NVMe device reaches its
+rated rate only with about a dozen requests in flight; past two threads lmz's
+own interpreter overhead between native calls becomes GIL contention. You
+cannot tune your way out of that from outside. You can only step around it, by
+fetching the payload yourself and handing lmz the bytes.
+
+```python
+idx = lmz.ArchiveIndex("model.lmz")
+for c in idx.chunks():                    # where every payload is
+    plain = idx.decode(c, my_reader.pread(c.off, c.clen))   # no I/O, no threads
+```
+
+Ref and delta chunks raise `NeedsSource` instead: they are *defined* as a
+difference from an earlier range, so decoding one needs bytes from elsewhere in
+the archive — and lmz will not reach for the file behind your back. Use
+`decompress` when you want it to handle that.
+
+**The caller owns the device.** `gpu.decode_batch_dev()` takes device pointers
+as plain integers plus your stream, allocates nothing, creates no context, and
+does not synchronise. Your allocator, your stream, your context; lmz does not
+build a second one behind them and does not decide when you need the result.
+
+**The kernel publishes its constants, not just its speed.** A rate measured on
+a 5080 tells you about a 5080. `gpu.cost_model()` gives you the mechanism
+instead, so you can compute the answer for your own device:
+
+```python
+gpu.cost_model()
+# k_cycles_per_byte: (230, 330)   -- an interval, because it is one
+# shmem_lut_bytes / shmem_per_group_bytes / blocks_per_unit_at_measurement
+# expansion, bound, and provenance for every number
+```
+
+`k` is published as a range rather than a midpoint because occupancy hides part
+of the cost and how much varies with the block size — and it is **latency-bound
+on a dependent shared-memory load chain, not throughput-bound**, so scaling it
+by a device's FP32 rate is the wrong arithmetic. The shared-memory numbers let
+you check how many blocks your device holds and decide whether that interval
+brackets you or is only a floor.
+
+**Every encode keyword is declared.** `encode_options()` labels all ten as
+`format` (eight — they decide what the coded bytes are), `schedule` (one:
+`workers`) or `observe` (one: `progress`). The distinction is the useful part:
+**a scheduling default is a fallback, never a decision.** lmz picks `workers`
+from a CPU count without knowing your machine or your workload — compression
+goes memory-bus-bound near four threads on real weights — so it is yours to
+override, and the declaration is how you can tell that from a considered
+answer.
+
+**One format choice worth knowing about.** A rANS stream normally carries its
+own 516-byte frequency table. `lmz compress --shared-tables` lifts it out and
+carries one per plane kind in the manifest instead, which is smaller on
+archives whose chunks are small enough for those headers to matter and is the
+layout a GPU wants, since a warp can then share one table in shared memory. It
+is **off by default** because it writes a v7 archive an older lmz cannot read,
+and the current GPU kernel does not read it yet — so today it is a size and
+format decision, not a speed one. Sharing is decided per plane and only where
+it measured better: **+0.93 points** on a 151 MB fp32 whisper checkpoint in
+64 KiB blocks, and on a BF16 Llama shard it declined outright and wrote an
+ordinary v1 archive, because there it does not pay.
 
 The first thing it does on any machine is decode a stream that machine just
 encoded and check the CPU decoder agrees; a device that disagrees is not used,
@@ -152,9 +257,15 @@ die, and reports it. A segmentation fault in your program is not a fallback.
 
 Nothing in `lmz decompress` routes to it yet, deliberately: the useful thing
 to do with a GPU decode is to leave the result in VRAM, and deciding when
-belongs to the layer above — see the
-[GPU residency handover](docs/gpu-residency-handover.md) for that boundary and
-for the work still between here and a residency engine.
+belongs to the layer above. That has stopped being a deferral. The layer above
+now exists, and what lmz owes it is published on both sides of the line —
+where the bytes are and what can read them, a decode that touches no file, a
+device entry point that takes your pointers and your stream, and the kernel's
+own cost constants so it can predict lmz on hardware nobody here has. lmz
+turns bytes into bytes as fast as the hardware allows and says what that
+costs; it does not decide when. The
+[GPU residency handover](docs/gpu-residency-handover.md) is where that boundary
+is written down.
 
 ## Where it is not worth it
 
@@ -198,14 +309,18 @@ or [Alipay](assets/alipay.jpg) (打开支付宝，扫一扫). Thank you.
 - [**Using lmz**](docs/usage.md) — command line, Python API, the mount and the
   filesystem
 - [**Limitations**](docs/limitations.md) — where it does not pay, and what the
-  108 tests check
+  120 tests check
 - [**Vectorising the coder**](docs/vectorising-the-coder.md) — how the encoder
   reached arm64, the one piece of work still open, and the six that were tried
   and measured out flat
-- [**GPU residency handover**](docs/gpu-residency-handover.md) — the GPU
-  decoder runs at 418 GB/s against a 28.8 GB/s PCIe link, so on that path
-  compression is free by 14×; what shipped as `lmz.gpu`, the two pieces of
-  work still between it and a residency layer, and where lmz's job ends
+- [**GPU residency handover**](docs/gpu-residency-handover.md) — what the
+  decoder costs and why, with the occupancy sweep that separated a compute
+  ceiling from a bandwidth one; what shipped as `lmz.gpu`, the interfaces the
+  layer above asked for, the two measurements still open, and where lmz's job
+  ends
+- [**Portable decoder handover**](docs/portable-decoder-handover.md) — the
+  shared frequency table as a format option, and the three things its design
+  did not survive contact with
 - [**Perception codec handover**](docs/perception-codec-handover.md) — what
   vision and audio models need that LLM checkpoints did not: int8 routed to
   the coder the GPU can read, ONNX parsed, and the two expected ratio items

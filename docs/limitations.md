@@ -59,9 +59,11 @@
   `lmz.native` makes with a C compiler: the wheel carries a `.cu` and no
   CUDA, installing needs no toolkit, and a machine with neither nvcc nor a
   card decodes on the CPU exactly as before. `lmz doctor` says which. What it
-  gives you is one call — `lmz.gpu.decode_batch`, a batch of lmz rANS streams
-  in, their plaintext out, verified byte-identical to `lmz_rans_decode` over
-  936 MB of real planes. What it does not give you is a faster
+  gives you is `lmz.gpu.decode_batch` — a batch of lmz rANS streams in, their
+  plaintext out, verified byte-identical to `lmz_rans_decode` over 936 MB of
+  real planes — plus `decode_batch_dev` for a caller that owns its own device
+  and stream, and `cost_model()` for one that needs to predict the kernel on
+  hardware this project has never run on. What it does not give you is a faster
   `lmz decompress`: nothing in the archive path calls it, because the useful
   thing to do with a GPU decode is leave the result in VRAM, and deciding
   when to do that belongs to the layer above. Two further limits are real.
@@ -69,13 +71,14 @@
   once and never by one, however large — that is the format's 8-state
   interleave, not the kernel's. And **an archive written today codes a
   frequency table per chunk**, which costs 3.8× against a table shared across
-  chunks: 111 GB/s versus 418 on the same 936 MB. The coder primitives for
-  the shared form now exist (`kernels.rans_table`, `rans_encode_shared`,
-  `rans_decode_shared`) and are verified against the ordinary decoder, but
-  no archive writes them yet: the format option is item 1 of
-  [gpu-residency-handover.md](gpu-residency-handover.md), and the
-  measurements that fix its design — the table must be shared per *plane
-  kind*, not per archive, which is otherwise six points worse — are in
+  chunks: 111 GB/s versus 418 on the same 936 MB. **The shared form now
+  writes**, as `CODEC_SPLIT_ST` under `--shared-tables`, off by default
+  because it writes a v7 archive an older build cannot read; the table is
+  shared per *plane kind* rather than per archive, which measurement showed is
+  otherwise six points worse than what lmz already did. **The GPU kernel does
+  not read it yet**, so the 3.8× above is still what an archive gives the
+  device decoder either way. The design and its three surprises are in
+  [portable-decoder-handover.md](portable-decoder-handover.md) §1 and
   [perception-codec-handover.md](perception-codec-handover.md). The Apple
   silicon port under `scratchpad/gpu/metal/` is still written and never run.
 - **Decompressing to a file is I/O bound** on real storage. The gain there is
@@ -145,7 +148,7 @@
 python3 tests/test_lmz.py          # also runs under pytest
 ```
 
-108 tests covering kernel equivalence across all backends, element sizes and
+120 tests covering kernel equivalence across all backends, element sizes and
 block periods,
 rANS round-trips over adversarial distributions (including single-symbol
 streams, which exposed a frequency-field overflow), rANS landing within 2% of

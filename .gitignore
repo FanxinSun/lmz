@@ -19,3 +19,7 @@ encbench-neon
 build/
 dist/
 *.egg-info/
+
+# Terminal session transcripts. One was committed by accident in bd3fb42;
+# they are not part of the package and say nothing about the code.
+log.txt

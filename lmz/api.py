@@ -1277,6 +1277,7 @@ def capabilities(src: str) -> dict:
 
         {"batch_decodable": bool,        # every coded chunk can ride the batch
          "batch_decodable_bytes": float, # share of plaintext that can, 0..1
+         "blocker_bytes": int,           # plaintext behind those chunks
          "blockers": {name: chunks},     # codecs standing in the way
          "min_reader_version": int,
          "shared_tables": bool,
@@ -1293,11 +1294,20 @@ def capabilities(src: str) -> dict:
     handles the coded chunks handles the archive. `batch_decodable_bytes`
     counts only what is coded, so an archive of entirely stored chunks reports
     True with a share of 1.0.
+
+    **Read the bytes, not only the boolean.** `batch_decodable` is True only
+    when *every* coded chunk can ride the batch decoder, and a single small
+    chunk makes it False -- a safetensors JSON header is one general-purpose
+    stream and is enough on its own. On a real 1.87 GB checkpoint that is
+    12 KB against 1873 MB: the boolean says no, and 99.999% of the output is
+    still batch-decodable. `blocker_bytes` and `batch_decodable_bytes` are
+    there so a caller can tell "one header" from "224 weight chunks" and route
+    the bulk on the device either way.
     """
     with open(src, "rb") as fh:
         reader = ArchiveReader(fh)
         blockers: dict[str, int] = {}
-        coded = ok = 0
+        coded = ok = blocked = 0
         for c in reader.chunks:
             if c.codec in (CODEC_STORED, CODEC_REF):
                 continue          # nothing coded here for any decoder to read
@@ -1305,11 +1315,13 @@ def capabilities(src: str) -> dict:
             if BATCH_DECODABLE.get(c.codec, False):
                 ok += c.rlen
             else:
+                blocked += c.rlen
                 name = CODEC_NAMES.get(c.codec, f"codec {c.codec}")
                 blockers[name] = blockers.get(name, 0) + 1
         return {
             "batch_decodable": not blockers,
             "batch_decodable_bytes": (ok / coded) if coded else 1.0,
+            "blocker_bytes": blocked,
             "blockers": blockers,
             "min_reader_version": max(
                 (CODEC_MIN_VERSION.get(c.codec, 1) for c in reader.chunks),
