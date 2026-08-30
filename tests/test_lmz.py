@@ -2887,6 +2887,73 @@ def test_gpu_decode_over_distributions_and_shapes():
     assert checked >= 20, f"only {checked} shapes actually ran"
 
 
+def test_encode_options_match_the_signature():
+    """The declaration must not be able to drift from what compress accepts.
+
+    A table of options that has quietly fallen behind the function is worse
+    than no table, because a caller trusts it. So this checks the two against
+    each other by introspection rather than against a copy of the list: a new
+    keyword with no entry fails here, and so does an entry for a keyword that
+    no longer exists or whose default has moved.
+    """
+    import inspect
+
+    opts = lmz.encode_options()
+    sig = inspect.signature(lmz.compress)
+    keywords = {name: p for name, p in sig.parameters.items()
+                if p.kind is inspect.Parameter.KEYWORD_ONLY}
+
+    assert set(opts) == set(keywords), (
+        set(opts) ^ set(keywords), "declaration and signature disagree")
+    for name, param in keywords.items():
+        assert opts[name].default == param.default, name
+        assert opts[name].kind in ("format", "schedule", "observe"), name
+        assert opts[name].describes, name
+        assert opts[name].name == name
+
+    # src and dst are positional, and deliberately not options.
+    assert "src" not in opts and "dst" not in opts
+
+    # Exactly one scheduling knob today. If a second appears, it needs the
+    # same "fallback, never a decision" treatment, so make that deliberate.
+    assert [n for n, o in opts.items() if o.kind == "schedule"] == ["workers"]
+
+    # Undeclared keywords are rejected by the language, which is why the
+    # table does not have to police the call.
+    try:
+        lmz.compress("/nonexistent", "/nonexistent.lmz", not_an_option=1)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("an undeclared keyword must not be accepted")
+
+
+def test_scheduling_options_do_not_change_the_bytes():
+    """`workers` is declared `schedule`; that has to be true of the archive.
+
+    This is what makes the format/schedule split a property of lmz rather
+    than a naming convention. A future option misclassified as scheduling --
+    one that quietly changed chunking, say -- would produce different bytes
+    at different thread counts and fail here.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "m.bin")
+        # Enough chunks that the work really is spread across the workers.
+        with open(src, "wb") as fh:
+            fh.write((bytes(range(256)) * 4096) * 24)
+
+        digests = set()
+        for workers in (1, 2, 8, 16):
+            archive = os.path.join(d, f"w{workers}.lmz")
+            lmz.compress(src, archive, workers=workers)
+            digests.add(digest(archive))
+        assert len(digests) == 1, f"{len(digests)} distinct archives"
+
+        # And the schedule really did vary -- a default that collapsed to one
+        # thread would pass the check above without testing anything.
+        assert lmz.encode_options()["workers"].default is None
+
+
 def test_gpu_cost_model_is_publishable():
     """The cost model is a contract, so its shape is checked even with no GPU.
 

@@ -356,6 +356,30 @@ adaptation, which keeps it on the right side of the line. The day it wants
 to time a disk, it should take the model from downstream rather than grow a
 second one.
 
+**Interrogation is not measurement, and the line runs between them.**
+`compress(workers=None)` falls back to `default_workers()`, which asks the OS
+for a CPU count honouring affinity and cgroups. That is a *question* — it
+times nothing, probes no device, adapts to no observed throughput — and it
+stays. What must never happen is a default derived from a *rate*: nothing
+timed, fitted, adapted from measured throughput, or cached as a machine
+profile, because that is a second rate model and the stack has one.
+
+`encode_options()` publishes the distinction so a caller can act on it. Every
+keyword `compress` accepts is declared `format`, `schedule` or `observe`;
+`format` decides what the coded bytes are and is lmz's to choose, `schedule`
+decides only how the work is spread, and `observe` watches without changing
+anything. **A scheduling default is a fallback, never a decision** — it was
+chosen knowing nothing about the caller's machine or workload, which is
+precisely the fact a transport layer needs and could not otherwise discover.
+`workers` is the one today, and its default is deliberately a weak proxy:
+compression goes memory-bus-bound near four threads on real weights, so a
+core count is a starting point rather than an answer.
+
+The split is a verified property rather than a naming convention — the same
+input at 1, 2, 8 and 16 workers produces byte-identical archives, and the
+suite checks both that and the declaration against `compress`'s own signature
+by introspection, so a new keyword cannot be added without classifying it.
+
 ## What is already right and should not be touched
 
 **64 KiB, page-aligned.** Measured in the consumer's probe on a real disk:

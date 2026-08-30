@@ -67,6 +67,86 @@ DELTA_MIN_GAIN = 0.05  # the difference must beat coding alone by this much
 SKIP_NAMES = {".DS_Store"}
 
 
+@dataclass(frozen=True)
+class Option:
+    """One keyword `compress` accepts, and what kind of thing it decides."""
+
+    name: str
+    default: object
+    kind: str          # "format" | "schedule" | "observe"
+    describes: str
+
+
+# What every keyword of `compress` is for, and -- the part a caller cannot
+# otherwise discover -- whether lmz chose its default knowing anything about
+# the caller's machine.
+#
+#   "format"   decides what the coded bytes are. lmz's to choose, and the
+#              same input plus the same format options gives the same archive
+#              on any machine.
+#   "schedule" decides how the work is spread, and nothing about the bytes.
+#              A default here is a *fallback, never a decision*: lmz may
+#              derive one by interrogating the host -- a static capability
+#              query, nothing timed -- but never from a rate. Nothing timed,
+#              fitted, adapted from observed throughput, or cached as a
+#              measured profile; that would be a second rate model, and the
+#              stack has one. So a scheduling default is chosen in ignorance
+#              of the caller's machine and workload, and is the caller's to
+#              override.
+#   "observe"  watches the work without changing it or its bytes.
+#
+# `workers` is the only schedule option today. Its default comes from
+# `default_workers()`, which asks the OS for a CPU count honouring affinity
+# and cgroups and clamps it -- a question, not a measurement. It is a weak
+# proxy on purpose: compression goes memory-bus-bound around four threads on
+# real weights, so a core count is a fallback and a caller that knows its
+# workload should say so.
+#
+# Undeclared keywords are already rejected: `compress` is keyword-only, so
+# Python raises TypeError before anything runs. This table exists so a caller
+# can tell the kinds apart, not to police the call.
+ENCODE_OPTIONS = {
+    o.name: o for o in (
+        Option("level", DEFAULT_LEVEL, "format",
+               "effort the general-purpose coder spends"),
+        Option("chunk_size", None, "format",
+               "bytes per chunk; None takes the default for `mapped`"),
+        Option("checksum", True, "format", "per-chunk CRC32 in the archive"),
+        Option("dedup", True, "format",
+               "store a repeated tensor once, as a ref chunk"),
+        Option("delta", True, "format",
+               "code a near-copy as a difference from the earlier file"),
+        Option("mapped", False, "format",
+               "small blocks, so any byte range decodes on its own"),
+        Option("align", False, "format",
+               "start every payload on a 4 KiB boundary"),
+        Option("shared_tables", False, "format",
+               "one rANS table per plane kind in the manifest; writes v7"),
+        Option("workers", None, "schedule",
+               "threads; None falls back to a CPU count, not a measurement"),
+        Option("progress", None, "observe",
+               "called with (done, total) as the work proceeds"),
+    )
+}
+
+
+def encode_options() -> dict:
+    """Every keyword `compress` accepts, by name, with its kind.
+
+    The kind is the part a caller cannot otherwise discover. A `format`
+    option decides what the coded bytes are and is lmz's to choose; a
+    `schedule` option decides only how the work is spread, and its default is
+    a fallback lmz picked without knowing anything about the caller's machine
+    or workload -- so a caller that does know should override it. `observe`
+    watches without changing anything.
+
+    The split is a real property of lmz, not a naming convention: compressing
+    the same input at 1, 2, 8 and 16 workers produces byte-identical
+    archives, which the test suite checks.
+    """
+    return dict(ENCODE_OPTIONS)
+
+
 @dataclass
 class Stats:
     input_bytes: int = 0
