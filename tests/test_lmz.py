@@ -3143,11 +3143,15 @@ def test_gpu_device_entry_point_owns_nothing():
 
     assert "decode_batch_dev" in gpu.__all__
     assert callable(gpu.decode_batch_dev)
-    # Declining without a device is a status, not an exception: the caller is
-    # mid-pipeline and the decision to fall back is theirs.
-    assert gpu.decode_batch_dev(1, 1, 0, 128, 1) == gpu.OK  # nstr == 0
 
+    # Declining is a status, not an exception -- the caller is mid-pipeline and
+    # the decision to fall back is theirs. Which status depends on whether
+    # there is a device, and asserting either one unconditionally tests the
+    # machine rather than the code: an empty batch is OK where the library
+    # loaded and ENODEV where it did not, because the load is checked first.
     ok, _why = gpu.available()
+    empty = gpu.decode_batch_dev(1, 1, 0, 128, 1)
+    assert empty == (gpu.OK if ok else gpu.ENODEV), empty
     if not ok:
         assert gpu.decode_batch_dev(1, 1, 4, 128, 1) == gpu.ENODEV
         raise Skip("no GPU decoder")
