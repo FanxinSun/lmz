@@ -1058,6 +1058,95 @@ def test_delta_against_an_earlier_file():
         assert raw == moved
 
 
+def test_delta_source_does_not_depend_on_file_order():
+    """The archive must be the same whatever order the members arrive in.
+
+    Until 2026-09-03 the delta source was "the earliest member holding this
+    tensor", which is the lowest member index, which is directory order, which
+    is filename sort. On a base plus fine-tunes of it, whichever file sorted
+    first became everyone's source and siblings were subtracted from each other
+    rather than from the parent they share. On a real Qwen2.5-0.5B family that
+    was 17.6 points of ratio decided by a hyphen sorting before a dot.
+
+    A star of near-copies around one original is the shape that exposes it: any
+    member can serve as the source, but only the original is close to them all.
+    """
+    original = weights_bf16(400000, 61)
+    spokes = [nudged_bf16(original, s) for s in (70, 90, 110)]
+    # All different, so nothing dedups and the archive size reflects only the
+    # source choice. The dedup interaction has its own test below.
+    assert len({original, *spokes}) == 4
+    # Equal-length names, so an archive's size reflects its bytes and not the
+    # length of the filenames inside it.
+    blobs = [("hub0", original)] + [(f"spk{i}", b) for i, b in enumerate(spokes)]
+
+    sizes = set()
+    with tempfile.TemporaryDirectory() as d:
+        # Every rotation puts a different member first. The one starting with a
+        # spoke is the case that used to lose.
+        for rot in range(len(blobs)):
+            order = blobs[rot:] + blobs[:rot]
+            src = os.path.join(d, f"order{rot}")
+            os.makedirs(src)
+            for slot, (tag, blob) in enumerate(order):
+                write_safetensors(os.path.join(src, f"{slot:02d}_{tag}.safetensors"),
+                                  [("layer.0.weight", "BF16", [400000], blob)])
+            arc = os.path.join(d, f"order{rot}.lmz")
+            lmz.compress(src, arc)
+            # The coded payload, not the archive size: the manifest names the
+            # members in whatever order they came and stores offsets of
+            # different magnitudes, which moves the total by a handful of bytes
+            # for reasons that have nothing to do with what the coder decided.
+            with open(arc, "rb") as fh:
+                reader = ArchiveReader(fh)
+                sizes.add((reader.payload_end - min(c.off for c in reader.chunks),
+                           tuple(sorted(c.codec for c in reader.chunks))))
+
+            out = os.path.join(d, f"back{rot}")
+            lmz.decompress(arc, out)
+            for slot, (tag, _b) in enumerate(order):
+                name = f"{slot:02d}_{tag}.safetensors"
+                assert digest(os.path.join(src, name)) == digest(os.path.join(out, name))
+    assert len(sizes) == 1, sorted(sizes)
+
+
+def test_delta_sources_are_never_themselves_deltas():
+    """Resolving a delta stays a single hop, however the sources were chosen.
+
+    One member per group is coded directly and everyone else subtracts from it,
+    so no delta can point at another delta. Checked against the archive rather
+    than argued: every source offset must land in a range that is not itself
+    coded as a difference.
+    """
+    original = weights_bf16(400000, 62)
+    blobs = [("hub", original)] + [(f"spoke{i}", nudged_bf16(original, 80 + i))
+                                   for i in range(3)]
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "family")
+        os.makedirs(src)
+        # Deliberately named so a spoke sorts first.
+        for tag, blob in blobs:
+            write_safetensors(os.path.join(src, f"{tag}.safetensors"),
+                              [("layer.0.weight", "BF16", [400000], blob)])
+        arc = os.path.join(d, "family.lmz")
+        lmz.compress(src, arc)
+        with open(arc, "rb") as fh:
+            reader = ArchiveReader(fh)
+            deltas = [c for c in reader.chunks
+                      if c.codec == lmzformat.CODEC_DELTA]
+            assert deltas, "expected deltas in this archive"
+            assert any(c.codec == lmzformat.CODEC_REF for c in reader.chunks), \
+                "expected a dedup ref, which is what makes this test bite"
+            spans = [(c.dst, c.dst + c.rlen) for c in deltas]
+            for c in deltas:
+                fh.seek(c.off)
+                src_off, _inner, _hdr = codec.delta_source(fh.read(16))
+                for s, e in spans:
+                    assert not (s <= src_off < e), (
+                        f"a delta at {c.dst} subtracts from a delta at {s}")
+        lmz.verify(arc)
+
+
 def test_delta_declines_when_the_files_differ():
     """Unrelated tensors must not be coded as differences from each other."""
     with tempfile.TemporaryDirectory() as d:

@@ -90,6 +90,51 @@ them, and the scales hold most of what is left: on Q4_K the fp16 `d`/`dmin`
 planes are 46–51% recoverable and the packed sub-scales 16%, against 3.5% for
 the quants that are 89% of the file.
 
+**Against ZipLLM's method**, on one corpus, measured the same way. ZipLLM
+publishes 54.1% across 3,048 models and 43.19 TB of hub, 99.64% of it
+fine-tunes. That is not a number lmz can be compared to directly — different
+corpus, different composition — so their pipeline was reproduced here instead:
+tensor dedup, a BitX XOR delta against the base, then a general-purpose coder.
+Only the last step differs between the rows.
+
+The corpus is Qwen2.5-0.5B and four full fine-tunes of it — `-Instruct`,
+`Coder-0.5B`, `numind/NuExtract-1.5-tiny`, `alamios/DeepSeek-R1-DRAFT` — 4.941
+GB, all BF16, weights only.
+
+| | archive | saved |
+|---|---|---|
+| ZipLLM's method, zstd -1 | 2.9239 GB | 40.82% |
+| ZipLLM's method, zstd -3 | 2.9353 GB | 40.59% |
+| ZipLLM's method, zstd -19 | 2.8479 GB | 42.36% |
+| lmz's coder in that same pipeline | 2.4168 GB | 51.08% |
+| **lmz as shipped** | **2.3940 GB** | **51.55%** |
+
+zstd -19 is their strongest setting and buys 1.5 points over -1 for 37 times
+the wall clock. The gap is the coder: on the XOR residuals themselves lmz beats
+zstd by 23–54% across update sizes from 1e-4 to 1e-1, against -1 and -19 both.
+The exponent field of `a XOR b` is not an exponent, which looked like it should
+cost lmz its field split — but those bits are then almost always zero, 0.00 to
+0.70 bits per byte, so the split still pays.
+
+Three things this does not say. **It is not a claim about 54.1%**: on this
+corpus ZipLLM's own method reaches 40.8%, and the comparable sentence is the
+one the table makes. **Dedup found 0.00% here** — 95 tensors, norms and biases,
+0.1 MB — where their hub gets 8.3% from it, so this corpus is *less* favourable
+to them than their own on that component; dedup is coder-independent and would
+lift both rows. And **four fine-tunes of one base is more favourable to delta
+than a real hub is**, which cuts the other way.
+
+Worth recording because it was found here: until 2026-09-03 the number in that
+last row was 41.83%, and which one you got depended on what your files were
+called. The delta source was "the earliest member holding this tensor", which
+is the lowest member index, which is directory order — so on this corpus every
+fine-tune was subtracted from `-Instruct` rather than from the base they share,
+because a hyphen sorts before a dot. Across orderings that was 17.6 points of
+spread, 34.0% to 51.6%, and at the bottom of that range lmz lost to the method
+it beats. Sources are now chosen by measuring candidates with the real coder,
+the same way the decision to delta at all was already made, and the archive is
+invariant under member order.
+
 **Throughput**, 1.119 GiB BF16 shard, RAM-backed filesystem, including all I/O
 and per-chunk checksums, best of 3:
 

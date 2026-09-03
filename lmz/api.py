@@ -62,6 +62,10 @@ DEDUP_MIN_TENSOR = 64 << 10
 DELTA_MIN_TENSOR = DEDUP_MIN_TENSOR
 DELTA_SAMPLE = 1 << 20
 DELTA_MIN_GAIN = 0.05  # the difference must beat coding alone by this much
+# Sources evaluated per group. The pairwise table costs one sample encode
+# per pair, so it is capped; past this the field is narrowed by content
+# hash, which keeps the choice independent of the order files arrived in.
+DELTA_MAX_SOURCES = 6
 
 # Files that are not model weights but belong with them; kept so a compressed
 # model directory round-trips into something directly usable.
@@ -637,21 +641,39 @@ def extract(archive: str, member: str, dst: str, *, overwrite: bool = False,
 
 
 def _find_delta_candidates(paths, members, layouts, refs, workers, level):
-    """Tensors that are close to one in an earlier member, but not identical.
+    """Tensors that are close to another copy of themselves, but not identical.
 
     Matched by name, dtype and size -- which is exactly what a checkpoint
     series or a fine-tune of a known base produces -- then decided by encoding
-    a sample both ways. That costs two encodes per candidate and settles the
-    question with the coder that will actually run, so a pair that has drifted
+    a sample with the coder that will actually run, so a pair that has drifted
     too far declines on its own rather than on a rule of thumb.
 
-    Sources are always the earliest member holding the tensor, so a delta
-    never points at another delta and resolving one stays a single hop.
-    Returns ({member index: [(start, end, source output offset)]}, bytes covered).
+    Which copy to subtract from is decided the same way, and that is the point.
+    Taking the earliest member, as this did until 2026-09-03, makes the choice
+    by filename sort order: on a base plus four fine-tunes of it, whichever
+    file happened to sort first became everyone's source, and siblings ended up
+    subtracted from each other rather than from their common parent -- roughly
+    twice the distance. Measured on Qwen2.5-0.5B plus four of its fine-tunes,
+    that was 17.6 points of ratio, 34.0% against 51.6%, decided by nothing but
+    a hyphen sorting before a dot. So every member is a candidate source and
+    the group keeps whichever one leaves the rest smallest.
+
+    One member per group is the source and is coded directly, so a delta never
+    points at another delta and resolving one stays a single hop. Returns
+    ({member index: [(start, end, source output offset)]}, bytes covered).
     """
     taken = {}
+    pinned = set()
     for idx, items in (refs or {}).items():
         taken[idx] = {(s, e) for s, e, _src in items}
+        # Whatever a dedup ref already points at has to stay plain. Making it a
+        # delta target instead would leave the ref resolving through a
+        # difference, which is the chain the single-hop rule exists to prevent.
+        # This never bit while the source was always the earliest member,
+        # because dedup picks the earliest occurrence too and the two agreed by
+        # accident; choosing the source by measurement breaks that coincidence.
+        for _s, _e, src in items:
+            pinned.add(_locate_output(members, src))
 
     groups: dict = {}
     region_at: list = []
@@ -662,6 +684,9 @@ def _find_delta_candidates(paths, members, layouts, refs, workers, level):
                 at[r.start] = r
             for name, meta in (layout.tensors or {}).items():
                 s, e = meta["offsets"]
+                # A tensor dedup already claimed is neither source nor target:
+                # as a target it is already free, and as a source it is a ref,
+                # which a delta pointing at it would chain through.
                 if e - s < DELTA_MIN_TENSOR or (s, e) in taken.get(idx, ()):
                     continue
                 groups.setdefault((name, meta.get("dtype", ""), e - s), []) \
@@ -673,48 +698,109 @@ def _find_delta_candidates(paths, members, layouts, refs, workers, level):
         if len(group) < 2:
             continue
         group.sort()
-        pidx, ps, _pe = group[0]
-        for idx, s, e in group[1:]:
-            r = region_at[idx].get(s)
-            if r is None or r.start != s or r.end != e:
-                continue  # only whole, singly-owned regions
-            work.append((pidx, ps, idx, s, e, r))
+        # A source only has to be readable; a target has to be a whole region
+        # this archive owns outright, and must not already be a dedup ref.
+        targets = [(idx, s, e, region_at[idx].get(s)) for idx, s, e in group]
+        targets = [t for t in targets
+                   if t[3] is not None and t[3].start == t[1] and t[3].end == t[2]
+                   and (t[0], t[1]) not in pinned]
+        if not targets:
+            continue
+        r = targets[0][3]
+        work.append((group, targets, r))
     if not work:
         return {}, 0
 
     pool = _FdPool(paths, os.O_RDONLY)
     try:
         def decide(item):
-            pidx, ps, idx, s, e, r = item
-            n = e - s
+            group, targets, r = item
+            n = group[0][2] - group[0][1]
+            esize = max(r.esize, 1)
             take = min(DELTA_SAMPLE, n)
-            take -= take % max(r.esize, 1)
+            take -= take % esize
             if take <= 0:
                 return None
-            off = ((n - take) // 2 // max(r.esize, 1)) * max(r.esize, 1)
-            a = os.pread(pool.get(pidx), take, ps + off)
-            b = os.pread(pool.get(idx), take, s + off)
-            if len(a) != take or len(b) != take or a == b:
-                return None  # identical samples are dedup's job, not this one
-            diff = bytes(kernels.xor_bytes(b, a))
+            off = ((n - take) // 2 // esize) * esize
+
+            samples = []
+            for idx, s, _e in group:
+                b = os.pread(pool.get(idx), take, s + off)
+                if len(b) != take:
+                    return None
+                samples.append(b)
 
             def coded(buf):
                 parts = _codec.encode_chunk(buf, r.esize, level, False,
                                             kind=r.kind, btype=r.btype)[0]
                 return sum(len(p) for p in parts)
 
-            if coded(diff) < coded(b) * (1 - DELTA_MIN_GAIN):
-                return idx, s, e, members[pidx].dst + ps
-            return None
+            # Candidate sources. Beyond a handful the pairwise table stops
+            # being worth its own cost, so the field is narrowed by a hash of
+            # the sample rather than by position -- the same members are
+            # picked whatever order the files arrived in.
+            cand = list(range(len(group)))
+            if len(cand) > DELTA_MAX_SOURCES:
+                cand.sort(key=lambda i: hashlib.blake2b(samples[i],
+                                                        digest_size=8).digest())
+                cand = sorted(cand[:DELTA_MAX_SOURCES])
+
+            # Every member of the group is coded somehow, so every one has to
+            # appear in the bill. Counting only the members eligible to be
+            # targets makes a source with few eligible neighbours look cheap
+            # for the wrong reason -- the ones it cannot claim are still there,
+            # still being coded, just not on its tab.
+            alone = {i: coded(samples[i]) for i in range(len(group))}
+            pair: dict = {}
+            for a in cand:
+                for j in range(len(group)):
+                    if j == a or (min(a, j), max(a, j)) in pair:
+                        continue
+                    if samples[a] == samples[j]:
+                        pair[(min(a, j), max(a, j))] = None  # dedup's job
+                        continue
+                    pair[(min(a, j), max(a, j))] = coded(
+                        bytes(kernels.xor_bytes(samples[j], samples[a])))
+
+            tpos = {group.index(t[:3]): t for t in targets}
+
+            def bill(a):
+                total = alone[a]
+                picks = []
+                for j in range(len(group)):
+                    if j == a:
+                        continue
+                    t = tpos.get(j)
+                    d = pair.get((min(a, j), max(a, j))) if t is not None else None
+                    if d is not None and d < alone[j] * (1 - DELTA_MIN_GAIN):
+                        total += d
+                        picks.append((t, a))
+                    else:
+                        total += alone[j]
+                return total, picks
+
+            best = None
+            for a in cand:
+                total, picks = bill(a)
+                key = (total, hashlib.blake2b(samples[a], digest_size=8).digest())
+                if best is None or key < best[0]:
+                    best = (key, picks)
+            if best is None or not best[1]:
+                return None
+            out = []
+            for (idx, s, e, _r), a in best[1]:
+                sidx, ss, _se = group[a]
+                out.append((idx, s, e, members[sidx].dst + ss))
+            return out
 
         deltas: dict[int, list] = {}
         covered = 0
         for got in unordered_map(decide, work, workers):
-            if got is None:
+            if not got:
                 continue
-            idx, s, e, src = got
-            deltas.setdefault(idx, []).append((s, e, src))
-            covered += e - s
+            for idx, s, e, src in got:
+                deltas.setdefault(idx, []).append((s, e, src))
+                covered += e - s
     finally:
         pool.close()
     for items in deltas.values():
