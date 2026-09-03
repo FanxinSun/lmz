@@ -1325,6 +1325,18 @@ def test_append_grows_an_archive_like_one_shot():
         assert abs(g - o) < max(4096, o // 200), (g, o)
         assert g < sum(len(b) for b in steps) * 0.9
 
+        # Both archives, not just the grown one. Comparing sizes catches a
+        # source choice that codes more than it should -- that is how the 2026-09-03
+        # rewrite of the chooser was caught here -- but only because the damage
+        # happened to change the total. An archive of the right size whose refs
+        # or deltas resolve through each other would have passed: nothing in
+        # this test ever decoded `one`, and compressing does not verify.
+        lmz.verify(one)
+        one_out = os.path.join(d, "one_back")
+        lmz.decompress(one, one_out)
+        for i, p in enumerate(names):
+            assert digest(p) == digest(os.path.join(one_out, f"ck{i}.safetensors"))
+
         lmz.verify(grown)
         out = os.path.join(d, "back")
         lmz.decompress(grown, out)

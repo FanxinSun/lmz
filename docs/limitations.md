@@ -98,6 +98,14 @@
   thread can only take the interpreter lock away from the thread whose reply
   the reader is waiting on. This is the one place where the interpreter build
   changes what lmz can do rather than just how fast it does it.
+- **Three tests fail with `LMZ_NO_NATIVE=1`** as of 2026-09-03:
+  `test_capabilities_are_declared_not_inferred`,
+  `test_gpu_device_entry_point_owns_nothing` (an `UnboundLocalError` on `ptrs`)
+  and `test_gpu_verify_reports_this_machine`. They are about the GPU and
+  capability reporting rather than the codec, and the suite is green on the
+  native kernel, which is what CI runs. Recorded here because the fallback path
+  is the one nobody exercises by accident, and a failure sitting in it is easy
+  to inherit and hard to date.
 - **Mounting is Linux-only and needs `fuse3`.** `fusermount3` must be on PATH
   and `/dev/fuse` readable; `lmz doctor` reports whether it is. The store and
   its random-access reader work everywhere, mount or no mount. Serving mmap
