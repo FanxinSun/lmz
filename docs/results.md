@@ -101,16 +101,24 @@ The corpus is Qwen2.5-0.5B and four full fine-tunes of it — `-Instruct`,
 `Coder-0.5B`, `numind/NuExtract-1.5-tiny`, `alamios/DeepSeek-R1-DRAFT` — 4.941
 GB, all BF16, weights only.
 
-| | archive | saved |
-|---|---|---|
-| ZipLLM's method, zstd -1 | 2.9239 GB | 40.82% |
-| ZipLLM's method, zstd -3 | 2.9353 GB | 40.59% |
-| ZipLLM's method, zstd -19 | 2.8479 GB | 42.36% |
-| lmz's coder in that same pipeline | 2.4168 GB | 51.08% |
-| **lmz as shipped** | **2.3940 GB** | **51.55%** |
+| | archive | saved | time |
+|---|---|---|---|
+| ZipLLM's method, zstd -1 | 2.9239 GB | 40.82% | 27 s |
+| ZipLLM's method, zstd -3 | 2.9353 GB | 40.59% | — |
+| ZipLLM's method, zstd -19 | 2.8479 GB | 42.36% | 1143 s |
+| lmz's coder in that same pipeline | 2.4168 GB | 51.08% | 28 s |
+| **lmz as shipped** | **2.3940 GB** | **51.55%** | **5.6 s** |
 
-zstd -19 is their strongest setting and buys 1.5 points over -1 for 37 times
-the wall clock. The gap is the coder: on the XOR residuals themselves lmz beats
+The first four rows are one single-threaded harness that does nothing but code,
+and they are comparable to each other. The last is the tool: threaded, writing a
+real archive, checksumming every chunk — 5.6 s to compress and 8.8 s to
+decompress, and not comparable to the rows above it. Each coder was timed on its
+own; a run that codes two of them and is then divided by a run that codes two
+others gives a ratio of nothing in particular, which is how this table came to
+say "37 times" before it was measured properly.
+
+zstd -19 is their strongest setting: it buys 1.5 points over -1 and costs about
+forty times as long. The gap is the coder: on the XOR residuals themselves lmz beats
 zstd by 23–54% across update sizes from 1e-4 to 1e-1, against -1 and -19 both.
 The exponent field of `a XOR b` is not an exponent, which looked like it should
 cost lmz its field split — but those bits are then almost always zero, 0.00 to
