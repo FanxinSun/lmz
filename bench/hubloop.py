@@ -128,6 +128,16 @@ def setup(ref="main", quiet=True):
         subprocess.run(cmd, check=True)
     else:
         log("nothing to install")
+        if sha:
+            # A warm runtime keeps whatever it already has. Say so, because a
+            # pinned ref that silently did not take is how a campaign ends up
+            # with rows attributed to a build that never ran: restarting the
+            # runtime is what actually changes the version.
+            have = lmz_version()
+            if not have.startswith(sha[:7]):
+                log(f"NOTE: lmz {have} is already installed and was kept; "
+                    f"{sha} was requested. Restart the runtime to change it. "
+                    f"The ledger records what is installed.")
     return sha
 
 
@@ -482,18 +492,28 @@ def check_member(arc, ft_dir, tag, scratch):
 def lmz_version():
     """What goes in the ledger's lmz_commit column.
 
-    The sha when it is known, so a row from Colab and a row from the local
-    tree name the same thing and can be compared without guessing. The
-    distribution version is only the fallback for a run that did not install
-    anything and has no record of what it is using.
+    What is INSTALLED, not what was asked for. `setup` installs nothing when
+    lmz is already importable, so on a warm runtime a pinned --lmz-ref would
+    otherwise be written into every row while an older build did the work: a
+    ledger claiming a provenance it does not have, which is worse than none.
+    pip records the commit it resolved a VCS install from in direct_url.json,
+    so ask that first; the version string and the requested ref are fallbacks
+    for a build with no such record.
     """
-    if LMZ_REF:
-        return LMZ_REF
+    try:
+        from importlib.metadata import distribution
+        info = json.loads(distribution("lmzip").read_text("direct_url.json"))
+        sha = (info.get("vcs_info") or {}).get("commit_id")
+        if sha:
+            return sha[:7]
+    except Exception:
+        pass
     try:
         from importlib.metadata import version
         return f"lmzip-{version('lmzip')}"
     except Exception:
-        return "lmzip-?"
+        pass
+    return LMZ_REF or "lmzip-?"
 
 
 # ------------------------------------------------------------------- state
