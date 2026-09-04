@@ -991,11 +991,17 @@ def selftest():
     # 1. The token as a SUBPROCESS sees it. `!python` gets no Colab kernel
     #    channel, so a secret read only in the notebook is invisible here.
     env = dict(os.environ, HF_TOKEN="selftest-not-a-real-token")
+    # Imported by whatever this file is actually called: the cell that fetches
+    # it chooses the name, and a check that only passes under one of them is
+    # not a check.
+    here = os.path.abspath(__file__)
     r = subprocess.run(
         [sys.executable, "-c",
-         "import sys; sys.path.insert(0, %r); import hubloop; "
-         "print('SEEN' if hubloop.token() else 'MISSING')"
-         % os.path.dirname(os.path.abspath(__file__))],
+         "import sys, importlib; sys.path.insert(0, %r); "
+         "m = importlib.import_module(%r); "
+         "print('SEEN' if m.token() else 'MISSING')"
+         % (os.path.dirname(here),
+            os.path.splitext(os.path.basename(here))[0])],
         capture_output=True, text=True, env=env)
     ok("SEEN" in r.stdout, "a subprocess sees HF_TOKEN from the environment")
 
