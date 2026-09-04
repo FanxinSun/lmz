@@ -368,6 +368,28 @@ class ArchiveWriter:
             self.version = need
         self.offset += clen
 
+    def alias(self, off: int, clen: int, dst: int, rlen: int, crc: int,
+              codec: int, esize: int, flags: int) -> None:
+        """Record a chunk whose payload is one already in the file.
+
+        Nothing is written. Two chunks with the same stored bytes and the same
+        codec, element size, flags, length and checksum decode to the same
+        thing, so the second only needs a table entry pointing at the first.
+        The offset in a record has always been explicit and readers resolve a
+        payload by (off, clen) without assuming those are unique, so this is
+        the format as it stands rather than a change to it.
+
+        This is what makes an exact re-upload free even when its twin is
+        stored as a difference: a reference may only name a plain chunk, but
+        sharing a payload is not a reference -- both entries still name the
+        plain source they were coded against, and resolution stays one hop.
+        """
+        self.chunks.append(Chunk(off, dst, clen, rlen, crc, codec, esize,
+                                 flags))
+        need = CODEC_MIN_VERSION.get(codec)
+        if need is not None and need > self.version:
+            self.version = need
+
     def close(self, original_size: int) -> None:
         table = b"".join(c.pack() for c in self.chunks)
         table_c = _zstd_compress(table, 3)

@@ -219,12 +219,20 @@ def cmd_append(args) -> int:
     bar = Progress("appending", not args.quiet)
     stats = api.append(args.archive, args.input, level=args.level,
                        workers=args.threads, checksum=not args.no_checksum,
-                       delta=not args.no_delta, progress=bar)
+                       dedup=not args.no_dedup, delta=not args.no_delta,
+                       progress=bar)
     bar.done()
     if not args.quiet:
         print(f"{args.input} -> {args.archive}")
         print(f"  added {human(stats.input_bytes)}, archive now "
               f"{human(stats.output_bytes)}  {stats.seconds:.2f}s")
+        dd = stats.detail.get("dedup_bytes", 0)
+        if dd:
+            print(f"  {human(dd)} already in the archive, stored once")
+        sh = stats.detail.get("shared_bytes", 0)
+        if sh:
+            print(f"  {human(sh)} of coded payload shared with what was "
+                  f"already there")
         d = stats.detail.get("delta_bytes", 0)
         if d:
             print(f"  {human(d)} coded as differences from what was already there")
@@ -646,6 +654,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap_.add_argument("input")
     ap_.add_argument("-l", "--level", type=int, default=api.DEFAULT_LEVEL)
     ap_.add_argument("--no-checksum", action="store_true")
+    ap_.add_argument("--no-dedup", action="store_true",
+                     help="skip duplicate-tensor detection against what is "
+                          "already there")
     ap_.add_argument("--no-delta", action="store_true",
                      help="skip delta coding against what is already there")
     common(ap_)

@@ -407,7 +407,7 @@ def _find_duplicate_tensors(paths: list[str], members: list[Member],
 
 def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
            workers: int | None = None, checksum: bool = True,
-           delta: bool = True, progress=None) -> Stats:
+           dedup: bool = True, delta: bool = True, progress=None) -> Stats:
     """Add files to an existing archive, coded against what is already in it.
 
     This is what makes the corpus-level savings reachable in practice. A
@@ -466,15 +466,28 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
 
     arc = MappedArchive(archive, verify=False, cache_blocks=8)
     try:
+        refs_by_member: dict[int, list] = {}
+        dedup_bytes = 0
+        if dedup:
+            refs_by_member, dedup_bytes = _find_append_refs(
+                paths, members, layouts, old_members, arc)
+
+        # Dedup before delta, as the one-shot path does: a tensor already in
+        # the archive byte for byte becomes a reference costing eight bytes,
+        # not a difference of all zeros -- and, more to the point, not a
+        # difference against something else entirely when its twin is itself
+        # delta-coded and so cannot be named as a base.
         deltas_by_member: dict[int, list] = {}
         delta_bytes = 0
         if delta:
             deltas_by_member, delta_bytes = _find_append_deltas(
-                paths, members, layouts, old_members, arc, level)
+                paths, members, layouts, old_members, arc, level,
+                refs_by_member)
 
         plan: list[tuple] = []
         for idx, layout in enumerate(layouts):
             for task in chunkify(layout, sizes[idx], chunk_size,
+                                 refs=refs_by_member.get(idx),
                                  deltas=deltas_by_member.get(idx)):
                 plan.append((idx,) + task)
 
@@ -483,10 +496,20 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
         tally = _codec.MethodTally()
         stats = Stats(input_bytes=total_new, files=len(members),
                       chunks=len(plan),
-                      detail={"delta_bytes": delta_bytes, "appended": True})
+                      detail={"delta_bytes": delta_bytes,
+                              "dedup_bytes": dedup_bytes, "appended": True})
 
         def work(task):
             idx, start, end, esize, kind, src_off, btype, ikind = task
+            if kind == KIND_REF:
+                # The bytes equal a range already in the archive; nothing is
+                # read and nothing needs a checksum of its own, since the
+                # source chunks carry theirs and resolution decodes through
+                # them. The one-shot path has always done this; without it
+                # here a reference fell through to plain coding and cost more
+                # than the difference it replaced.
+                return (members[idx].dst + start, end - start,
+                        [struct.pack("<Q", src_off)], CODEC_REF, 1, 0, 0)
             data = os.pread(pool.get(idx), end - start, start)
             if len(data) != end - start:
                 raise IOError(f"short read on {members[idx].path} at {start}")
@@ -512,20 +535,64 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
         if delta_bytes:
             manifest["delta_bytes"] = (old_manifest.get("delta_bytes", 0)
                                        + delta_bytes)
+        if dedup_bytes:
+            manifest["dedup_bytes"] = (old_manifest.get("dedup_bytes", 0)
+                                       + dedup_bytes)
+
+        # Chunks with the same stored payload decode to the same bytes, so the
+        # second needs only a table entry pointing at the first. This is what
+        # makes an exact re-upload free even when its twin is held as a
+        # difference: the copy codes to the same difference against the same
+        # plain source, and that payload is already in the file. A reference
+        # could not do it -- a reference may only name a plain chunk -- but
+        # sharing a payload is not a reference, and resolution stays one hop.
+        payload_at: dict = {}
+        if dedup:
+            for c in old_chunks:
+                payload_at.setdefault(
+                    (c.codec, c.esize, c.flags, c.rlen, c.crc, c.clen),
+                    []).append(c.off)
+        shared_bytes = 0
 
         with open(archive, "r+b") as out:
             writer = ArchiveWriter(out, manifest, flags=reader.flags,
                                    align=PAGE_ALIGN if reader.aligned else 0,
                                    resume_at=table_off, chunks=old_chunks)
+            rfd = os.open(archive, os.O_RDONLY)
             nw = _worker_cap([e - s for _i, s, e, *_r in plan], workers)
             for results in ordered_map(
                     work_batch, _batches(plan, lambda t: t[2] - t[1]), nw,
                     lookahead=nw * 2):
                 for dst_off, rlen, parts, cid, esize, flags, crc in results:
-                    writer.append(parts, dst_off, rlen, crc, cid, esize, flags)
+                    clen = sum(len(p) for p in parts)
+                    key = (cid, esize, flags, rlen, crc, clen)
+                    cands = payload_at.get(key) if dedup else None
+                    hit = None
+                    if cands:
+                        # Only now is the payload worth materialising, and the
+                        # comparison is exact rather than a digest: a shared
+                        # payload is a claim about every byte, and one that
+                        # agreed by chance would put wrong data in the archive.
+                        blob = b"".join(bytes(p) for p in parts)
+                        out.flush()
+                        for off in cands:
+                            if os.pread(rfd, clen, off) == blob:
+                                hit = off
+                                break
+                    if hit is None:
+                        writer.append(parts, dst_off, rlen, crc, cid, esize,
+                                      flags)
+                        if dedup:
+                            payload_at.setdefault(key, []).append(
+                                writer.chunks[-1].off)
+                    else:
+                        writer.alias(hit, clen, dst_off, rlen, crc, cid, esize,
+                                     flags)
+                        shared_bytes += clen
                     done += rlen
                 if progress:
                     progress(done, total_new)
+            os.close(rfd)
             # The table describes the whole archive after an append, so the
             # method counts have to as well.
             merged = _codec.merge_methods(old_manifest.get("methods"),
@@ -539,13 +606,107 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
     finally:
         arc.close()
 
+    stats.detail["shared_bytes"] = shared_bytes
     stats.detail["methods"] = tally.to_json()   # this append's share, not the whole
     stats.output_bytes = os.path.getsize(archive)
     stats.seconds = time.perf_counter() - started
     return stats
 
 
-def _find_append_deltas(paths, members, layouts, old_members, arc, level):
+def _same_bytes(path, s, e, arc, src, window=1 << 20):
+    """Whether a file range and an archive range hold the same bytes.
+
+    A sample first, because almost every candidate differs immediately and
+    decoding the archive side is the expensive part. Then in full, because a
+    reference is a claim about every byte: a sampled digest that agreed by
+    chance would put wrong data in the archive and nothing downstream would
+    notice until someone decompressed it.
+    """
+    n = e - s
+    with open(path, "rb") as fh:
+        probe = min(1 << 16, n)
+        fh.seek(s)
+        if fh.read(probe) != arc.read(src, probe):
+            return False
+        fh.seek(s)
+        off = 0
+        while off < n:
+            k = min(window, n - off)
+            if fh.read(k) != arc.read(src + off, k):
+                return False
+            off += k
+    return True
+
+
+def _find_append_refs(paths, members, layouts, old_members, arc,
+                      max_candidates=8):
+    """Incoming tensors that are already in the archive, byte for byte.
+
+    A reference costs eight bytes and may name any tensor already stored,
+    including one held as a difference -- resolving it follows the target's
+    own chain, which the decoder does for its members anyway. That is the
+    whole point of having it: the duplicate of a fine-tune arrives after that
+    fine-tune has been delta-coded against its base, and a delta may only name
+    a plain chunk, so without a reference path the copy is coded against the
+    base a second time and costs exactly what its twin cost.
+
+    Measured on the hub against ZipLLM's method, that was five byte-identical
+    re-uploads of one Qwen3.5-0.8B fine-tune charged 0.76 GB each. The one-shot
+    path has always had this right, which is why compressing the same files
+    together beat growing the archive one at a time.
+    """
+    # A reference may only name a plain chunk, exactly as a delta may: sources
+    # are decoded straight from the archive so that decompression stays a bag
+    # of independent jobs, and naming a coded chunk would make resolution a
+    # chain of unknown depth. The one-shot path satisfies this by keeping a
+    # dedup target plain and letting something else delta against *it*; an
+    # append cannot rewrite what is already written, so a duplicate of a
+    # member already held as a difference is out of reach here. See
+    # `test_append_cannot_dedup_a_copy_of_a_delta_coded_member`, which pins
+    # that limit and what it costs.
+    coded = [(c.dst, c.dst + c.rlen) for c in arc._chunks
+             if c.codec in (CODEC_DELTA, CODEC_REF)]
+
+    def is_plain(lo, hi):
+        return not any(cs < hi and lo < ce for cs, ce in coded)
+
+    known: dict = {}
+    for m in old_members:
+        for name, meta in (m.tensors or {}).items():
+            s, e = meta["offsets"]
+            if e - s < DEDUP_MIN_TENSOR or not is_plain(m.dst + s, m.dst + e):
+                continue
+            known.setdefault((name, meta.get("dtype", ""), e - s),
+                             []).append(m.dst + s)
+    if not known:
+        return {}, 0
+
+    refs: dict[int, list] = {}
+    covered = 0
+    for idx, layout in enumerate(layouts):
+        seen: set[tuple[int, int]] = set()
+        for name, meta in ((layout.tensors or {}) if layout else {}).items():
+            s, e = meta["offsets"]
+            # Aliased names over one range would emit the same reference twice.
+            if (s, e) in seen or e - s < DEDUP_MIN_TENSOR:
+                continue
+            # Newest first, and only a few: a re-upload almost always follows
+            # the model it copies, and every candidate that does not match
+            # costs a decode of the archive side to find that out.
+            cands = known.get((name, meta.get("dtype", ""), e - s)) or ()
+            for src in list(reversed(cands))[:max_candidates]:
+                if _same_bytes(paths[idx], s, e, arc, src):
+                    seen.add((s, e))
+                    refs.setdefault(idx, []).append((s, e, src))
+                    covered += e - s
+                    break
+    for items in refs.values():
+        items.sort()
+    return refs, covered
+
+
+def _find_append_deltas(paths, members, layouts, old_members, arc, level,
+                        refs_by_member=None):
     """New tensors that are close to one already in the archive.
 
     Same rule as within a single job -- matched by name, dtype and size, and
@@ -577,8 +738,13 @@ def _find_append_deltas(paths, members, layouts, old_members, arc, level):
     covered = 0
     for idx, layout in enumerate(layouts):
         region_at = {r.start: r for r in (layout.regions if layout else ())}
+        # A range already a reference is done: it costs eight bytes, which no
+        # difference will beat, and coding it twice would be a contradiction.
+        taken = {(s, e) for s, e, _src in (refs_by_member or {}).get(idx, ())}
         for name, meta in ((layout.tensors or {}) if layout else {}).items():
             s, e = meta["offsets"]
+            if (s, e) in taken:
+                continue
             key = (name, meta.get("dtype", ""), e - s)
             src_off = known.get(key)
             r = region_at.get(s)

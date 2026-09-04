@@ -4060,5 +4060,135 @@ def main() -> int:
     return 1 if failed else 0
 
 
+def test_append_dedups_a_copy_of_a_plain_member():
+    """A re-upload of something stored plainly costs a reference, not a copy.
+
+    The hub is full of exact re-uploads, and `compress` has always taken them
+    for eight bytes: it deduplicates before it deltas. `append` had no
+    reference path at all, so a duplicate was coded against whatever base was
+    nearest and charged nearly in full. Found by measuring the hub against
+    ZipLLM's method, where the same three files scored 194 MiB compressed in
+    one shot against 197 MiB grown one at a time.
+    """
+    base = weights_bf16(700000, 61)
+    with tempfile.TemporaryDirectory() as d:
+        first = os.path.join(d, "first")
+        os.makedirs(first)
+        write_safetensors(os.path.join(first, "base.safetensors"),
+                          [("layer.0.weight", "BF16", [700000], base)])
+        p_copy = os.path.join(d, "copy.safetensors")
+        write_safetensors(p_copy,
+                          [("layer.0.weight", "BF16", [700000], base)])
+
+        arc = os.path.join(d, "fam.lmz")
+        lmz.compress(first, arc)
+        before = os.path.getsize(arc)
+        stats = lmz.append(arc, p_copy)
+        cost = os.path.getsize(arc) - before
+
+        assert stats.detail["dedup_bytes"] == len(base), stats.detail
+        assert cost < 4096, cost
+
+        out = os.path.join(d, "out")
+        lmz.decompress(arc, out)
+        got = open(os.path.join(out, "copy.safetensors"), "rb").read()
+        assert got[-len(base):] == base
+
+
+def test_append_dedups_a_copy_of_a_delta_coded_member():
+    """A re-upload is free even when its twin is stored as a difference.
+
+    This is the hub's normal shape, not a corner: a fine-tune deltas well
+    against its base -- that is what the delta coding is for -- and exact
+    re-uploads of that fine-tune are everywhere. The copy cannot be a
+    reference, because a reference may only name a plain chunk: sources are
+    decoded straight from the archive so decompression stays a bag of
+    independent jobs, and naming a coded chunk would make resolution a chain
+    of unknown depth.
+
+    It does not need to be one. The copy codes to the same difference against
+    the same plain source, so its stored payload is byte for byte the payload
+    already in the file, and a chunk record can simply point at it. Both
+    entries still name the plain source they were coded against, so resolution
+    is still a single hop.
+
+    Found by measuring the hub against ZipLLM's method: five byte-identical
+    re-uploads of one Qwen3.5-0.8B fine-tune were charged 0.76 GB each, which
+    ZipLLM's per-tensor dedup took for nothing.
+    """
+    base = weights_bf16(700000, 61)
+    ft = nudged_bf16(base, 70)
+    assert ft != base
+    with tempfile.TemporaryDirectory() as d:
+        first = os.path.join(d, "first")
+        os.makedirs(first)
+        write_safetensors(os.path.join(first, "base.safetensors"),
+                          [("layer.0.weight", "BF16", [700000], base)])
+        p_ft = os.path.join(d, "ft.safetensors")
+        write_safetensors(p_ft, [("layer.0.weight", "BF16", [700000], ft)])
+        p_copy = os.path.join(d, "copy.safetensors")
+        shutil.copy(p_ft, p_copy)
+
+        arc = os.path.join(d, "fam.lmz")
+        lmz.compress(first, arc)
+        before = os.path.getsize(arc)
+        lmz.append(arc, p_ft)
+        after_ft = os.path.getsize(arc)
+        st = lmz.append(arc, p_copy)
+        cost_ft = after_ft - before
+        cost_copy = os.path.getsize(arc) - after_ft
+
+        assert st.detail["shared_bytes"] > 0, st.detail
+        assert cost_copy < max(cost_ft // 100, 4096), (cost_ft, cost_copy)
+
+        # Sharing a payload is only legitimate if it reads back exactly.
+        lmz.verify(arc)
+        out = os.path.join(d, "out")
+        lmz.decompress(arc, out)
+        for name in ("ft.safetensors", "copy.safetensors"):
+            got = open(os.path.join(out, name), "rb").read()
+            assert got[-len(ft):] == ft, name
+        got = open(os.path.join(out, "base.safetensors"), "rb").read()
+        assert got[-len(base):] == base
+
+
+def test_shared_payloads_survive_a_second_append():
+    """A third copy shares with the first, and the archive still reads back.
+
+    The index has to carry chunks written by this append as well as the ones
+    already in the file, or only the first duplicate of a run is cheap.
+    """
+    base = weights_bf16(400000, 91)
+    ft = nudged_bf16(base, 92)
+    with tempfile.TemporaryDirectory() as d:
+        first = os.path.join(d, "first")
+        os.makedirs(first)
+        write_safetensors(os.path.join(first, "base.safetensors"),
+                          [("layer.0.weight", "BF16", [400000], base)])
+        arc = os.path.join(d, "fam.lmz")
+        lmz.compress(first, arc)
+
+        costs = []
+        prev = os.path.getsize(arc)
+        for i in range(4):
+            p = os.path.join(d, f"copy{i}.safetensors")
+            write_safetensors(p, [("layer.0.weight", "BF16", [400000], ft)])
+            lmz.append(arc, p)
+            now = os.path.getsize(arc)
+            costs.append(now - prev)
+            prev = now
+
+        assert costs[0] > 1000, costs
+        for c in costs[1:]:
+            assert c < max(costs[0] // 100, 4096), costs
+
+        lmz.verify(arc)
+        out = os.path.join(d, "out")
+        lmz.decompress(arc, out)
+        for i in range(4):
+            got = open(os.path.join(out, f"copy{i}.safetensors"), "rb").read()
+            assert got[-len(ft):] == ft, i
+
+
 if __name__ == "__main__":
     sys.exit(main())
