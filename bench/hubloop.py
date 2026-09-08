@@ -144,10 +144,17 @@ def setup(ref="main", quiet=True):
 def token():
     """The user's Hugging Face token, from their keystrokes, never from here.
 
-    Colab secrets first, then the environment, then the file huggingface_hub
-    writes. It leaves only as an Authorization header: nothing in this file
-    prints it, logs it, or writes it anywhere.
+    The environment comes first.  A notebook puts its secret there before it
+    starts this runner, and that runner is a child Python process: Colab's
+    notebook-only secret bridge can wait forever from a child even though the
+    inherited environment is ready.  Direct notebook use still falls back to
+    Colab secrets, then to the file huggingface_hub writes.  It leaves only as
+    an Authorization header: nothing in this file prints it, logs it, or
+    writes it anywhere.
     """
+    t = os.environ.get("HF_TOKEN")
+    if t:
+        return t.strip()
     try:
         from google.colab import userdata          # type: ignore
         t = userdata.get("HF_TOKEN")
@@ -155,9 +162,6 @@ def token():
             return t.strip()
     except Exception:
         pass
-    t = os.environ.get("HF_TOKEN")
-    if t:
-        return t.strip()
     for p in ("~/.cache/huggingface/token", "~/.huggingface/token"):
         f = os.path.expanduser(p)
         try:
@@ -1008,22 +1012,32 @@ def selftest():
     os.makedirs(state_dir)
     scratch = os.path.join(root, "scratch")
 
-    # 1. The token as a SUBPROCESS sees it. `!python` gets no Colab kernel
-    #    channel, so a secret read only in the notebook is invisible here.
+    # 1. The token as a SUBPROCESS uses the inherited environment without
+    #    asking Colab's notebook-only secret bridge.  The bridge can wait
+    #    forever in a child Python process, which leaves a cell looking busy
+    #    before the runner prints its first line.
     env = dict(os.environ, HF_TOKEN="selftest-not-a-real-token")
     # Imported by whatever this file is actually called: the cell that fetches
     # it chooses the name, and a check that only passes under one of them is
     # not a check.
     here = os.path.abspath(__file__)
-    r = subprocess.run(
-        [sys.executable, "-c",
-         "import sys, importlib; sys.path.insert(0, %r); "
-         "m = importlib.import_module(%r); "
-         "print('SEEN' if m.token() else 'MISSING')"
-         % (os.path.dirname(here),
-            os.path.splitext(os.path.basename(here))[0])],
-        capture_output=True, text=True, env=env)
-    ok("SEEN" in r.stdout, "a subprocess sees HF_TOKEN from the environment")
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import sys, importlib, time, types; "
+             "userdata = types.SimpleNamespace(get=lambda _: time.sleep(60)); "
+             "colab = types.ModuleType('google.colab'); colab.userdata = userdata; "
+             "google = types.ModuleType('google'); google.colab = colab; "
+             "sys.modules.update({'google': google, 'google.colab': colab}); "
+             "sys.path.insert(0, %r); m = importlib.import_module(%r); "
+             "print('SEEN' if m.token() else 'MISSING')"
+             % (os.path.dirname(here),
+                os.path.splitext(os.path.basename(here))[0])],
+            capture_output=True, text=True, env=env, timeout=3)
+        token_seen = "SEEN" in r.stdout
+    except subprocess.TimeoutExpired:
+        token_seen = False
+    ok(token_seen, "a subprocess uses HF_TOKEN without querying Colab secrets")
 
     # 2. Real bytes. The distilbert base fetched by the local loop if it is
     #    here, else something with the same shape, plus a fine-tune of it and
