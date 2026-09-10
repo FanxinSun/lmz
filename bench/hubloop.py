@@ -538,6 +538,7 @@ class State:
         self.hold = os.path.join(self.root, "HOLD")
         self.closed = os.path.join(self.root, "closed.json")
         self.st = self._load()
+        self.reconcile_ledger()
 
     def _load(self):
         st = {"bytes": 0, "secs": 0.0, "code_s": 0.0, "models": 0,
@@ -561,6 +562,98 @@ class State:
             st.setdefault(k, v)
         return st
 
+    def _ledger_rows(self):
+        """Return the recognised durable header and its data rows."""
+        try:
+            with open(self.ledger, newline="") as fh:
+                rows = list(csv.reader(fh))
+        except Exception:
+            return LEDGER_COLS, []
+        if rows and rows[0] == LEDGER_COLS:
+            return rows[0], rows[1:]
+        # Never rewrite a file whose shape we do not understand.
+        return None, []
+
+    @staticmethod
+    def _unique_rows(rows):
+        """Keep the latest measurement of each (family, repo) pair.
+
+        A family remeasurement supersedes an earlier row for the same model.
+        A repo can legitimately occur under different bases, so its family is
+        part of the identity.
+        """
+        seen, kept = set(), []
+        for row in reversed(rows):
+            key = tuple(row[:2]) if len(row) >= 2 and row[0] and row[1] else None
+            if key is not None and key in seen:
+                continue
+            if key is not None:
+                seen.add(key)
+            kept.append(row)
+        return list(reversed(kept))
+
+    def _write_ledger(self, header, rows):
+        tmp = self.ledger + ".tmp"
+        with open(tmp, "w", newline="") as fh:
+            csv.writer(fh).writerows([header] + rows)
+        os.replace(tmp, self.ledger)
+
+    @staticmethod
+    def _number(row, index):
+        try:
+            return float(row[index])
+        except (IndexError, TypeError, ValueError):
+            return 0.0
+
+    def _recount_ledger(self, rows):
+        """Make durable rows, dashboard figures and final summary agree.
+
+        Base-download bytes are not ledger columns.  After a recovery the
+        rebuilt rate is therefore fine-tune-only, which is honest and much
+        better than compression totals that include rows just discarded.
+        """
+        st = self.st
+        totals = {"raw": 0.0, "dedup": 0.0, "zstd": 0.0,
+                  "lmzc": 0.0, "shipped": 0.0, "secs": 0.0,
+                  "code_s": 0.0}
+        columns = {"raw": 3, "dedup": 4, "zstd": 5, "lmzc": 6,
+                   "shipped": 7, "secs": 8, "code_s": 9}
+        hist, repos = {}, set()
+        for row in rows:
+            family = row[1] if len(row) > 1 else ""
+            repo = row[0] if row else ""
+            if repo:
+                repos.add(repo)
+            acc = hist.setdefault(family, {"n": 0})
+            acc["n"] += 1
+            for name, index in columns.items():
+                value = self._number(row, index)
+                totals[name] += value
+                if name in ("raw", "dedup", "zstd", "lmzc", "shipped"):
+                    acc[name] = acc.get(name, 0.0) + value
+        st.update(totals)
+        st["models"] = len(rows)
+        st["bytes"] = totals["raw"]
+        st["fam_hist"] = hist
+        st["families"] = len(st["fam_closed"])
+        st["gated"] = (len(set(st["unavailable"])) +
+                       sum(reason == "base unavailable"
+                           for reason in st["fam_closed"].values()))
+        st["digests"] = {repo: digest for repo, digest in st["digests"].items()
+                         if repo in repos}
+
+    def reconcile_ledger(self):
+        """Discard superseded measurements and rebuild aggregate state."""
+        header, rows = self._ledger_rows()
+        if header is None:
+            return
+        unique = self._unique_rows(rows)
+        if len(unique) != len(rows):
+            self._write_ledger(header, unique)
+            log(f"  reconciled the ledger: removed {len(rows) - len(unique)} "
+                "superseded measurement row(s)")
+        self._recount_ledger(unique)
+
     def drop_family(self, base):
         """Forget a family entirely: its rows AND its dedup hashes.
 
@@ -576,18 +669,23 @@ class State:
         h = os.path.join(self.root, "hashes", base.replace("/", "__") + ".json")
         if os.path.exists(h):
             os.unlink(h)
-        try:
-            rows = list(csv.reader(open(self.ledger)))
-        except Exception:
+        header, rows = self._ledger_rows()
+        if header is None:
             return
-        if not rows:
-            return
-        keep = [rows[0]] + [r for r in rows[1:] if len(r) < 2 or r[1] != base]
-        dropped = len(rows) - len(keep)
-        if dropped:
-            with open(self.ledger + ".tmp", "w", newline="") as fh:
-                csv.writer(fh).writerows(keep)
-            os.replace(self.ledger + ".tmp", self.ledger)
+        forgotten = [r for r in rows if len(r) >= 2 and r[1] == base]
+        keep = [r for r in rows if len(r) < 2 or r[1] != base]
+        unique = self._unique_rows(keep)
+        dropped = len(forgotten)
+        if dropped or len(unique) != len(keep):
+            self._write_ledger(header, unique)
+        for row in forgotten:
+            if row:
+                self.st["digests"].pop(row[0], None)
+        self.st["fam_closed"].pop(base, None)
+        self.st["fam_flags"].pop(base, None)
+        self.st["fam_evidence"].pop(base, None)
+        self.st["fam_hist"].pop(base, None)
+        self._recount_ledger(unique)
         log(f"  forgot {base}: {dropped} rows and its hashes")
 
     def save(self):
@@ -631,7 +729,7 @@ class State:
         }
         if planned and rate > 0:
             p["days_left_at_this_rate"] = round(
-                (planned - st["bytes"]) / rate / 86400, 1)
+                max(planned - st["bytes"], 0) / rate / 86400, 1)
         try:
             tmp = os.path.join(self.root, "progress.json.tmp")
             json.dump(p, open(tmp, "w"), indent=1)
@@ -748,6 +846,8 @@ def hold(state, base, criterion, numbers):
         fh.write("the fix belongs in lmz's tree, not here; this runner "
                  "refetches the family when it is told to continue\n")
     log(f"HOLD written: {base} — {criterion}")
+    if numbers.get("error"):
+        log(f"  HOLD detail: {numbers['error']}")
 
 
 def run(state, scratch, reverse, others_closed, max_models=None):
@@ -818,7 +918,6 @@ def run(state, scratch, reverse, others_closed, max_models=None):
                 state.drop_family(base)
                 covered = state.measured() | set(st["unavailable"])
                 st["ft"] = 0
-                st["fam_hist"].pop(base, None)
             st["prev"] = archive_start(bdir, arc, scratch)
             st["fam_arc"] = base
         seen = state.seen_load(base)
@@ -949,6 +1048,9 @@ def run(state, scratch, reverse, others_closed, max_models=None):
         st["families"] += 1
         st["fam_closed"][base] = why
         st["cur_fam"], st["ft"] = None, 0
+        # The archive has just been removed.  Do not leave metadata saying a
+        # later Colab process can continue to append to it.
+        st["fam_arc"], st["prev"] = None, 0
         shutil.rmtree(scratch, ignore_errors=True)
         state.save()
         state.progress(planned, f"finished {base}")
@@ -1091,6 +1193,10 @@ def selftest():
         ok(os.path.exists(os.path.join(state_dir, "progress.json")),
            "progress.json is written")
 
+        # Colab's scratch disk is temporary.  A runner resumed after the
+        # archive disappears must discard that partial family's rows and
+        # hashes, then measure the family again from a consistent zero point.
+        shutil.rmtree(scratch, ignore_errors=True)
         st2 = State(state_dir, "selftest")          # a fresh process would
         run(st2, scratch, reverse=False, others_closed=set())
         rows2 = list(csv.reader(open(st2.ledger)))
@@ -1116,6 +1222,21 @@ def selftest():
            f"progress.json counts the models ({prog['models_measured']})")
         ok(not os.path.exists(st2.hold),
            "nothing HOLDs: a ratio is a result, not a stop")
+
+        # An earlier Colab recovery could leave a superseded row behind.  A
+        # new process must retain its latest measurement once, rebuild its
+        # totals from that ledger, and make a later family reset complete.
+        with open(st2.ledger, "a", newline="") as fh:
+            csv.writer(fh).writerow(rows2[1])
+        st3 = State(state_dir, "selftest")
+        rows3 = list(csv.reader(open(st3.ledger)))
+        ok(len(rows3) == 3 and st3.st["models"] == 2,
+           "recovery removes a superseded duplicate row and recounts totals")
+        st3.drop_family("org/base")
+        rows4 = list(csv.reader(open(st3.ledger)))
+        ok(len(rows4) == 1 and st3.st["models"] == 0 and
+           "org/base" not in st3.st["fam_closed"],
+           "a family reset removes rows, closure, hashes, and aggregates")
     finally:
         globals()["get_model"] = real_get
         shutil.rmtree(root, ignore_errors=True)
