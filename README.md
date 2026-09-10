@@ -12,7 +12,11 @@ Llama-3.1-8B BF16 checkpoint. lmz takes **34.7%** — and **64.6%** off the
 directory as Hugging Face actually ships it, which is **13 GB more than zstd
 on one 8B model**.
 
-Nothing is approximated. Every byte comes back.
+Across a completed 224-fine-tune Hub corpus, the corrected shipped result saves
+approximately **51.65%**, against **42.11%** for ZipLLM's method on the same
+124.45 GB of tensor bytes.
+
+No model data is approximated. Every byte comes back.
 
 And the decoder now runs on the GPU — **111 GB/s** on an RTX 5080 from an
 ordinary archive, against a 28.8 GB/s PCIe link, shipped in the wheel.
@@ -35,6 +39,28 @@ Real checkpoints, every round-trip verified byte-identical.
 | Pythia-160m, 3 training checkpoints | 1.81 GiB | 644 MiB | **65.3%** | 22.7% |
 | bge-m3 directory (FP32 container) | 4.59 GB | 2.45 GB | **46.5%** | — |
 | 8-bit AdamW optimizer state ×2 | 161 MiB | 119 MiB | **26.1%** | — |
+
+### Across a fixed Hub corpus
+
+The larger run resolved every planned row: 224 fine-tunes from 12 base-model
+families. Each model's bytes went through both pipelines. The ZipLLM pipeline
+deduplicates tensors by content, XORs against the base, then uses `zstd -1`;
+the lmz result is the incremental cost in the real archive produced by the
+shipped tool.
+
+| corpus | raw | ZipLLM method | lmz as shipped | lmz lead |
+|---|---:|---:|---:|---:|
+| 224 fine-tunes / 12 families | 124.45 GB | 72.04 GB · 42.11% saved | ≈60.17 GB · **≈51.65% saved** | **≈9.54 pp** |
+
+The original full run measured 50.77% for shipped lmz. It exposed one append
+case that prevented Qwen3-0.6B from reusing already referenced plain sources.
+After [fixing that case](https://github.com/FanxinSun/lmz/commit/9e6549c3705a6b2df5f0df60a97889e653912eb8),
+the same eight Qwen inputs moved from 3.099 GB to 1.997 GB: **83.3975% saved**,
+against ZipLLM's 74.5819%. That exact 1,102,264,525-byte improvement is
+substituted into the aggregate above; the other 216 measurements are unchanged.
+The aggregate is marked approximate because the full-run totals available for
+the substitution were rounded to 0.01 GB. Every measurement was round-trip
+verified. See the [benchmark design and reproduction instructions](bench/README.md).
 
 On BF16 weights lmz beats the published state of the art, and sits 0.3 points
 off the bound no lossless coder of any kind can pass:
