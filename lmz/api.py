@@ -638,17 +638,70 @@ def _same_bytes(path, s, e, arc, src, window=1 << 20):
     return True
 
 
+def _plain_source_for_coded_range(arc, lo, hi, coded, allowed):
+    """Return the plain source range behind an old ref/delta, if there is one.
+
+    Append normally indexes a tensor by its own output range.  That misses a
+    useful case in a tied-weight file: the old tensor may be a ref to another
+    tensor, while the incoming tensor has changed a little and needs a delta.
+    Following the existing pointer to its plain source preserves the
+    single-hop decoder rule.  A mixed or malformed range is ignored because
+    this is only an optimisation.
+    """
+    if hi <= lo:
+        return None
+    chunks = arc._chunks
+    starts = arc._starts
+    i = bisect_right(starts, lo) - 1
+    pos = lo
+    source = source_end = None
+    while pos < hi:
+        if i < 0 or i >= len(chunks):
+            return None
+        c = chunks[i]
+        cend = c.dst + c.rlen
+        if c.dst > pos or cend <= pos or cend <= lo:
+            return None
+        if c.codec not in allowed:
+            return None
+        payload = arc._payload_of(c)
+        if c.codec == CODEC_REF:
+            if len(payload) != 8:
+                return None
+            src = struct.unpack("<Q", payload)[0]
+        else:
+            try:
+                src, _inner, _off = _codec.delta_source(payload)
+            except (ValueError, FormatError):
+                return None
+        take_end = min(cend, hi)
+        src += pos - c.dst
+        take = take_end - pos
+        if source is None:
+            source, source_end = src, src + take
+        elif src != source_end:
+            return None
+        else:
+            source_end += take
+        pos = take_end
+        i += 1
+
+    if source is None or source_end - source != hi - lo:
+        return None
+    if any(cs < source_end and source < ce for cs, ce in coded):
+        return None
+    return source
+
+
 def _find_append_refs(paths, members, layouts, old_members, arc,
                       max_candidates=8):
     """Incoming tensors that are already in the archive, byte for byte.
 
-    A reference costs eight bytes and may name any tensor already stored,
-    including one held as a difference -- resolving it follows the target's
-    own chain, which the decoder does for its members anyway. That is the
-    whole point of having it: the duplicate of a fine-tune arrives after that
-    fine-tune has been delta-coded against its base, and a delta may only name
-    a plain chunk, so without a reference path the copy is coded against the
-    base a second time and costs exactly what its twin cost.
+    A reference costs eight bytes and may name any plain range already stored.
+    An old tensor held as a reference can contribute that plain source range,
+    so a later exact copy does not need to be coded again under its own name.
+    A delta still cannot name a coded range: resolving every source remains a
+    single hop.
 
     Measured on the hub against ZipLLM's method, that was five byte-identical
     re-uploads of one Qwen3.5-0.8B fine-tune charged 0.76 GB each. The one-shot
@@ -658,12 +711,9 @@ def _find_append_refs(paths, members, layouts, old_members, arc,
     # A reference may only name a plain chunk, exactly as a delta may: sources
     # are decoded straight from the archive so that decompression stays a bag
     # of independent jobs, and naming a coded chunk would make resolution a
-    # chain of unknown depth. The one-shot path satisfies this by keeping a
-    # dedup target plain and letting something else delta against *it*; an
-    # append cannot rewrite what is already written, so a duplicate of a
-    # member already held as a difference is out of reach here. See
-    # `test_append_cannot_dedup_a_copy_of_a_delta_coded_member`, which pins
-    # that limit and what it costs.
+    # chain of unknown depth. An old ref can safely donate its own plain source
+    # range; an old delta can donate the plain range it subtracts from, but an
+    # exact copy of a delta remains handled by payload sharing below.
     coded = [(c.dst, c.dst + c.rlen) for c in arc._chunks
              if c.codec in (CODEC_DELTA, CODEC_REF)]
 
@@ -674,10 +724,16 @@ def _find_append_refs(paths, members, layouts, old_members, arc,
     for m in old_members:
         for name, meta in (m.tensors or {}).items():
             s, e = meta["offsets"]
-            if e - s < DEDUP_MIN_TENSOR or not is_plain(m.dst + s, m.dst + e):
+            if e - s < DEDUP_MIN_TENSOR:
+                continue
+            lo, hi = m.dst + s, m.dst + e
+            source = lo if is_plain(lo, hi) else \
+                _plain_source_for_coded_range(arc, lo, hi, coded,
+                                               (CODEC_REF,))
+            if source is None:
                 continue
             known.setdefault((name, meta.get("dtype", ""), e - s),
-                             []).append(m.dst + s)
+                             []).append(source)
     if not known:
         return {}, 0
 
@@ -729,10 +785,16 @@ def _find_append_deltas(paths, members, layouts, old_members, arc, level,
     for m in old_members:
         for name, meta in (m.tensors or {}).items():
             s, e = meta["offsets"]
-            if e - s < DELTA_MIN_TENSOR or not is_plain(m.dst + s, m.dst + e):
+            if e - s < DELTA_MIN_TENSOR:
+                continue
+            lo, hi = m.dst + s, m.dst + e
+            source = lo if is_plain(lo, hi) else \
+                _plain_source_for_coded_range(arc, lo, hi, coded,
+                                               (CODEC_REF, CODEC_DELTA))
+            if source is None:
                 continue
             # Latest wins: the nearer the base, the smaller the difference.
-            known[(name, meta.get("dtype", ""), e - s)] = m.dst + s
+            known[(name, meta.get("dtype", ""), e - s)] = source
 
     deltas: dict[int, list] = {}
     covered = 0

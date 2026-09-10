@@ -4095,6 +4095,59 @@ def test_append_dedups_a_copy_of_a_plain_member():
         assert got[-len(base):] == base
 
 
+def test_append_deltas_through_a_reference_source():
+    """A tied tensor can delta against the plain range behind its ref.
+
+    A base file commonly carries tied embeddings as one plain tensor and one
+    reference.  If the referenced name changes in a fine-tune, append used to
+    reject its same-name range as a source and store the whole tensor again,
+    even though the residual against the base was tiny.  Following the
+    existing ref to its plain source keeps the decoder at one hop.
+    """
+    base = weights_bf16(700000, 61)
+    moved = nudged_bf16(base, 70)
+    assert moved != base
+    with tempfile.TemporaryDirectory() as d:
+        base_dir = os.path.join(d, "base")
+        os.makedirs(base_dir)
+        write_safetensors(os.path.join(base_dir, "base.safetensors"), [
+            ("embed_tokens.weight", "BF16", [700000], base),
+            ("lm_head.weight", "BF16", [700000], base),
+        ])
+        target = os.path.join(d, "target.safetensors")
+        write_safetensors(target, [
+            ("embed_tokens.weight", "BF16", [700000], base),
+            ("lm_head.weight", "BF16", [700000], moved),
+        ])
+
+        def run(delta):
+            arc = os.path.join(d, f"{'delta' if delta else 'plain'}.lmz")
+            lmz.compress(base_dir, arc)
+            before = os.path.getsize(arc)
+            stats = lmz.append(arc, target, delta=delta)
+            return arc, stats, os.path.getsize(arc) - before
+
+        plain_arc, _plain_stats, plain_cost = run(False)
+        delta_arc, delta_stats, delta_cost = run(True)
+        assert delta_stats.detail["delta_bytes"] == len(moved), delta_stats.detail
+        assert delta_cost < plain_cost // 4, (delta_cost, plain_cost)
+
+        with open(delta_arc, "rb") as fh:
+            reader = ArchiveReader(fh)
+            target_member = next(m for m in reader.members
+                                 if m.path == "target.safetensors")
+            chunks = [c for c in reader.chunks
+                      if target_member.dst <= c.dst <
+                      target_member.dst + target_member.size]
+            assert any(c.codec == lmzformat.CODEC_DELTA for c in chunks), \
+                [(c.codec, c.rlen, c.clen) for c in chunks]
+
+        out = os.path.join(d, "out")
+        lmz.decompress(delta_arc, out)
+        assert digest(os.path.join(out, "target.safetensors")) == digest(target)
+        lmz.verify(delta_arc)
+
+
 def test_append_dedups_a_copy_of_a_delta_coded_member():
     """A re-upload is free even when its twin is stored as a difference.
 
