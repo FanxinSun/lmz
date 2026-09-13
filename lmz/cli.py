@@ -248,6 +248,64 @@ def cmd_extract(args) -> int:
     return 0
 
 
+def cmd_bundle_create(args) -> int:
+    from . import bundle as bundle_api
+
+    manifest = None
+    if args.manifest:
+        with open(args.manifest, "r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    result = bundle_api.create_bundle(
+        args.input, args.output, manifest, level=args.level,
+        workers=args.threads, checksum=not args.no_checksum,
+        dedup=not args.no_dedup, delta=not args.no_delta,
+        mapped=args.mapped, align=args.align, overwrite=args.force)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"{args.input} -> {args.output}")
+        print(f"  bundle {result['bundle']['id']}  "
+              f"{result['archive_accounting']['decoded_bytes']} decoded bytes")
+        print(f"  archive {result['archive_bytes']} bytes, "
+              f"manifest {result['bundle_manifest_sha256']}")
+    return 0
+
+
+def cmd_bundle_inventory(args) -> int:
+    from . import bundle as bundle_api
+
+    result = bundle_api.inventory_bundle(
+        args.archive, expected_manifest_sha256=args.expected_manifest_sha256,
+        strict=not args.allow_invalid)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"{args.archive}: {result['status']}")
+        if result.get("validation", {}).get("reason"):
+            print(f"  {result['validation']['reason']}")
+        if result.get("bundle"):
+            print(f"  bundle {result['bundle']['id']}  "
+                  f"entries {len(result['entries'])}")
+            print(f"  decoded {result['archive_accounting']['decoded_bytes']}  "
+                  f"archive {result['archive_bytes']}")
+    return 0 if result["status"] == "verified" else 1
+
+
+def cmd_bundle_materialize(args) -> int:
+    from . import bundle as bundle_api
+
+    result = bundle_api.materialize_bundle(
+        args.archive, args.output,
+        expected_manifest_sha256=args.expected_manifest_sha256)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"{args.archive} -> {result['materialization']['path']}")
+        print(f"  {len(result['entries'])} entries, "
+              f"{result['archive_accounting']['materialized_bytes']} bytes")
+    return 0
+
+
 def cmd_doctor(args) -> int:
     from . import fuse, gpu
 
@@ -669,6 +727,41 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("-f", "--force", action="store_true", help="overwrite output")
     common(e)
     e.set_defaults(func=cmd_extract)
+
+    # -- complete artifact bundles ----------------------------------------
+    bundle = sub.add_parser("bundle", help="create, inspect and materialize a complete artifact")
+    bundle_sub = bundle.add_subparsers(dest="bundle_command", required=True)
+
+    bc = bundle_sub.add_parser("create", help="snapshot a source tree into a bundle")
+    bc.add_argument("input", help="regular-file source tree")
+    bc.add_argument("output", help="new .lmz archive")
+    bc.add_argument("--manifest", help="JSON bundle metadata and entry roles")
+    bc.add_argument("-l", "--level", type=int, default=api.DEFAULT_LEVEL)
+    bc.add_argument("--no-checksum", action="store_true")
+    bc.add_argument("--no-dedup", action="store_true")
+    bc.add_argument("--no-delta", action="store_true")
+    bc.add_argument("--mapped", action="store_true")
+    bc.add_argument("--align", action="store_true")
+    bc.add_argument("-f", "--force", action="store_true",
+                    help="replace the requested archive path")
+    bc.add_argument("--json", action="store_true")
+    common(bc)
+    bc.set_defaults(func=cmd_bundle_create)
+
+    bi = bundle_sub.add_parser("inventory", help="verify and print bundle inventory")
+    bi.add_argument("archive")
+    bi.add_argument("--expected-manifest-sha256")
+    bi.add_argument("--allow-invalid", action="store_true",
+                    help="return a structured invalid result instead of failing")
+    bi.add_argument("--json", action="store_true")
+    bi.set_defaults(func=cmd_bundle_inventory)
+
+    bm = bundle_sub.add_parser("materialize", help="safely materialize a verified bundle")
+    bm.add_argument("archive")
+    bm.add_argument("output")
+    bm.add_argument("--expected-manifest-sha256")
+    bm.add_argument("--json", action="store_true")
+    bm.set_defaults(func=cmd_bundle_materialize)
 
     d = sub.add_parser("decompress", aliases=["d", "x"], help="restore an archive")
     d.add_argument("input")

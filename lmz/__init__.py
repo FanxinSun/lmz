@@ -30,6 +30,8 @@ from .api import (DEFAULT_CHUNK_SIZE, DEFAULT_LEVEL, ArchiveIndex, ChunkRef,
                   Option, Stats, backends, capabilities, compress, decompress,
                   encode_options, info, read_tensor, verify)
 from .api import MappedArchive, append, extract  # noqa: F401
+from .bundle import (BundleError, BundleSourceChanged, create_bundle,
+                     inventory_bundle, materialize_bundle, validate_bundle)
 from .format import FormatError
 from .lmzfs import LmzFS  # noqa: F401
 from .store import Store, mount  # noqa: F401
@@ -39,5 +41,7 @@ __all__ = [
     "MappedArchive", "append", "extract", "Store", "mount", "LmzFS",
     "Stats", "Option", "encode_options", "FormatError",
     "ArchiveIndex", "ChunkRef", "capabilities",
+    "BundleError", "BundleSourceChanged", "create_bundle",
+    "validate_bundle", "inventory_bundle", "materialize_bundle",
     "DEFAULT_LEVEL", "DEFAULT_CHUNK_SIZE", "__version__",
 ]
