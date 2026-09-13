@@ -18,6 +18,11 @@ approximately **51.65%**, against **42.11%** for ZipLLM's method on the same
 
 No model data is approximated. Every byte comes back.
 
+Development priorities: [current plan](docs/strategy.md) — complete acoustic,
+visual, spatial and language/multimodal artifacts; affordability and niche
+positioning remain independently assessed. This is planned support, not a claim
+that every model/engine is already supported.
+
 And the decoder now runs on the GPU — **111 GB/s** on an RTX 5080 from an
 ordinary archive, against a 28.8 GB/s PCIe link, shipped in the wheel.
 [Jump to it](#on-a-gpu).
@@ -26,6 +31,27 @@ ordinary archive, against a 28.8 GB/s PCIe link, shipped in the wheel.
 pip install lmzip
 lmz compress ./Llama-3.1-8B-Instruct/
 ```
+
+## Ship complete artifacts, not just tensors
+
+A deployable model is more than its weights. `lmz bundle` keeps an ONNX graph
+with its external sidecars, configuration, preprocessing, vocabulary, calibration,
+and opaque backend files in one versioned, lossless archive. Every entry has a
+declared role, dependencies, byte length, and digest; consumers can inspect the
+complete materialization requirement without importing or running an inference
+engine.
+
+```
+lmz bundle create ./model-artifact model.lmz
+lmz bundle inventory model.lmz --json
+lmz bundle materialize model.lmz ./materialized-model
+```
+
+Materialization verifies bytes, refuses missing sidecars and unsafe paths or
+links, and will not replace an existing destination. The feature is additive:
+existing archives, APIs, and codecs continue to work. Hashes establish byte
+identity against an expected value; they do not by themselves authenticate a
+publisher. See [complete artifact bundles](docs/evaluations/multimodal-artifacts.md).
 
 ## What it saves
 
