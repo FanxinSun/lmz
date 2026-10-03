@@ -1,5 +1,10 @@
 # lmz
 
+> **Planning authority — 2026-10-03.** The project's sole current execution
+> order is [`plan/PLAN.md`](plan/PLAN.md). The older “Development priorities”
+> pointer below is retained as historical wording; `docs/strategy.md` remains
+> strategy and acceptance detail, not a competing master plan.
+
 [![tests](https://github.com/FanxinSun/lmz/actions/workflows/tests.yml/badge.svg)](https://github.com/FanxinSun/lmz/actions/workflows/tests.yml)
 [![Python](https://img.shields.io/pypi/pyversions/lmzip?cacheSeconds=3600)](https://pypi.org/project/lmzip/)
 [![PyPI](https://img.shields.io/pypi/v/lmzip?cacheSeconds=3600)](https://pypi.org/project/lmzip/)

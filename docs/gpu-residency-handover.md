@@ -1,5 +1,10 @@
 # GPU residency — what lmz has to ship for it
 
+> **Planning authority — 2026-10-03.** This handover is preserved as technical
+> evidence and rationale. Its sequence and remaining-item language is not a
+> separate active order; candidate future work is gated by `LMZ-T0` in the sole
+> canonical master, [`../plan/PLAN.md`](../plan/PLAN.md).
+
 *The pieces of work in lmz between a fast kernel and a residency layer, why
 each one is load-bearing, what is already measured about it, and where the
 boundary is between lmz and the thing that consumes it. Three of the four

@@ -1,5 +1,11 @@
 # Development plan — multimodal artifacts and independent A/B tracks
 
+> **Canonical authority — 2026-10-03.** This document is preserved in full as
+> strategy, rationale, historical decisions, and detailed acceptance guidance.
+> Its original sequence language is retired as an independent execution order.
+> The project's sole current order is [`../plan/PLAN.md`](../plan/PLAN.md),
+> which retains `LMZ-A1` and `LMZ-B1` as independently gated conditional tracks.
+
 Updated 2026-09-13: the September 10 independent-track decision now includes
 the user's acoustic, visual, physical/spatial and language/multimodal direction.
 This is the

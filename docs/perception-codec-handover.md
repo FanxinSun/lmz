@@ -1,5 +1,10 @@
 # Perception models — what lmz needs for the machine's eyes and ears
 
+> **Planning authority — 2026-10-03.** This completed handover and its remaining
+> external gaps are retained as evidence. It is not an independent execution
+> order; any future gap is gated by `LMZ-T0` in
+> [`../plan/PLAN.md`](../plan/PLAN.md).
+
 *The pieces of work in lmz between an LLM compressor and the perception set
 of blueprint D15, why each is load-bearing, what is already measured about
 it, and where the boundary is between lmz and the things that consume it.

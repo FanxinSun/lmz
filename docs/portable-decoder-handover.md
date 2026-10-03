@@ -1,5 +1,10 @@
 # A decoder off CUDA — what lmz has to ship for the machines most people have
 
+> **Planning authority — 2026-10-03.** This handover is retained as technical
+> evidence and historical ordering rationale. Metal, Vulkan, and related decoder
+> work are not active merely because they appear below; the sole current gate is
+> `LMZ-T0` in [`../plan/PLAN.md`](../plan/PLAN.md).
+
 *Why lmz currently makes loading **slower** on every machine without an
 NVIDIA GPU, what the fix is, the order it has to happen in and why, and what
 the first item cost when it landed. One of three items is done; this says

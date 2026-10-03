@@ -1,5 +1,10 @@
 # Vectorising the coder
 
+> **Planning authority — 2026-10-03.** This document is preserved as technical
+> evidence and prototype guidance. The vector decoder is a candidate, not a
+> separately scheduled project; activation is governed by `LMZ-T0` in
+> [`../plan/PLAN.md`](../plan/PLAN.md).
+
 *One piece of work that is open, what is already known about it, the six things
 that were tried and do not work, and how the encoder got to arm64. Written for
 whoever picks this up next, so that none of it has to be rediscovered.*
