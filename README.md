@@ -1,5 +1,10 @@
 # lmz
 
+> **Planning authority — 2026-10-03.** The project's sole current execution
+> order is [`plan/PLAN.md`](plan/PLAN.md). The older “Development priorities”
+> pointer below is retained as historical wording; `docs/strategy.md` remains
+> strategy and acceptance detail, not a competing master plan.
+
 [![tests](https://github.com/FanxinSun/lmz/actions/workflows/tests.yml/badge.svg)](https://github.com/FanxinSun/lmz/actions/workflows/tests.yml)
 [![Python](https://img.shields.io/pypi/pyversions/lmzip?cacheSeconds=3600)](https://pypi.org/project/lmzip/)
 [![PyPI](https://img.shields.io/pypi/v/lmzip?cacheSeconds=3600)](https://pypi.org/project/lmzip/)
@@ -12,15 +17,46 @@ Llama-3.1-8B BF16 checkpoint. lmz takes **34.7%** — and **64.6%** off the
 directory as Hugging Face actually ships it, which is **13 GB more than zstd
 on one 8B model**.
 
-Nothing is approximated. Every byte comes back.
+Across a completed 224-fine-tune Hub corpus, the corrected shipped result saves
+approximately **51.65%**, against **42.11%** for ZipLLM's method on the same
+124.45 GB of tensor bytes.
 
-And the decoder now runs on the GPU — **111 GB/s** from an ordinary archive
-against a 28.8 GB/s PCIe link, shipped in the wheel. [Jump to it](#on-a-gpu).
+No model data is approximated. Every byte comes back.
+
+Development priorities: [current plan](docs/strategy.md) — complete acoustic,
+visual, spatial and language/multimodal artifacts; affordability and niche
+positioning remain independently assessed. This is planned support, not a claim
+that every model/engine is already supported.
+
+And the decoder now runs on the GPU — **111 GB/s** on an RTX 5080 from an
+ordinary archive, against a 28.8 GB/s PCIe link, shipped in the wheel.
+[Jump to it](#on-a-gpu).
 
 ```
 pip install lmzip
 lmz compress ./Llama-3.1-8B-Instruct/
 ```
+
+## Ship complete artifacts, not just tensors
+
+A deployable model is more than its weights. `lmz bundle` keeps an ONNX graph
+with its external sidecars, configuration, preprocessing, vocabulary, calibration,
+and opaque backend files in one versioned, lossless archive. Every entry has a
+declared role, dependencies, byte length, and digest; consumers can inspect the
+complete materialization requirement without importing or running an inference
+engine.
+
+```
+lmz bundle create ./model-artifact model.lmz
+lmz bundle inventory model.lmz --json
+lmz bundle materialize model.lmz ./materialized-model
+```
+
+Materialization verifies bytes, refuses missing sidecars and unsafe paths or
+links, and will not replace an existing destination. The feature is additive:
+existing archives, APIs, and codecs continue to work. Hashes establish byte
+identity against an expected value; they do not by themselves authenticate a
+publisher. See [complete artifact bundles](docs/evaluations/multimodal-artifacts.md).
 
 ## What it saves
 
@@ -34,6 +70,28 @@ Real checkpoints, every round-trip verified byte-identical.
 | Pythia-160m, 3 training checkpoints | 1.81 GiB | 644 MiB | **65.3%** | 22.7% |
 | bge-m3 directory (FP32 container) | 4.59 GB | 2.45 GB | **46.5%** | — |
 | 8-bit AdamW optimizer state ×2 | 161 MiB | 119 MiB | **26.1%** | — |
+
+### Across a fixed Hub corpus
+
+The larger run resolved every planned row: 224 fine-tunes from 12 base-model
+families. Each model's bytes went through both pipelines. The ZipLLM pipeline
+deduplicates tensors by content, XORs against the base, then uses `zstd -1`;
+the lmz result is the incremental cost in the real archive produced by the
+shipped tool.
+
+| corpus | raw | ZipLLM method | lmz as shipped | lmz lead |
+|---|---:|---:|---:|---:|
+| 224 fine-tunes / 12 families | 124.45 GB | 72.04 GB · 42.11% saved | ≈60.17 GB · **≈51.65% saved** | **≈9.54 pp** |
+
+The original full run measured 50.77% for shipped lmz. It exposed one append
+case that prevented Qwen3-0.6B from reusing already referenced plain sources.
+After [fixing that case](https://github.com/FanxinSun/lmz/commit/9e6549c3705a6b2df5f0df60a97889e653912eb8),
+the same eight Qwen inputs moved from 3.099 GB to 1.997 GB: **83.3975% saved**,
+against ZipLLM's 74.5819%. That exact 1,102,264,525-byte improvement is
+substituted into the aggregate above; the other 216 measurements are unchanged.
+The aggregate is marked approximate because the full-run totals available for
+the substitution were rounded to 0.01 GB. Every measurement was round-trip
+verified. See the [benchmark design and reproduction instructions](bench/README.md).
 
 On BF16 weights lmz beats the published state of the art, and sits 0.3 points
 off the bound no lossless coder of any kind can pass:
@@ -73,15 +131,32 @@ archive is a third smaller, so a storage-bound load moves a third fewer bytes.
 
 `pip install lmzip` ships a CUDA decoder. On an RTX 5080 it decodes lmz's own
 rANS at **111 GB/s** out of an archive written today, and **418 GB/s** when
-the frequency table is shared across chunks — both verified byte-identical to
-the CPU decoder over 936 MB of real BF16 planes.
+one frequency table is handed to the batch API for the whole batch — both
+verified byte-identical to the CPU decoder over 936 MB of real BF16 planes.
 
-The ratio to the link is the point. PCIe Gen4 x16 delivers 28.8 GB/s, so a
-decoder 3.9× faster than that makes compression on the path into VRAM free,
-and every point of lmz's ratio becomes a point of load bandwidth. The fused
-whole-BF16 kernel in `scratchpad/gpu/` measures the end of it: cold disk to
-VRAM, plain safetensors 0.373 s against lmz's 0.256 — **1.46× faster**,
-converting 98% of the ratio into load speed.
+That second number is what the kernel can do, not what an archive gives you
+today: it is reached by passing a shared table to `decode_batch`, and the
+kernel does not yet read the shared-table archives `--shared-tables` writes.
+**111 GB/s is the number to plan around**; the 418 is the headroom that
+connecting the two would recover.
+
+**The ratio to the link is the point, and it is a ratio you can recompute.**
+On this machine PCIe Gen4 x16 delivers 28.8 GB/s, so a decoder running at 111
+is 3.9× faster than the link it feeds — and once decoding is faster than the
+link, compression on the path into VRAM is free, with every point of lmz's
+ratio becoming a point of load bandwidth. Both halves are machine-dependent: a
+Gen5 host doubles the link, a unified-memory Mac has no such link at all, and
+a phone changes both numbers. What travels is the comparison, not the 3.9×.
+
+The 418 GB/s is a bandwidth ceiling rather than a compute one — 59% of this
+card's ~960 GB/s peak, because decoding moves 1.347 bytes of DRAM traffic per
+decoded byte: the plaintext out plus the coded bytes in.
+
+What that is worth end to end was measured with a research kernel in
+`scratchpad/gpu/`, not the shipped one: cold disk to VRAM, plain safetensors
+0.373 s against lmz's 0.256 — **1.46× faster**, converting 98% of the ratio
+into load speed. That is the prize for a caller that wires the pieces together,
+which is a different thing from what `pip install lmzip` does for you today.
 
 ```python
 from lmz import gpu
@@ -93,11 +168,155 @@ gpu.decode_batch(streams, offsets, nstr, plane)    # a batch in, plaintext out
 A batch, not a stream: lmz's 8 interleaved rANS states are 8 lanes of work, so
 one stream never fills a GPU however large it is, and many streams at once do.
 
+## Building on lmz
+
+New in 1.3.0, and the reason to upgrade if you are writing the layer above:
+lmz stopped requiring anyone to reach inside it. A runtime that wants to
+schedule reads, drive its own device, or predict lmz's cost on hardware nobody
+here owns can now ask, instead of copying a constant out of the source and
+hoping it does not move.
+
+**The archive says who can read it.** Not plumbing — a footgun with a fix.
+Once a chunk is big enough and conditioning wins, lmz emits `CODEC_BF16C`,
+whose per-bucket segments have unequal lengths — and **the GPU decoder cannot
+read it**, because a batch decode needs equal-length streams. Nothing used to
+say so.
+
+```python
+lmz.capabilities("model.lmz")
+# {'batch_decodable': False, 'blockers': {'bf16-cond': 224, 'entropy': 1},
+#  'blocker_bytes': 1872871856, 'batch_decodable_fraction': 0.0, ...}
+```
+
+`lmz info` prints the same thing as a `batch` line. If it says no and you
+wanted a GPU-readable archive, compress with `--mapped`: 64 KiB blocks stay
+under the conditioning threshold, so that codec is never chosen. Measured on a
+1.87 GB BF16 checkpoint on this box, that moved 224 blocking chunks and
+1.87 GB down to one 12 KB chunk, and cost **0.89 points** of ratio (32.91% →
+32.02%).
+
+Read the bytes and not only the boolean. That last 12 KB chunk is the
+safetensors JSON header — one general-purpose stream, enough on its own to
+make `batch_decodable` False while 99.999% of the output is still
+batch-decodable. `blocker_bytes` (a count) and `batch_decodable_fraction` (a
+share of 0..1) are there so you can tell one header from two hundred weight
+chunks, and route the bulk on the device either way. The boolean stays strict
+on purpose: it means *every* chunk, because one that meant "mostly" would be
+worse than none.
+
+**Decode bytes you already have.** `ArchiveIndex` exists because of a coupling
+worth naming, since it is not specific to lmz: `decompress` reads and decodes
+inside one worker, so a single thread count sets both decode throughput *and*
+read queue depth — and those want opposite things. An NVMe device reaches its
+rated rate only with about a dozen requests in flight; past two threads lmz's
+own interpreter overhead between native calls becomes GIL contention. You
+cannot tune your way out of that from outside. You can only step around it, by
+fetching the payload yourself and handing lmz the bytes.
+
+```python
+idx = lmz.ArchiveIndex("model.lmz")
+for c in idx.chunks():                    # where every payload is
+    plain = idx.decode(c, my_reader.pread(c.off, c.clen))   # no I/O, no threads
+```
+
+Ref and delta chunks raise `NeedsSource` instead: they are *defined* as a
+difference from an earlier range, so decoding one needs bytes from elsewhere in
+the archive — and lmz will not reach for the file behind your back. Use
+`decompress` when you want it to handle that.
+
+**The caller owns the device.** `gpu.decode_batch_dev()` takes device pointers
+as plain integers plus your stream, allocates nothing, creates no context, and
+does not synchronise. Your allocator, your stream, your context; lmz does not
+build a second one behind them and does not decide when you need the result.
+
+**The kernel publishes its constants, not just its speed.** A rate measured on
+a 5080 tells you about a 5080. `gpu.cost_model()` gives you the mechanism
+instead, so you can compute the answer for your own device:
+
+```python
+gpu.cost_model()              # the shared-table kernel
+gpu.cost_model("per_chunk")   # what an ordinary archive actually uses
+# k_cycles_per_byte: (230, 330)   -- an interval, because it is one
+# shmem_lut_bytes / shmem_per_group_bytes / blocks_per_unit_at_measurement
+# expansion, bound, and provenance for every number
+```
+
+Ask for the kernel you will actually run: the two cost about the same per byte
+and differ by up to 6× in how many lanes a device keeps resident, so quoting
+the shared-table constants for an ordinary archive over-predicts it about
+fourfold.
+
+`k` is published as a range rather than a midpoint because occupancy hides part
+of the cost and how much varies with the block size — and it is **latency-bound
+on a dependent shared-memory load chain, not throughput-bound**, so scaling it
+by a device's FP32 rate is the wrong arithmetic. The shared-memory numbers let
+you check how many blocks your device holds and decide whether that interval
+brackets you or is only a floor.
+
+**Every encode keyword is declared.** `encode_options()` labels all ten as
+`format` (eight — they decide what the coded bytes are), `schedule` (one:
+`workers`) or `observe` (one: `progress`). The distinction is the useful part:
+**a scheduling default is a fallback, never a decision.** lmz picks `workers`
+from a CPU count without knowing your machine or your workload — compression
+goes memory-bus-bound near four threads on real weights — so it is yours to
+override, and the declaration is how you can tell that from a considered
+answer.
+
+**One format choice worth knowing about.** A rANS stream normally carries its
+own 516-byte frequency table. `lmz compress --shared-tables` lifts it out and
+carries one per plane kind in the manifest instead, which is smaller on
+archives whose chunks are small enough for those headers to matter and is the
+layout a GPU wants, since a warp can then share one table in shared memory. It
+is **off by default** because it writes a v7 archive an older lmz cannot read,
+and the current GPU kernel does not read it yet — so today it is a size and
+format decision, not a speed one. Sharing is decided per plane and only where
+it measured better: **+0.93 points** on a 151 MB fp32 whisper checkpoint in
+64 KiB blocks, and on a BF16 Llama shard it declined outright and wrote an
+ordinary v1 archive, because there it does not pay.
+
 The first thing it does on any machine is decode a stream that machine just
 encoded and check the CPU decoder agrees; a device that disagrees is not used,
 and `lmz doctor` names it. The kernel is clean under `compute-sanitizer` and
-compiles for sm_75 through sm_121, but it has only ever been *run* on one
-card, so it verifies rather than assumes.
+compiles for sm_75 through sm_121. It has been *run* on two architectures —
+an RTX 5080 and a Tesla T4 — which are the two ends of the range and the two
+that generate different code, so it verifies rather than assumes.
+
+**If you have a GPU, this is worth thirty seconds:**
+
+```
+lmz doctor --gpu-verify
+```
+
+It decodes thirty awkward distributions and batch shapes and checks lmz's own
+CPU decoder agrees with every byte — no data file, no network, no login: the
+streams are built by lmz's own encoder, so the oracle travels with the
+question. Paste the block into
+[an issue](https://github.com/FanxinSun/lmz/issues). A pass is evidence too,
+and an **Ampere, Ada or Hopper** is the gap now: those are the cards nobody
+has run.
+
+**No GPU? A free Colab T4 takes one click** —
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/FanxinSun/lmz/blob/main/docs/verify-on-colab.ipynb)
+
+Turing runs *different generated code*: it has no `cp.async` instruction, so
+the intrinsic falls back to a synchronous copy. Counting them says which
+architectures share which path:
+
+| | `LDGSTS` | run on real silicon |
+|---|---|---|
+| sm_75, Turing | **0** | **yes — Tesla T4, 30/30 byte-identical** |
+| sm_80 / 86 / 89 | 38 | not yet |
+| sm_90 / 120 | 41 | **yes — RTX 5080, 936 MB byte-identical** |
+
+The synchronous fallback is not a guess: a Tesla T4 decodes all thirty shapes
+byte-identically, and separately, `compute_75` built as PTX with no cubin —
+so the driver must JIT it — decodes 936 MB byte-identically at every block
+size on both kernels and is clean under `memcheck`, `racecheck` and
+`synccheck`. Ampere through Hopper sit *between* two architectures that have
+both been verified on hardware, and their generated code has been JIT-run and
+sanitized too, so what is open there is a throughput number rather than a
+question of whether it works. Shared memory excludes nobody either: a T4's
+64 KiB holds the per-chunk tables at 64 threads a block.
 
 **CUDA is optional in every direction.** The wheel is pure Python, carries a
 `.cu` and no CUDA, and installing needs no toolkit. `nvcc`, if it is there, is
@@ -106,11 +325,23 @@ the SIMD kernel already makes with a C compiler, and nothing is installed
 system-wide. No nvcc or no card means the CPU path, unchanged. `lmz doctor`
 says which you have.
 
+That holds even when the driver itself is broken. A CUDA driver that is
+half-removed or mid-upgrade leaves `libcuda.so.1` on disk with an initialiser
+that faults, and loading it takes the whole process down with no return code
+involved — so lmz does its first load in a child process that is allowed to
+die, and reports it. A segmentation fault in your program is not a fallback.
+
 Nothing in `lmz decompress` routes to it yet, deliberately: the useful thing
 to do with a GPU decode is to leave the result in VRAM, and deciding when
-belongs to the layer above — see the
-[GPU residency handover](docs/gpu-residency-handover.md) for that boundary and
-for the work still between here and a residency engine.
+belongs to the layer above. That has stopped being a deferral. The layer above
+now exists, and what lmz owes it is published on both sides of the line —
+where the bytes are and what can read them, a decode that touches no file, a
+device entry point that takes your pointers and your stream, and the kernel's
+own cost constants so it can predict lmz on hardware nobody here has. lmz
+turns bytes into bytes as fast as the hardware allows and says what that
+costs; it does not decide when. The
+[GPU residency handover](docs/gpu-residency-handover.md) is where that boundary
+is written down.
 
 ## Where it is not worth it
 
@@ -154,14 +385,22 @@ or [Alipay](assets/alipay.jpg) (打开支付宝，扫一扫). Thank you.
 - [**Using lmz**](docs/usage.md) — command line, Python API, the mount and the
   filesystem
 - [**Limitations**](docs/limitations.md) — where it does not pay, and what the
-  97 tests check
+  120 tests check
 - [**Vectorising the coder**](docs/vectorising-the-coder.md) — how the encoder
   reached arm64, the one piece of work still open, and the six that were tried
   and measured out flat
-- [**GPU residency handover**](docs/gpu-residency-handover.md) — the GPU
-  decoder runs at 418 GB/s against a 28.8 GB/s PCIe link, so on that path
-  compression is free by 14×; what shipped as `lmz.gpu`, the three pieces of
-  work still between it and a residency layer, and where lmz's job ends
+- [**GPU residency handover**](docs/gpu-residency-handover.md) — what the
+  decoder costs and why, with the occupancy sweep that separated a compute
+  ceiling from a bandwidth one; what shipped as `lmz.gpu`, the interfaces the
+  layer above asked for, the two measurements still open, and where lmz's job
+  ends
+- [**Portable decoder handover**](docs/portable-decoder-handover.md) — the
+  shared frequency table as a format option, and the three things its design
+  did not survive contact with
+- [**Perception codec handover**](docs/perception-codec-handover.md) — what
+  vision and audio models need that LLM checkpoints did not: int8 routed to
+  the coder the GPU can read, ONNX parsed, and the two expected ratio items
+  that dissolved under measurement and should stay dissolved
 
 Python 3.10+, no runtime dependencies. zstd comes from the standard library on
 3.14+; a C compiler, if present, is used once to build the SIMD kernel into the

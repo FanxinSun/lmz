@@ -3,6 +3,29 @@
 Runs standalone (`python3 tests/test_lmz.py`) and under pytest. Every
 round-trip check compares bytes, not just sizes: the whole point of the tool
 is that decompression reproduces the input exactly.
+
+**A test that asserts what this machine returns is testing the machine.** The
+environments that disagree are the ones you cannot see from here: no GPU, no
+nvcc, no zstd binding, a different Python, an interpreter with no free
+threading. Assert the *contract* -- what the code promises given what the
+machine has -- rather than the answer this box happens to give. Two ways that
+goes wrong, both of which have shipped:
+
+- asserting the present-hardware answer unconditionally. `decode_batch_dev`
+  with an empty batch returns OK where the library loaded and ENODEV where it
+  did not, because the load is checked first; asserting OK turned every
+  GPU-less runner red.
+- asserting which coder wins. Before 3.14 there is no stdlib zstd, so naming
+  zstd in an assertion tests which Python is running rather than which coder
+  is better.
+
+Before pushing, run the suite the way the runners will:
+
+    LMZ_NO_GPU=1 python3 tests/test_lmz.py
+
+It takes the same minute as the ordinary run and covers the environment
+difference that no amount of local passing will reveal. A GPU test that does
+not `raise Skip` on a machine without one is a bug in the test.
 """
 
 from __future__ import annotations
@@ -11,6 +34,7 @@ import errno
 import hashlib
 import io
 import json
+import math
 import os
 import shutil
 import stat
@@ -20,11 +44,12 @@ import sys
 import tempfile
 import threading
 import time
+import tracemalloc
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import lmz  # noqa: E402
-from lmz import codec, entropy, kernels, planner  # noqa: E402
+from lmz import codec, entropy, freqs, kernels, planner  # noqa: E402
 from lmz import format as lmzformat  # noqa: E402
 from lmz.format import ArchiveReader, FormatError  # noqa: E402
 
@@ -96,6 +121,26 @@ def weights_bf16_cond(nelem: int, seed: int = 1) -> bytes:
             mant &= 0x0F
         sign = (x >> 63) & 1
         out += ((sign << 15) | (exp << 7) | mant).to_bytes(2, "little")
+    return bytes(out)
+
+
+def weights_f32_from_f16(nelem: int, seed: int = 1, band: int = 0) -> bytes:
+    """FP32 words holding values that only ever had fp16 precision.
+
+    The shape whisper and bge-m3 really ship in, and the one shared tables are
+    for: the low 13 mantissa bits are zero, so byte 0 is constant and byte 1
+    takes eight values, while byte 3 carries the sign and exponent and so
+    moves with `band` -- a stand-in for the per-tensor scale that makes one
+    tensor's high byte a poor fit for another's.
+    """
+    out = bytearray()
+    x = seed | 1
+    for _ in range(nelem):
+        x = (x * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
+        mant = (x >> 11) & 0x3FF                     # 10 bits, as fp16 has
+        exp = 118 + band + ((x >> 40) % 5)
+        sign = (x >> 63) & 1
+        out += ((sign << 31) | (exp << 23) | (mant << 13)).to_bytes(4, "little")
     return bytes(out)
 
 
@@ -473,7 +518,8 @@ def test_rans_decode_many4_neon():
         # 2. Shared frequency table streams
         h0 = kernels.histogram(b"".join(streams))
         f0 = kernels.rans_freqs(h0)
-        enc_shared = [bytes(kernels.rans_encode_shared(s, f0)) for s in streams]
+        t0 = kernels.rans_shared_header(f0)
+        enc_shared = [bytes(kernels.rans_encode_shared(s, t0)) for s in streams]
         dec_shared = kernels.rans_decode_many4(enc_shared, n, freqs=[f0] * 4)
         for m in range(4):
             assert bytes(dec_shared[m]) == streams[m], f"mismatch shared stream {m}, size {n}"
@@ -800,34 +846,6 @@ def test_read_tensor_matches_original():
             pass
 
 
-def test_chunk_table_is_buffer_backed():
-    """The table answers lookups from raw records, in order or not."""
-    from lmz.format import Chunk, ChunkTable, CorruptArchive
-
-    recs = [Chunk(100 + i, i * 10, 5, 10, 0, 0, 1, 0) for i in range(7)]
-    table = ChunkTable(b"".join(c.pack() for c in recs))
-    assert len(table) == 7 and table[3] == recs[3] and table[-1] == recs[-1]
-    assert list(table) == recs and table[2:5] == recs[2:5]
-    assert table.locate(0) == 0 and table.locate(69) == 6
-    assert table.range_indices(5, 25) == (0, 3)
-    assert table.range_indices(10, 20) == (1, 2)
-    assert table.range_indices(0, 0) == (0, 0)
-    table.check_coverage(70)
-    try:
-        table.locate(70)
-        raise AssertionError("an uncovered byte was located")
-    except CorruptArchive:
-        pass
-    shuffled = ChunkTable(b"".join(c.pack() for c in reversed(recs)))
-    assert shuffled.locate(35) == 3 and shuffled[3] == recs[3]
-    shuffled.check_coverage(70)
-    try:
-        ChunkTable(b"x" * 33)
-        raise AssertionError("a partial record was accepted")
-    except FormatError:
-        pass
-
-
 def test_tensor_blocks_addressing():
     """Each tensor's block range is recorded and matches the chunk table."""
     a = weights_bf16(300000, 81)
@@ -845,7 +863,7 @@ def test_tensor_blocks_addressing():
             for name, blob in (("a", a), ("b", b)):
                 tb = arc.tensor_blocks(name)
                 assert tb.size == len(blob) and tb.num_blocks == len(tb.chunks)
-                lo, hi = arc._chunks.range_indices(tb.offset, tb.offset + tb.size)
+                lo, hi = arc._reader.chunks.range_indices(tb.offset, tb.offset + tb.size)
                 assert tb.blocks == (lo, hi)
                 raw = b"".join(arc._block(i) for i in range(lo, hi))
                 assert raw[tb.block_offset:tb.block_offset + tb.size] == blob
@@ -855,84 +873,6 @@ def test_tensor_blocks_addressing():
             raise AssertionError("missing tensor should raise")
         except KeyError:
             pass
-
-
-def test_shared_table_rans_kernels():
-    """rANS encoding and decoding against a shared global table."""
-    if not kernels.have_rans():
-        raise Skip("rANS coder not available")
-    src = bytes(0x3E + (i % 5) for i in range(10000))
-    counts = kernels.histogram(src)
-    freqs = kernels.rans_freqs(counts)
-    assert freqs is not None and sum(freqs) == 4096
-
-    hdr = kernels.rans_shared_header(freqs)
-    assert len(hdr) == 516 and hdr.startswith(b"R1\0\0")
-
-    coded = kernels.rans_encode_shared(src, freqs)
-    assert coded is not None and len(coded) < len(src)
-
-    decoded = kernels.rans_decode_shared(coded, len(src), freqs)
-    assert bytes(decoded) == src
-
-    # Prepended header decodes cleanly under ordinary rans_decode
-    assert bytes(kernels.rans_decode(hdr + coded, len(src))) == src
-
-    # Damaged stream should be caught
-    corrupt = bytearray(coded)
-    corrupt[len(corrupt) // 2] ^= 0xFF
-    try:
-        got = kernels.rans_decode_shared(bytes(corrupt), len(src), freqs)
-        assert bytes(got) != src, "corruption went undetected"
-    except (FormatError, ValueError):
-        pass
-
-
-def test_shared_table_archive_roundtrip():
-    """Archives with --shared-table store and reuse the global frequency table."""
-    if not kernels.have_rans():
-        raise Skip("rANS coder not available")
-    w1 = weights_bf16(200000, 11)
-    w2 = weights_bf16(200000, 23)
-    with tempfile.TemporaryDirectory() as d:
-        path = os.path.join(d, "m.safetensors")
-        write_safetensors(path, [("w1", "BF16", [200000], w1),
-                                 ("w2", "BF16", [200000], w2)])
-        archive = os.path.join(d, "a.lmz")
-        stats = lmz.compress(path, archive, mapped=True, shared_table=True)
-        assert stats.detail.get("shared_table") is True
-
-        info = lmz.info(archive)
-        assert "shared_table" in info["manifest"]
-        st = bytes.fromhex(info["manifest"]["shared_table"])
-        assert len(st) == 516 and st.startswith(b"R1\0\0")
-
-        with open(archive, "rb") as fh:
-            reader = ArchiveReader(fh)
-            assert reader.shared_table == st
-            assert len(reader.shared_freqs) == 256
-            assert sum(reader.shared_freqs) == 4096
-            assert any(c.flags & lmzformat.FLAG_SHARED_TABLE for c in reader.chunks)
-
-        lmz.verify(archive)
-        out = os.path.join(d, "restored.safetensors")
-        lmz.decompress(archive, out)
-        assert digest(out) == digest(path)
-
-        with lmz.MappedArchive(archive) as arc:
-            assert arc.shared_table == st
-            assert arc.shared_freqs == reader.shared_freqs
-            assert arc.tensor("w1")[2] == w1
-            assert arc.tensor("w2")[2] == w2
-
-        # Appending to a shared-table archive preserves the table and decodes
-        w3 = weights_bf16(100000, 31)
-        path2 = os.path.join(d, "m2.safetensors")
-        write_safetensors(path2, [("w3", "BF16", [100000], w3)])
-        lmz.append(archive, path2)
-        lmz.verify(archive)
-        with lmz.MappedArchive(archive) as arc:
-            assert arc.tensor("w3", member="m2.safetensors")[2] == w3
 
 
 def test_options_are_honoured():
@@ -1176,6 +1116,95 @@ def test_delta_against_an_earlier_file():
         assert raw == moved
 
 
+def test_delta_source_does_not_depend_on_file_order():
+    """The archive must be the same whatever order the members arrive in.
+
+    Until 2026-09-03 the delta source was "the earliest member holding this
+    tensor", which is the lowest member index, which is directory order, which
+    is filename sort. On a base plus fine-tunes of it, whichever file sorted
+    first became everyone's source and siblings were subtracted from each other
+    rather than from the parent they share. On a real Qwen2.5-0.5B family that
+    was 17.6 points of ratio decided by a hyphen sorting before a dot.
+
+    A star of near-copies around one original is the shape that exposes it: any
+    member can serve as the source, but only the original is close to them all.
+    """
+    original = weights_bf16(400000, 61)
+    spokes = [nudged_bf16(original, s) for s in (70, 90, 110)]
+    # All different, so nothing dedups and the archive size reflects only the
+    # source choice. The dedup interaction has its own test below.
+    assert len({original, *spokes}) == 4
+    # Equal-length names, so an archive's size reflects its bytes and not the
+    # length of the filenames inside it.
+    blobs = [("hub0", original)] + [(f"spk{i}", b) for i, b in enumerate(spokes)]
+
+    sizes = set()
+    with tempfile.TemporaryDirectory() as d:
+        # Every rotation puts a different member first. The one starting with a
+        # spoke is the case that used to lose.
+        for rot in range(len(blobs)):
+            order = blobs[rot:] + blobs[:rot]
+            src = os.path.join(d, f"order{rot}")
+            os.makedirs(src)
+            for slot, (tag, blob) in enumerate(order):
+                write_safetensors(os.path.join(src, f"{slot:02d}_{tag}.safetensors"),
+                                  [("layer.0.weight", "BF16", [400000], blob)])
+            arc = os.path.join(d, f"order{rot}.lmz")
+            lmz.compress(src, arc)
+            # The coded payload, not the archive size: the manifest names the
+            # members in whatever order they came and stores offsets of
+            # different magnitudes, which moves the total by a handful of bytes
+            # for reasons that have nothing to do with what the coder decided.
+            with open(arc, "rb") as fh:
+                reader = ArchiveReader(fh)
+                sizes.add((reader.payload_end - min(c.off for c in reader.chunks),
+                           tuple(sorted(c.codec for c in reader.chunks))))
+
+            out = os.path.join(d, f"back{rot}")
+            lmz.decompress(arc, out)
+            for slot, (tag, _b) in enumerate(order):
+                name = f"{slot:02d}_{tag}.safetensors"
+                assert digest(os.path.join(src, name)) == digest(os.path.join(out, name))
+    assert len(sizes) == 1, sorted(sizes)
+
+
+def test_delta_sources_are_never_themselves_deltas():
+    """Resolving a delta stays a single hop, however the sources were chosen.
+
+    One member per group is coded directly and everyone else subtracts from it,
+    so no delta can point at another delta. Checked against the archive rather
+    than argued: every source offset must land in a range that is not itself
+    coded as a difference.
+    """
+    original = weights_bf16(400000, 62)
+    blobs = [("hub", original)] + [(f"spoke{i}", nudged_bf16(original, 80 + i))
+                                   for i in range(3)]
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "family")
+        os.makedirs(src)
+        # Deliberately named so a spoke sorts first.
+        for tag, blob in blobs:
+            write_safetensors(os.path.join(src, f"{tag}.safetensors"),
+                              [("layer.0.weight", "BF16", [400000], blob)])
+        arc = os.path.join(d, "family.lmz")
+        lmz.compress(src, arc)
+        with open(arc, "rb") as fh:
+            reader = ArchiveReader(fh)
+            deltas = [c for c in reader.chunks
+                      if c.codec == lmzformat.CODEC_DELTA]
+            assert deltas, "expected deltas in this archive"
+            assert any(c.codec == lmzformat.CODEC_REF for c in reader.chunks), \
+                "expected a dedup ref, which is what makes this test bite"
+            spans = [(c.dst, c.dst + c.rlen) for c in deltas]
+            for c in deltas:
+                fh.seek(c.off)
+                src_off, _inner, _hdr = codec.delta_source(fh.read(16))
+                for s, e in spans:
+                    assert not (s <= src_off < e), (
+                        f"a delta at {c.dst} subtracts from a delta at {s}")
+        lmz.verify(arc)
+
+
 def test_delta_declines_when_the_files_differ():
     """Unrelated tensors must not be coded as differences from each other."""
     with tempfile.TemporaryDirectory() as d:
@@ -1353,6 +1382,18 @@ def test_append_grows_an_archive_like_one_shot():
         g, o = os.path.getsize(grown), os.path.getsize(one)
         assert abs(g - o) < max(4096, o // 200), (g, o)
         assert g < sum(len(b) for b in steps) * 0.9
+
+        # Both archives, not just the grown one. Comparing sizes catches a
+        # source choice that codes more than it should -- that is how the 2026-09-03
+        # rewrite of the chooser was caught here -- but only because the damage
+        # happened to change the total. An archive of the right size whose refs
+        # or deltas resolve through each other would have passed: nothing in
+        # this test ever decoded `one`, and compressing does not verify.
+        lmz.verify(one)
+        one_out = os.path.join(d, "one_back")
+        lmz.decompress(one, one_out)
+        for i, p in enumerate(names):
+            assert digest(p) == digest(os.path.join(one_out, f"ck{i}.safetensors"))
 
         lmz.verify(grown)
         out = os.path.join(d, "back")
@@ -1577,6 +1618,482 @@ def test_pytorch_bin_layout_and_roundtrip():
         # Two of four byte planes in the fp32 payload are zeros; anything
         # near or below 1.5x means the container was not really parsed.
         assert stats.ratio > 1.5, f"fp32-from-bf16 only reached {stats.ratio:.3f}x"
+
+
+def _pb_varint(v: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        out.append(b | (0x80 if v else 0))
+        if not v:
+            return bytes(out)
+
+
+def _pb_len(field: int, payload: bytes) -> bytes:
+    return _pb_varint(field << 3 | 2) + _pb_varint(len(payload)) + payload
+
+
+def _pb_int(field: int, value: int) -> bytes:
+    return _pb_varint(field << 3) + _pb_varint(value)
+
+
+def _onnx_tensor(name: str, dtype_id: int, dims, raw: bytes) -> bytes:
+    """One TensorProto, written the way an exporter writes it."""
+    return (b"".join(_pb_int(1, d) for d in dims)
+            + _pb_int(2, dtype_id)
+            + _pb_len(8, name.encode())
+            + _pb_len(9, raw))
+
+
+def _onnx_model(tensors) -> bytes:
+    graph = b"".join(_pb_len(5, t) for t in tensors) + _pb_len(2, b"main")
+    return _pb_int(1, 8) + _pb_len(7, graph) + _pb_len(8, b"test")
+
+
+def test_onnx_initializers_are_addressed_and_typed():
+    """ONNX is what perception ships in, and its weights must be typed.
+
+    Without a parse every initializer travels as opaque bytes, and the
+    byte-position planes cannot phase-align because nothing knows the element
+    width -- an fp16 exponent then smears across positions instead of
+    collecting in one plane. The offsets have to land on the real bytes, and
+    the dtypes have to reach the same splitter safetensors uses.
+    """
+    f32 = rand(4096, 3)
+    f16 = rand(2048, 5)
+    i8 = rand(256, 7)
+    model = _onnx_model([
+        _onnx_tensor("conv1.weight", 1, [16, 64], f32),      # FLOAT
+        _onnx_tensor("conv2.weight", 10, [8, 128], f16),     # FLOAT16
+        _onnx_tensor("quant.weight", 3, [16, 16], i8),       # INT8
+        _onnx_tensor("attn.weight", 16, [2, 2], rand(8, 11)),  # BFLOAT16
+    ])
+
+    layout = planner.probe(io.BytesIO(model), len(model))
+    assert layout.kind == "onnx", layout.kind
+    assert set(layout.tensors) == {"conv1.weight", "conv2.weight",
+                                   "quant.weight", "attn.weight"}
+    assert layout.tensors["conv1.weight"]["dtype"] == "F32"
+    assert layout.tensors["conv1.weight"]["shape"] == [16, 64]
+    assert layout.tensors["quant.weight"]["dtype"] == "I8"
+
+    # The offsets must point at the weights themselves, not at the message.
+    for name, payload in (("conv1.weight", f32), ("conv2.weight", f16),
+                          ("quant.weight", i8)):
+        start, end = layout.tensors[name]["offsets"]
+        assert model[start:end] == payload, name
+
+    # And each region must carry the element width its splitter needs.
+    widths = sorted((r.end - r.start, r.esize, r.kind) for r in layout.regions)
+    assert (len(i8), 1, planner.KIND_BYTES) in widths
+    assert (len(f16), 2, planner.KIND_BYTES) in widths
+    assert (len(f32), 4, planner.KIND_BYTES) in widths
+    # BF16 reaches the conditioned path, exactly as it does from safetensors.
+    assert (8, 2, planner.KIND_BF16) in widths
+
+
+def test_onnx_that_is_not_onnx_degrades_to_bytes():
+    """Anything unexpected must become opaque bytes, never an exception.
+
+    `probe` runs on every file that is compressed, so a parser that raises on
+    a malformed or merely unfamiliar file would take the whole archive with
+    it. ONNX has no magic number either, so this parser is offered every file
+    the earlier ones declined.
+    """
+    good = _onnx_model([_onnx_tensor("w", 1, [4], rand(16, 2))])
+    assert planner.probe(io.BytesIO(good), len(good)).kind == "onnx"
+
+    cases = {
+        "empty": b"",
+        "not a protobuf": b"\xff\xff\xff\xff" + b"x" * 100,
+        "starts right, says nothing": b"\x08" + b"\x00" * 50,
+        "truncated mid-field": (_pb_int(1, 8) + _pb_varint(7 << 3 | 2)
+                                + _pb_varint(1000) + b"short"),
+        "no initializers": _pb_int(1, 8) + _pb_len(7, _pb_len(2, b"main")),
+        "initializer with no data": _onnx_model(
+            [_onnx_tensor("w", 1, [4], b"")]),
+        "length prefix past the file": (_pb_int(1, 8) + _pb_varint(7 << 3 | 2)
+                                        + _pb_varint(1 << 40) + b"x" * 10),
+        "deprecated group wire type": (_pb_int(1, 8)
+                                       + _pb_len(7, _pb_varint(5 << 3 | 3)
+                                                 + b"\x00")),
+    }
+    for name, data in cases.items():
+        assert planner.probe(io.BytesIO(data), len(data)).kind == "raw", name
+
+    # External-data tensors name a sidecar instead of carrying raw_data. There
+    # is nothing in the file to address, so it is not an ONNX layout here.
+    external = _pb_int(1, 8) + _pb_len(7, _pb_len(
+        5, _pb_int(2, 1) + _pb_len(8, b"w") + _pb_len(12, b"weights.bin")))
+    assert planner.probe(io.BytesIO(external), len(external)).kind == "raw"
+
+    # A dtype this build does not know, and a payload that is not a whole
+    # number of elements, both fall back to untyped bytes -- still addressed,
+    # just not split.
+    for model in (_onnx_model([_onnx_tensor("w", 999, [4], b"abcd" * 4)]),
+                  _onnx_model([_onnx_tensor("w", 1, [1], b"abc")])):
+        layout = planner.probe(io.BytesIO(model), len(model))
+        assert layout.kind == "onnx"
+        assert layout.tensors["w"]["dtype"] == "U8"
+        assert all(r.esize == 1 for r in layout.regions)
+
+
+def test_onnx_round_trips_through_an_archive():
+    """The parse has to survive the whole path, not just the planner."""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "m.onnx")
+        # fp16 weights with the structure real ones have: an exponent that
+        # occupies a handful of values and a mantissa that does not. Random
+        # bytes would only prove the parse survives, not that it helps.
+        payloads = []
+        for i in range(6):
+            noise = rand(1 << 16, i + 1)
+            payloads.append(bytes(
+                b if k % 2 == 0 else 0x38 | (b & 7)
+                for k, b in enumerate(noise)))
+        model = _onnx_model([
+            _onnx_tensor(f"layer{i}.weight", 10, [16, 2048], p)
+            for i, p in enumerate(payloads)])
+        with open(path, "wb") as fh:
+            fh.write(model)
+
+        archive = os.path.join(d, "m.lmz")
+        lmz.compress(path, archive)
+        out = os.path.join(d, "out.onnx")
+        lmz.decompress(archive, out)
+        assert digest(out) == digest(path)
+
+        info = lmz.info(archive)
+        assert info["members"][0]["kind"] == "onnx"
+        assert len(info["members"][0]["tensors"]) == 6
+
+        # Typed beats opaque, which is the whole reason to parse the
+        # container: without the element width the byte-position planes
+        # cannot phase-align, and an fp16 exponent smears across positions
+        # instead of collecting in one plane. Measured against the same bytes
+        # with the parser switched off.
+        real = planner.parse_onnx
+        try:
+            planner.parse_onnx = lambda f, size: None
+            blob = os.path.join(d, "blob.lmz")
+            lmz.compress(path, blob)
+            assert planner.probe(io.BytesIO(model), len(model)).kind == "raw"
+        finally:
+            planner.parse_onnx = real
+        assert os.path.getsize(archive) < os.path.getsize(blob), (
+            os.path.getsize(archive), os.path.getsize(blob))
+
+
+def test_int8_weights_are_coded_with_rans_not_zstd():
+    """int8 planes must reach the coder the GPU can decode.
+
+    A 1-byte element has no plane split, so an int8 tensor takes the general
+    path. rANS used to be priced there only where zstd had failed to dent the
+    stream by 1/32 -- a bar quantised weights never clear, because a
+    per-channel scale maps each filter's peak to 127 and leaves the body
+    concentrated enough for zstd to save a comfortable tenth. So rANS was
+    never tried, and `lmz.gpu`, which decodes rANS and nothing else, could
+    never touch an int8 archive.
+
+    The size difference is small either way. The point is which decoder can
+    read the result.
+    """
+    if not kernels.have_rans():
+        raise Skip("no native rANS kernel")
+
+    # A per-channel int8 weight plane: symmetric and peaked, but with no long
+    # repeats -- the distribution is the only structure, which is exactly the
+    # case a symbol coder wins and a match finder does not. Mapping distinct
+    # random bytes through a bell curve keeps every byte independent.
+    n = 1 << 20
+    bell = bytes(max(0, min(255, int(128 + 34 * math.sqrt(-2 * math.log(
+        (i + 0.5) / 256)) * math.cos(i * 2.39996))))
+        for i in range(256))
+    plane = rand(n, 9).translate(bell)
+
+    used, payload = codec._encode_stream(plane, 1, entropy.METHOD_ZSTD)
+    assert used == entropy.METHOD_RANS, entropy.METHOD_NAMES.get(used)
+    assert len(payload) < n
+    assert bytes(entropy.decompress(payload, used, n)) == plane
+
+    # Where a general-purpose coder genuinely wins -- long repeats, which are
+    # matches rather than symbol statistics -- it must still be chosen, and
+    # that holds whichever general coder this interpreter has. Naming zstd
+    # here would only test which Python is running: before 3.14 without the
+    # package there is none, and the fallback is deflate.
+    repetitive = b"the quick brown fox jumps over the lazy dog. " * 20000
+    used, out = codec._encode_stream(repetitive, 1, entropy.METHOD_ZSTD)
+    assert used in (entropy.METHOD_ZSTD, entropy.METHOD_DEFLATE), \
+        entropy.METHOD_NAMES.get(used)
+    # rANS on this stream is ~500 KB against deflate's ~5 KB, so choosing it
+    # would be a 90x regression rather than a close call.
+    assert len(out) < len(repetitive) // 100
+
+    # And incompressible bytes must still be stored, without either coder
+    # being run to find that out.
+    used, out = codec._encode_stream(rand(1 << 20, 77), 1, entropy.METHOD_ZSTD)
+    assert used == entropy.METHOD_STORED
+
+
+def test_a_missing_general_coder_does_not_hand_everything_to_rans():
+    """Without zstd, the fallback must still be priced against rANS.
+
+    Before 3.14 and without the `zstandard` package there is no zstd, so a
+    caller asking for it gets UnsupportedMethod. That used to leave the
+    general path with no candidate at all, and the branch that takes rANS
+    when nothing else worked would then accept it unpriced -- on text with
+    long repeats that is ~500 KB against deflate's ~5 KB, a ninety-fold
+    regression on exactly the interpreters that already compress worst.
+    """
+    if not kernels.have_rans():
+        raise Skip("no native rANS kernel")
+
+    repetitive = b"the quick brown fox jumps over the lazy dog. " * 20000
+    saved = (entropy._zstd_compress, entropy.HAVE_ZSTD, entropy.DEFAULT_METHOD)
+    try:
+        entropy._zstd_compress = None
+        entropy.HAVE_ZSTD = False
+        entropy.DEFAULT_METHOD = entropy.METHOD_DEFLATE
+        used, out = codec._encode_stream(repetitive, 1, entropy.METHOD_ZSTD)
+        assert used == entropy.METHOD_DEFLATE, entropy.METHOD_NAMES.get(used)
+        assert len(out) < len(repetitive) // 100, len(out)
+    finally:
+        (entropy._zstd_compress, entropy.HAVE_ZSTD,
+         entropy.DEFAULT_METHOD) = saved
+
+    # And with zstd back, the same stream picks it up again.
+    used, _ = codec._encode_stream(repetitive, 1, entropy.METHOD_ZSTD)
+    assert used in (entropy.METHOD_ZSTD, entropy.METHOD_DEFLATE)
+
+
+def test_shared_table_streams_are_ordinary_streams():
+    """A shared-table stream must decode through the untouched decoder.
+
+    The whole basis of the shared form is that lifting the 516-byte header out
+    of a stream leaves the coded bytes unchanged: prepend the table again and
+    it is an ordinary lmz stream. That makes `lmz_rans_decode` -- which knows
+    nothing about any of this -- the oracle, so there is no second decoder to
+    keep in step with the first.
+    """
+    if not kernels.have_rans():
+        raise Skip("no native rANS kernel")
+
+    plane, nstr = 8192, 24
+    # Peaked, the way a quantised weight plane is: a shared table is only
+    # interesting where the streams resemble each other.
+    table_map = bytes((abs(i - 128) // 3 + 100) % 256 for i in range(256))
+    segs = [rand(plane, seed + 1).translate(table_map) for seed in range(nstr)]
+
+    total = [0] * 256
+    for seg in segs:
+        for i, c in enumerate(kernels.histogram(seg)):
+            total[i] += c
+    shared = kernels.rans_table(total)
+    assert shared is not None and len(shared) == kernels.RANS_HEADER
+    assert shared[:2] == b"R1"
+
+    per_stream = headerless = 0
+    for seg in segs:
+        own = kernels.rans_encode(seg, kernels.histogram(seg))
+        coded = kernels.rans_encode_shared(seg, shared)
+        assert coded is not None
+        per_stream += len(own)
+        headerless += len(coded)
+        # The oracle, and the direct path, must both give the bytes back.
+        assert bytes(kernels.rans_decode(shared + coded, plane)) == seg
+        assert bytes(kernels.rans_decode_shared(coded, plane, shared)) == seg
+
+    # 516 bytes a stream, paid once instead of nstr times. The coded bytes
+    # themselves are not identical to the per-stream form -- a shared table
+    # holds slightly different probabilities, so it codes slightly worse per
+    # stream and wins by not repeating the header.
+    assert headerless + len(shared) < per_stream
+
+    # Coding a stream against its own table is exactly the ordinary form with
+    # the header lifted off, which is the property the oracle above rests on.
+    lone = kernels.histogram(segs[0])
+    assert (len(kernels.rans_encode(segs[0], lone))
+            == len(kernels.rans_encode_shared(segs[0], kernels.rans_table(lone)))
+            + kernels.RANS_HEADER)
+
+
+def test_shared_table_refuses_what_it_cannot_code():
+    """A table that cannot represent a symbol must refuse, not mis-code.
+
+    A shared table comes from counts the caller gathered, and a caller that
+    gathers them over the wrong set produces a table with a zero frequency for
+    a symbol that really occurs. The coder cannot represent it; encoding
+    anyway would emit a stream that decodes to different bytes, which is the
+    one outcome an archiver must never produce.
+    """
+    if not kernels.have_rans():
+        raise Skip("no native rANS kernel")
+
+    partial = kernels.rans_table(kernels.histogram(bytes([1, 2, 3]) * 400))
+    assert partial is not None
+    assert kernels.rans_encode_shared(bytes([1, 2, 3]) * 400, partial) is not None
+    # 200 never appeared in the counts, so it has no frequency to code with.
+    assert kernels.rans_encode_shared(bytes([1, 2, 200]) * 400, partial) is None
+
+    # A table whose frequencies do not sum to the coder's scale is malformed
+    # in both directions.
+    broken = bytearray(partial)
+    broken[4] = (broken[4] + 1) & 0xFF
+    assert kernels.rans_encode_shared(bytes([1, 2, 3]) * 400, bytes(broken)) is None
+    try:
+        kernels.rans_decode_shared(b"\0" * 64, 64, bytes(broken))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a malformed table must not decode")
+
+    try:
+        kernels.rans_encode_shared(b"abc" * 100, partial[:-1])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a short table must be rejected")
+
+    # One symbol at the full probability scale is the edge the stream header
+    # biases for; it has to survive the shared path too.
+    one = kernels.rans_table(kernels.histogram(b"\x07" * 5000))
+    coded = kernels.rans_encode_shared(b"\x07" * 5000, one)
+    assert bytes(kernels.rans_decode_shared(coded, 5000, one)) == b"\x07" * 5000
+
+
+def _shared_model(path, tensors=24, nelem=12000):
+    """A checkpoint whose tensors sit at different scales, as layers do."""
+    write_safetensors(path, [
+        (f"layer.{i}.weight", "F32", [nelem],
+         weights_f32_from_f16(nelem, seed=i + 1, band=(i % 7)))
+        for i in range(tensors)])
+
+
+def test_shared_tables_shrink_a_page_mapped_archive():
+    """The fixed cost a small archive cannot amortise, actually removed.
+
+    A 64 KiB block archive pays 516 bytes of frequency table per stream, and
+    on a model of a few megabytes that is a material fraction of the payload.
+    This is the whole justification for the format option, so it is asserted
+    as a size, not just as a round trip.
+    """
+    if not kernels.have_rans():
+        raise Skip("no native rANS kernel")
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "m.safetensors")
+        _shared_model(src)
+        before = digest(src)
+
+        sizes = {}
+        for tag, shared in (("own", False), ("shared", True)):
+            arc = os.path.join(d, f"{tag}.lmz")
+            out = os.path.join(d, f"out-{tag}")
+            lmz.compress(src, arc, mapped=True, shared_tables=shared)
+            lmz.decompress(arc, out, overwrite=True)
+            assert digest(out) == before, f"{tag} did not round-trip"
+            sizes[tag] = os.path.getsize(arc)
+
+        assert sizes["shared"] < sizes["own"], (
+            f"shared tables did not pay: {sizes['shared']} vs {sizes['own']}")
+
+
+def test_shared_tables_are_decided_per_plane():
+    """Pooling wins on some planes of a file and loses on others.
+
+    An fp32 checkpoint upcast from fp16 is the case: its low byte planes are
+    near-constant and pool perfectly, while its high byte carries a per-tensor
+    scale and pools badly. An all-or-nothing rule would throw away the planes
+    that did win, so the manifest is expected to hold *some* kinds and not
+    all of them -- and every chunk must still round-trip.
+    """
+    if not kernels.have_rans():
+        raise Skip("no native rANS kernel")
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "m.safetensors")
+        _shared_model(src)
+        arc = os.path.join(d, "a.lmz")
+        lmz.compress(src, arc, mapped=True, shared_tables=True)
+        with open(arc, "rb") as fh:
+            reader = lmzformat.ArchiveReader(fh)
+            kinds = set((reader.manifest.get("tables") or {}))
+            codecs = {c.codec for c in reader.chunks}
+        assert kinds, "no plane kind was worth a shared table"
+        assert kinds != {f"{lmzformat.CODEC_SPLIT}:4:{k}" for k in range(4)}, \
+            "every plane pooled; this fixture no longer tests the mixed case"
+        assert lmzformat.CODEC_SPLIT_ST in codecs, \
+            "tables were written but no chunk used them"
+
+
+def test_shared_table_chunk_needs_its_manifest():
+    """A v7 chunk without its tables is corruption, not a wrong answer.
+
+    The coded bytes carry no frequencies of their own, so a reader that has
+    lost the manifest's table set cannot decode them and must say so rather
+    than produce plausible garbage.
+    """
+    if not kernels.have_rans():
+        raise Skip("no native rANS kernel")
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "m.safetensors")
+        _shared_model(src)
+        arc = os.path.join(d, "a.lmz")
+        lmz.compress(src, arc, mapped=True, shared_tables=True)
+        with open(arc, "rb") as fh:
+            reader = lmzformat.ArchiveReader(fh)
+            chunk = next(c for c in reader.chunks
+                         if c.codec == lmzformat.CODEC_SPLIT_ST)
+            fh.seek(chunk.off)
+            payload = fh.read(chunk.clen)
+        try:
+            codec.decode_chunk(payload, chunk.codec, chunk.esize, chunk.flags,
+                               chunk.rlen, chunk.crc, True, tables=None)
+        except lmzformat.CorruptArchive:
+            pass
+        else:
+            raise AssertionError("a shared-table chunk decoded without tables")
+
+
+def test_version_stamp_follows_the_codecs_used():
+    """The stamp is a requirement on the reader, not a build number.
+
+    Writing the newest version unconditionally would make every ordinary
+    archive this build produces unreadable to the previous release, which can
+    decode all of it. Only an archive that really uses a v7 codec is v7.
+    """
+    if not kernels.have_rans():
+        raise Skip("no native rANS kernel")
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "m.safetensors")
+        _shared_model(src)
+        for shared, want in ((False, lmzformat.BASE_VERSION), (True, 7)):
+            arc = os.path.join(d, f"v{int(shared)}.lmz")
+            lmz.compress(src, arc, mapped=True, shared_tables=shared)
+            with open(arc, "rb") as fh:
+                _magic, ver = lmzformat.HEADER.unpack(
+                    fh.read(lmzformat.HEADER_SIZE))[:2]
+            assert ver == want, f"shared={shared} stamped v{ver}, wanted v{want}"
+
+
+def test_primer_declines_when_pooling_loses():
+    """The decision is a measurement, and it has to be able to say no.
+
+    Streams drawn from unrelated distributions cost more against one pooled
+    table than they do against their own, header included. A primer that
+    kept a table there would make the archive bigger, which is the failure
+    mode the whole-archive table showed on real models.
+    """
+    if not kernels.have_rans():
+        raise Skip("no native rANS kernel")
+    alike, unlike = freqs.Primer(), freqs.Primer()
+    for i in range(16):
+        same = bytes((j * 7 + 3) % 32 for j in range(4096))
+        alike.add("2:4:0", kernels.histogram(same))
+        # Each stream a narrow band of its own, disjoint from its neighbours'.
+        band = bytes((i * 16 + (j % 16)) & 0xFF for j in range(4096))
+        unlike.add("2:4:0", kernels.histogram(band))
+    assert alike.build(), "identical streams must pool"
+    assert not unlike.build(), "disjoint streams must not pool"
 
 
 def test_stride_kernels():
@@ -2110,6 +2627,215 @@ def test_v3_q8_block_chunks_still_decode():
     assert bytes(got) == data
 
 
+def test_opening_a_huge_index_stays_cheap():
+    """Opening must not scale with the number of chunks.
+
+    The chunk table used to become one Python object per chunk at open: for a
+    70B checkpoint that is 70 MB of records turning into ~0.5 GB of objects
+    and about five seconds, paid by every process before it read a byte, and
+    it is why mounting a large store was expensive. The records are
+    fixed-width, so the decompressed bytes are already the index.
+
+    Sized so the old behaviour cannot pass: 400k chunks is roughly 100 MB of
+    objects, against a 12.8 MB table.
+    """
+    from lmz.format import RECORD, ChunkTable
+
+    n = 400_000
+    table = b"".join(RECORD.pack(i * 65536, i * 65536, 65536, 65536, 0, 1, 2, 0)
+                     for i in range(n))
+
+    tracemalloc.start()
+    try:
+        before = tracemalloc.get_traced_memory()[0]
+        t0 = time.perf_counter()
+        chunks = ChunkTable(table)
+        assert len(chunks) == n
+        cost = tracemalloc.get_traced_memory()[0] - before
+        elapsed = time.perf_counter() - t0
+    finally:
+        tracemalloc.stop()
+
+    # Materialising even one field of every chunk would be megabytes; this is
+    # a couple of attributes regardless of how many chunks there are.
+    assert cost < 100_000, f"opening allocated {cost} bytes for {n} chunks"
+    assert elapsed < 0.5, f"opening took {elapsed:.2f}s for {n} chunks"
+
+    # And it still behaves like the list it replaced.
+    assert chunks[0].dst == 0
+    assert chunks[-1].dst == (n - 1) * 65536
+    assert chunks[5].off == 5 * 65536
+    assert chunks[-1] == chunks[n - 1]
+    assert [c.dst for c in chunks[:3]] == [0, 65536, 131072]
+    try:
+        chunks[n]
+    except IndexError:
+        pass
+    else:
+        raise AssertionError("an out-of-range index must raise IndexError")
+
+    # The column shortcut has to agree with walking the records, or the
+    # aggregate paths that use it would report something different from the
+    # ones that iterate.
+    assert sum(chunks.column("clen")) == sum(c.clen for c in chunks)
+    assert list(chunks.column("dst")) == [c.dst for c in chunks]
+
+
+def test_chunk_order_survives_a_table_written_out_of_order():
+    """Chunks are appended as workers finish, so dst order is not the file's.
+
+    order_by_dst() skips the sort when the table is already ascending, which
+    is the common case -- and a wrong sortedness test would silently hand back
+    an unordered list, which every offset lookup downstream depends on.
+    """
+    from lmz.format import RECORD, ChunkTable
+
+    order = [3, 0, 4, 1, 2]
+    table = b"".join(RECORD.pack(1000 + i * 10, d * 65536, 10, 65536, 0, 1, 2, 0)
+                     for i, d in enumerate(order))
+    chunks = ChunkTable(table)
+
+    assert [c.dst for c in chunks] == [d * 65536 for d in order]
+    assert [c.dst for c in chunks.order_by_dst()] == [d * 65536 for d in sorted(order)]
+    # The payload offset must travel with its record rather than the position.
+    assert [c.off for c in chunks.order_by_dst()] == [1010, 1030, 1040, 1000, 1020]
+
+    ascending = b"".join(RECORD.pack(100, d * 65536, 10, 65536, 0, 1, 2, 0)
+                         for d in range(5))
+    assert [c.dst for c in ChunkTable(ascending).order_by_dst()] == \
+        [d * 65536 for d in range(5)]
+
+    # Equal destinations are not ascending-violating, and a single record and
+    # an empty table are the boundaries the zip-based check has to survive.
+    same = b"".join(RECORD.pack(100, 0, 10, 0, 0, 1, 2, 0) for _ in range(3))
+    assert len(ChunkTable(same).order_by_dst()) == 3
+    assert len(ChunkTable(RECORD.pack(1, 2, 3, 4, 0, 1, 2, 0)).order_by_dst()) == 1
+    assert ChunkTable(b"").order_by_dst() == []
+    assert len(ChunkTable(b"")) == 0
+
+    try:
+        ChunkTable(b"\0" * (RECORD.size + 1))
+    except FormatError:
+        pass
+    else:
+        raise AssertionError("a partial record must be rejected")
+
+
+def test_archive_index_decodes_without_doing_io():
+    """A caller must be able to fetch payloads itself and hand them back.
+
+    `decompress` reads and decodes inside one worker, so the thread count that
+    sets decode throughput also sets how many reads are outstanding -- and
+    those want opposite things. The only way out is a decode that touches no
+    file, which is this. What it must produce is exactly what `decompress`
+    produces, or it is a second decoder rather than the same one.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "m.safetensors")
+        write_safetensors(path, [
+            ("w", "BF16", [65536], weights_bf16(65536, 11)),
+            ("dup", "BF16", [65536], weights_bf16(65536, 11)),   # a ref chunk
+            ("f", "F32", [16384], rand(65536, 3)),
+        ])
+        archive = os.path.join(d, "a.lmz")
+        lmz.compress(path, archive, mapped=True)
+        expect = os.path.join(d, "expect.bin")
+        lmz.decompress(archive, expect)
+        want = open(expect, "rb").read()
+
+        index = lmz.ArchiveIndex(archive)
+        assert index.original_size == len(want)
+        refs = index.chunks()
+        assert refs and [c.index for c in refs] == list(range(len(refs)))
+        # Output order, so a caller can stream them into place.
+        assert [c.dst for c in refs] == sorted(c.dst for c in refs)
+
+        out = bytearray(len(want))
+        deferred = 0
+        with open(archive, "rb") as fh:
+            for ref in refs:
+                payload = os.pread(fh.fileno(), ref.clen, ref.off)
+                assert len(payload) == ref.clen
+                try:
+                    plain = index.decode(ref, payload)
+                except lmz.ArchiveIndex.NeedsSource:
+                    # Coded against another range; decompress owns that.
+                    deferred += 1
+                    out[ref.dst:ref.dst + ref.rlen] = want[ref.dst:ref.dst + ref.rlen]
+                    continue
+                assert len(plain) == ref.rlen
+                out[ref.dst:ref.dst + ref.rlen] = plain
+        assert bytes(out) == want
+        # The duplicate tensor must actually have produced a ref chunk, or
+        # this test never exercised the case it claims to.
+        assert deferred >= 1
+
+        # A payload of the wrong length is caught rather than decoded.
+        try:
+            index.decode(refs[0], b"\0" * (refs[0].clen + 1))
+        except FormatError:
+            pass
+        else:
+            raise AssertionError("a short payload must be refused")
+
+
+def test_capabilities_are_declared_not_inferred():
+    """An archive must say which decoders can read it.
+
+    lmz emits CODEC_BF16C for large enough chunks, and the batch decoder
+    cannot read it -- its per-bucket segments have unequal lengths. Nothing in
+    the archive used to say so, so a consumer that wanted a GPU-readable
+    archive had to reproduce lmz's own encoder threshold and would not notice
+    the day it changed.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "m.safetensors")
+        # Big enough to clear the conditioning threshold, and shaped so that
+        # conditioning actually wins -- the encoder prices it rather than
+        # taking it on size alone, so uniform noise would quietly produce a
+        # plain split and this test would pass without reaching its subject.
+        # Big enough to clear the conditioning threshold, and shaped so the
+        # conditioned codec must win -- the encoder prices it rather than
+        # choosing it on size alone, so ordinary weights would produce a plain
+        # split and this test would pass without reaching its subject.
+        n = 1 << 21
+        write_safetensors(path, [("w", "BF16", [n], weights_bf16_cond(n, 5))])
+
+        whole = os.path.join(d, "whole.lmz")
+        lmz.compress(path, whole)
+        cap = lmz.capabilities(whole)
+        assert cap["derived"] is False
+        assert 0.0 <= cap["batch_decodable_fraction"] <= 1.0
+        # The case the item exists for: lmz emitted a codec its own batch
+        # decoder cannot read, and the archive now says so.
+        assert cap["blockers"] == {"bf16-cond": 1}, cap["blockers"]
+        assert cap["batch_decodable"] is False
+
+        # The same weights in small blocks stay under the threshold, so the
+        # conditioned codec is never chosen and the archive is readable.
+        blocks = os.path.join(d, "blocks.lmz")
+        lmz.compress(path, blocks, mapped=True)
+        cap2 = lmz.capabilities(blocks)
+        assert cap2["batch_decodable"] is True, cap2["blockers"]
+        assert not cap2["blockers"]
+        assert cap2["batch_decodable_fraction"] == 1.0
+
+        # Shared tables raise the reader version and stay batch-decodable.
+        shared = os.path.join(d, "shared.lmz")
+        lmz.compress(path, shared, mapped=True, shared_tables=True)
+        cap3 = lmz.capabilities(shared)
+        assert cap3["batch_decodable"] is True, cap3["blockers"]
+        if cap3["shared_tables"]:
+            assert cap3["min_reader_version"] >= 7
+
+        # Every codec lmz can emit has an entry, or an archive using it would
+        # silently report itself unreadable.
+        from lmz import format as fmt
+        for cid, name in fmt.CODEC_NAMES.items():
+            assert cid in fmt.BATCH_DECODABLE, name
+        assert set(fmt.BATCH_DECODABLE) == set(fmt.CODEC_NAMES)
+
+
 def test_v1_archives_still_read():
     """Version-1 archives predate refs and conditioning; they must still open."""
     with tempfile.TemporaryDirectory() as d:
@@ -2417,7 +3143,7 @@ def test_gpu_decode_shared_table():
 
     sh_streams, sh_offsets = bytearray(), bytearray()
     for buf in plains:
-        coded = kernels.rans_encode_shared(buf, freqs)
+        coded = kernels.rans_encode_shared(buf, hdr)
         assert coded is not None
         sh_offsets += struct.pack("<QQ", len(sh_streams), len(coded))
         sh_streams += coded
@@ -2491,6 +3217,315 @@ def test_gpu_decode_over_distributions_and_shapes():
     assert checked >= 20, f"only {checked} shapes actually ran"
 
 
+def test_encode_options_match_the_signature():
+    """The declaration must not be able to drift from what compress accepts.
+
+    A table of options that has quietly fallen behind the function is worse
+    than no table, because a caller trusts it. So this checks the two against
+    each other by introspection rather than against a copy of the list: a new
+    keyword with no entry fails here, and so does an entry for a keyword that
+    no longer exists or whose default has moved.
+    """
+    import inspect
+
+    opts = lmz.encode_options()
+    sig = inspect.signature(lmz.compress)
+    keywords = {name: p for name, p in sig.parameters.items()
+                if p.kind is inspect.Parameter.KEYWORD_ONLY}
+
+    assert set(opts) == set(keywords), (
+        set(opts) ^ set(keywords), "declaration and signature disagree")
+    for name, param in keywords.items():
+        assert opts[name].default == param.default, name
+        assert opts[name].kind in ("format", "schedule", "observe"), name
+        assert opts[name].describes, name
+        assert opts[name].name == name
+
+    # src and dst are positional, and deliberately not options.
+    assert "src" not in opts and "dst" not in opts
+
+    # Exactly one scheduling knob today. If a second appears, it needs the
+    # same "fallback, never a decision" treatment, so make that deliberate.
+    assert [n for n, o in opts.items() if o.kind == "schedule"] == ["workers"]
+
+    # Undeclared keywords are rejected by the language, which is why the
+    # table does not have to police the call.
+    try:
+        lmz.compress("/nonexistent", "/nonexistent.lmz", not_an_option=1)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("an undeclared keyword must not be accepted")
+
+
+def test_scheduling_options_do_not_change_the_bytes():
+    """`workers` is declared `schedule`; that has to be true of the archive.
+
+    This is what makes the format/schedule split a property of lmz rather
+    than a naming convention. A future option misclassified as scheduling --
+    one that quietly changed chunking, say -- would produce different bytes
+    at different thread counts and fail here.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "m.bin")
+        # Enough chunks that the work really is spread across the workers.
+        with open(src, "wb") as fh:
+            fh.write((bytes(range(256)) * 4096) * 24)
+
+        digests = set()
+        for workers in (1, 2, 8, 16):
+            archive = os.path.join(d, f"w{workers}.lmz")
+            lmz.compress(src, archive, workers=workers)
+            digests.add(digest(archive))
+        assert len(digests) == 1, f"{len(digests)} distinct archives"
+
+        # And the schedule really did vary -- a default that collapsed to one
+        # thread would pass the check above without testing anything.
+        assert lmz.encode_options()["workers"].default is None
+
+
+def test_gpu_cost_model_is_publishable():
+    """The cost model is a contract, so its shape is checked even with no GPU.
+
+    A consumer builds a rate curve from these constants and decides whether
+    the coded route beats the plain one on its machine. A key that changes
+    name or a point published where the truth is an interval both land as a
+    wrong decision downstream rather than as an error, so the shape is pinned
+    here and the provenance is required to be present.
+    """
+    from lmz import gpu
+
+    # Both kernels publish a model, and a caller routing an ordinary archive
+    # needs the per-chunk one -- quoting the shared kernel's constants for a
+    # per-chunk archive would predict roughly four times the real throughput.
+    assert gpu.cost_model()["kernel"] == "shared"
+    for kern in ("shared", "per_chunk"):
+        assert gpu.cost_model(kern)["kernel"] == kern
+    try:
+        gpu.cost_model("fused")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown kernel name must be refused")
+
+    per = gpu.cost_model("per_chunk")
+    # Its table is per group with no fixed cost; the shared kernel is the
+    # reverse. That difference is the occupancy story, so it has to survive.
+    assert per["shmem_lut_bytes"] == 0
+    assert per["shmem_per_group_bytes"] > gpu.cost_model()["shmem_per_group_bytes"]
+    # Both must say whether their interval is a bracket or a point estimate.
+    # The two fields are named the same and mean different things -- the
+    # shared kernel's spans two occupancies, the per-chunk kernel's is
+    # run-to-run spread on the one launch pick_tpb allows -- and a consumer
+    # that cannot tell them apart will read noise as a range a device might
+    # land anywhere inside.
+    assert gpu.cost_model()["k_is_single_point_fit"] is False
+    assert per["k_is_single_point_fit"] is True
+
+    # The per-chunk kernel must cost *more* per byte than the shared one, and
+    # not wildly more. It reads a narrow table, which is a second dependent
+    # shared load per symbol; that is the whole trade the two-table design
+    # makes, so its k being lower would mean one of them was measured wrong,
+    # and its being several times higher would mean the narrow table costs far
+    # more than a load. Both intervals were measured in the compute-bound
+    # regime, which is the only place either is visible.
+    a_lo, a_hi = gpu.cost_model()["k_cycles_per_byte"]
+    b_lo, b_hi = per["k_cycles_per_byte"]
+    assert b_lo > a_lo, (a_lo, b_lo)
+    assert b_hi < 2 * a_hi, (a_hi, b_hi)
+
+    cm = gpu.cost_model()
+    for key in ("lanes", "states", "grain", "bytes_per_symbol",
+                "k_cycles_per_byte", "expansion", "bound", "provenance"):
+        assert key in cm, key
+
+    # Exact properties of the format: 8 interleaved states is what makes one
+    # stream 8 lanes of work, and the grain follows from it.
+    assert cm["lanes"] == 8 and cm["states"] == 8
+    assert cm["bytes_per_symbol"] == 1
+    assert cm["grain"] == gpu.grain()
+
+    # k is not pinned to a point, and must not be published as one.
+    lo, hi = cm["k_cycles_per_byte"]
+    assert 0 < lo < hi, cm["k_cycles_per_byte"]
+
+    assert cm["expansion"] > 1
+    assert cm["bound"]["compute_below_threads"] > 0
+    assert 0 < cm["bound"]["saturates_at_fraction_of_peak_dram"] <= 1
+
+    # A number without its conditions is not a measurement.
+    prov = cm["provenance"]
+    for key in ("kernel", "device", "machine", "archive", "method",
+                "k_derivation", "scaling", "status"):
+        assert prov.get(key), key
+
+    # A published constant that moves has to say why, or a consumer cannot
+    # tell a refinement from a contradiction and will either re-derive the
+    # reasoning or carry its own guess. `supersedes` is that statement, and it
+    # names the old value so the connection is findable.
+    assert "230" in prov["supersedes"], prov["supersedes"]
+    assert str(cm["k_cycles_per_byte"][0]) in prov["supersedes"]
+
+    # The shared-memory layout, as numbers rather than prose. A consumer
+    # divides its own device's budget by these to learn how many blocks it can
+    # hold, and compares that against the occupancy k was measured at: hold at
+    # least as many and the interval brackets the device, hold fewer and it is
+    # only a floor. Prose in provenance cannot be computed with, and a
+    # consumer restating it in its own constants is a copy that drifts.
+    assert cm["shmem_lut_bytes"] == gpu.PROB_SCALE * 4
+    assert cm["shmem_per_group_bytes"] == gpu.GRAIN + gpu.BUFB
+    lo_blocks, hi_blocks = cm["blocks_per_unit_at_measurement"]
+    assert 0 < lo_blocks <= hi_blocks
+
+    # The residency formula must be published, and must reproduce the
+    # residency figures published beside it. A consumer cannot infer the
+    # divisor from the three shared-memory fields -- dividing by a per-unit
+    # pool where the kernel used a per-block cap over-predicts, and the error
+    # hides on a card that is bandwidth-bound anyway and surfaces on the small
+    # devices the projections are about.
+    for kern in ("shared", "per_chunk"):
+        m = gpu.cost_model(kern)
+        assert "pool" in m["residency_formula"] and "cap" in m["residency_formula"]
+        cap, pool = 101376, 102400          # the device the figures were taken on
+        lo, hi = m["blocks_per_unit_at_measurement"]
+        blocks = set()
+        for threads in (32, 64, 96, 128, 160, 192, 384):
+            shm = m["shmem_lut_bytes"] + (threads // m["lanes"]) * m["shmem_per_group_bytes"]
+            if shm <= cap and pool // shm:
+                blocks.add(pool // shm)
+        assert lo in blocks and hi in blocks, (kern, lo, hi, sorted(blocks))
+
+    # The formula omits the per-unit thread limit on the stated grounds that
+    # shared memory binds first for this kernel. That is a claim about the
+    # footprint, not a law, so it is checked: if a smaller table ever makes
+    # threads the binding limit, the formula needs the min() term it currently
+    # says can be dropped.
+    for kern in ("shared", "per_chunk"):
+        m = gpu.cost_model(kern)
+        cap, pool, threads_per_unit = 101376, 102400, 1536
+        for threads in (32, 64, 96, 128, 160, 192, 256, 384):
+            shm = m["shmem_lut_bytes"] + (threads // m["lanes"]) * m["shmem_per_group_bytes"]
+            if shm > cap:
+                continue
+            assert pool // shm <= threads_per_unit // threads, (
+                kern, threads, "threads now bind before shared memory; "
+                "residency_formula must take the min")
+
+    # Those constants mirror the kernel, so they are checked against what the
+    # library itself reports rather than trusted. `grain` is the one the C ABI
+    # exposes directly; if it disagrees, the mirror has drifted.
+    assert gpu.GRAIN == gpu.grain()
+    assert gpu.NST == cm["lanes"] == cm["states"]
+
+    # A block's request must be positive and must actually fit somewhere: a
+    # layout needing more than the 48 KiB every CUDA device grants without
+    # opting in would decline on hardware the kernel claims to support.
+    one_group = cm["shmem_lut_bytes"] + cm["shmem_per_group_bytes"]
+    assert 0 < one_group <= 99 * 1024
+
+
+def test_gpu_device_entry_point_owns_nothing():
+    """The device path must take the caller's memory and synchronise nothing.
+
+    A consumer that has built its own context, staging ring and event chain
+    cannot share a device with a library that quietly builds its own. This is
+    the entry point that lets it drive lmz instead, so what is checked is that
+    it exists, that it is exported, and -- where there is a GPU -- that it
+    decodes correctly against pointers the caller allocated in a context the
+    caller created.
+    """
+    from lmz import gpu
+
+    assert "decode_batch_dev" in gpu.__all__
+    assert callable(gpu.decode_batch_dev)
+
+    # Declining is a status, not an exception -- the caller is mid-pipeline and
+    # the decision to fall back is theirs. Which status depends on whether
+    # there is a device, and asserting either one unconditionally tests the
+    # machine rather than the code: an empty batch is OK where the library
+    # loaded and ENODEV where it did not, because the load is checked first.
+    ok, _why = gpu.available()
+    empty = gpu.decode_batch_dev(1, 1, 0, 128, 1)
+    assert empty == (gpu.OK if ok else gpu.ENODEV), empty
+    if not ok:
+        assert gpu.decode_batch_dev(1, 1, 4, 128, 1) == gpu.ENODEV
+        raise Skip("no GPU decoder")
+    if not gpu.backend().startswith("cuda:"):
+        raise Skip("libcuda.so.1 device entry point test is CUDA-only")
+
+    import ctypes
+    import struct
+
+    cuda = ctypes.CDLL("libcuda.so.1")
+    assert cuda.cuInit(0) == 0
+    dev, ctx = ctypes.c_int(), ctypes.c_void_p()
+    assert cuda.cuDeviceGet(ctypes.byref(dev), 0) == 0
+    assert cuda.cuCtxCreate_v2(ctypes.byref(ctx), 0, dev) == 0
+    try:
+        plane, nstr = 4096, 32
+        table = bytes((abs(i - 128) // 3 + 100) % 256 for i in range(256))
+        segs = [rand(plane, i + 1).translate(table) for i in range(nstr)]
+        streams, offsets = bytearray(), bytearray()
+        for seg in segs:
+            coded = kernels.rans_encode(seg, kernels.histogram(seg))
+            offsets += struct.pack("<QQ", len(streams), len(coded))
+            streams += coded
+        # The caller owns the padding here, because the allocation is the
+        # caller's -- decode_batch adds it on the device, this cannot.
+        blob = bytes(streams) + b"\0" * gpu.pad_bytes()
+
+        ptrs = []
+
+        def alloc(n):
+            p = ctypes.c_void_p()
+            assert cuda.cuMemAlloc_v2(ctypes.byref(p), ctypes.c_size_t(n)) == 0
+            ptrs.append(p)
+            return p
+
+        d_streams, d_off, d_out = alloc(len(blob)), alloc(len(offsets)), \
+            alloc(nstr * plane)
+        cuda.cuMemcpyHtoD_v2(d_streams, blob, ctypes.c_size_t(len(blob)))
+        cuda.cuMemcpyHtoD_v2(d_off, bytes(offsets), ctypes.c_size_t(len(offsets)))
+
+        rc = gpu.decode_batch_dev(d_streams.value, d_off.value, nstr, plane,
+                                  d_out.value)
+        assert rc == gpu.OK, (rc, gpu.last_error())
+        # It did not synchronise; the caller does, which is the point.
+        assert cuda.cuCtxSynchronize() == 0
+        host = ctypes.create_string_buffer(nstr * plane)
+        cuda.cuMemcpyDtoH_v2(host, d_out, ctypes.c_size_t(nstr * plane))
+        assert host.raw[:nstr * plane] == b"".join(segs)
+    finally:
+        for p in ptrs:
+            cuda.cuMemFree_v2(p)
+        cuda.cuCtxDestroy_v2(ctx)
+
+
+def test_gpu_verify_reports_this_machine():
+    """`lmz doctor --gpu-verify` is the field report, so it has to be right.
+
+    It is the one thing a stranger with a Turing card will run, and its answer
+    is the only evidence that will ever exist for that architecture. A verdict
+    that is wrong in either direction is worse than no command at all.
+    """
+    from lmz import gpu
+
+    ok, why = gpu.available()
+    r = gpu.verify(quick=True)
+    assert r["lmz"] == lmz.__version__
+    if not ok:
+        assert r["ok"] is False and r["device"] is None and r["why"]
+        raise Skip(f"no GPU decoder: {why}")
+    assert r["ok"] is True, r["failures"]
+    assert r["checked"] >= 5 and not r["failures"]
+    assert r["gbps"] and r["gbps"] > 0
+
+    out = subprocess.run([*CLI, "doctor", "--gpu-verify"], capture_output=True,
+                         text=True)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "byte-identical" in out.stdout and "verdict  OK" in out.stdout
+
+
 def test_gpu_refuses_a_device_that_disagrees_with_the_cpu():
     """A card whose answer differs from the CPU's is not used at all.
 
@@ -2518,6 +3553,82 @@ def test_gpu_refuses_a_device_that_disagrees_with_the_cpu():
         gpu._state, gpu._lib = "unloaded", None
         gpu.available()          # re-probe honestly for whatever runs next
     assert gpu.backend().startswith(("cuda:", "metal:"))
+
+
+def test_gpu_probe_survives_a_driver_that_crashes():
+    """Loading the CUDA library must not be able to kill the caller.
+
+    A driver that is half-removed or mid-upgrade leaves libcuda.so.1 on disk
+    with an initialiser that faults, and `ctypes.CDLL` then takes the whole
+    interpreter down -- no return code involved. That happened for real, so
+    the first load is done in a child process that is allowed to die. This
+    runs everywhere: it is the plumbing, not the driver.
+    """
+    from lmz import gpu
+
+    # What matters is that it declines with a reason and does not raise. The
+    # wording is the platform's -- macOS dlopen and glibc describe a missing
+    # library quite differently -- so asserting on it tests dyld, not lmz.
+    ok, why = gpu._probe_elsewhere("/nonexistent/nothing-here.so")
+    assert ok is False and why.strip(), repr(why)
+
+    junk = os.path.join(tempfile.mkdtemp(), "junk.so")
+    with open(junk, "wb") as fh:
+        fh.write(b"not an ELF file at all")
+    ok, why = gpu._probe_elsewhere(junk)
+    assert ok is False and why.strip(), repr(why)
+
+    # A child that dies from a signal must be reported as a crash rather than
+    # raising, because that is the case the guard exists for.
+    saved = gpu._PROBE_SOURCE
+    try:
+        # On macOS, an uncaught SIGSEGV spawns Apple CrashReporter dialog.
+        # SIGKILL tests the identical subprocess signal-death path without alerting the desktop.
+        sig = "signal.SIGKILL" if sys.platform == "darwin" else "signal.SIGSEGV"
+        gpu._PROBE_SOURCE = f"import os, signal\nos.kill(os.getpid(), {sig})\n"
+        ok, why = gpu._probe_elsewhere(junk)
+        assert ok is False, why
+        assert "crashed" in why and "staying on the CPU" in why, why
+    finally:
+        gpu._PROBE_SOURCE = saved
+
+
+def test_colab_notebook_still_opens():
+    """The badge in the README is the only path most people will ever take.
+
+    It is a JSON file that gets hand-edited whenever the evidence changes, and
+    a stray comma makes Colab show a load error instead of the notebook -- at
+    which point the field reports simply stop arriving and nothing says why.
+    The runtime metadata matters just as much: without `accelerator` and a T4
+    `gpuType` the notebook opens on a CPU runtime, prints "no CUDA device",
+    and asks a card-specific question of no card at all.
+    """
+    path = os.path.join(ROOT, "docs", "verify-on-colab.ipynb")
+    with open(path, encoding="utf-8") as fh:
+        nb = json.load(fh)
+
+    assert nb["metadata"]["accelerator"] == "GPU"
+    assert nb["metadata"]["colab"]["gpuType"] == "T4"
+    assert nb["nbformat"] == 4
+
+    cells = nb["cells"]
+    assert cells, "an empty notebook opens fine and asks nothing"
+    for c in cells:
+        assert c["cell_type"] in ("markdown", "code")
+        # nbformat allows a bare string here and Colab reads it, but an editor
+        # that rewrites one cell that way turns the next prose change into a
+        # single 3000-character line nobody can review. Keep the line lists.
+        assert isinstance(c["source"], list), c["cell_type"]
+        if c["cell_type"] == "code":
+            assert "outputs" in c and "execution_count" in c
+
+    body = "\n".join("".join(c["source"]) for c in cells)
+    # The two things the notebook exists to do: install the published wheel
+    # and run the check. A doc edit that loses either leaves a page that reads
+    # well and reports nothing.
+    assert "pip install -q lmzip" in body
+    assert "doctor --gpu-verify" in body
+    assert "github.com/FanxinSun/lmz/issues" in body
 
 
 def test_gpu_build_declines_hardware_it_cannot_target():
@@ -3043,6 +4154,189 @@ def main() -> int:
     tail = f", {len(skipped)} skipped" if skipped else ""
     print(f"\n{len(tests) - len(failed) - len(skipped)}/{len(tests)} passed{tail}")
     return 1 if failed else 0
+
+
+def test_append_dedups_a_copy_of_a_plain_member():
+    """A re-upload of something stored plainly costs a reference, not a copy.
+
+    The hub is full of exact re-uploads, and `compress` has always taken them
+    for eight bytes: it deduplicates before it deltas. `append` had no
+    reference path at all, so a duplicate was coded against whatever base was
+    nearest and charged nearly in full. Found by measuring the hub against
+    ZipLLM's method, where the same three files scored 194 MiB compressed in
+    one shot against 197 MiB grown one at a time.
+    """
+    base = weights_bf16(700000, 61)
+    with tempfile.TemporaryDirectory() as d:
+        first = os.path.join(d, "first")
+        os.makedirs(first)
+        write_safetensors(os.path.join(first, "base.safetensors"),
+                          [("layer.0.weight", "BF16", [700000], base)])
+        p_copy = os.path.join(d, "copy.safetensors")
+        write_safetensors(p_copy,
+                          [("layer.0.weight", "BF16", [700000], base)])
+
+        arc = os.path.join(d, "fam.lmz")
+        lmz.compress(first, arc)
+        before = os.path.getsize(arc)
+        stats = lmz.append(arc, p_copy)
+        cost = os.path.getsize(arc) - before
+
+        assert stats.detail["dedup_bytes"] == len(base), stats.detail
+        assert cost < 4096, cost
+
+        out = os.path.join(d, "out")
+        lmz.decompress(arc, out)
+        got = open(os.path.join(out, "copy.safetensors"), "rb").read()
+        assert got[-len(base):] == base
+
+
+def test_append_deltas_through_a_reference_source():
+    """A tied tensor can delta against the plain range behind its ref.
+
+    A base file commonly carries tied embeddings as one plain tensor and one
+    reference.  If the referenced name changes in a fine-tune, append used to
+    reject its same-name range as a source and store the whole tensor again,
+    even though the residual against the base was tiny.  Following the
+    existing ref to its plain source keeps the decoder at one hop.
+    """
+    base = weights_bf16(700000, 61)
+    moved = nudged_bf16(base, 70)
+    assert moved != base
+    with tempfile.TemporaryDirectory() as d:
+        base_dir = os.path.join(d, "base")
+        os.makedirs(base_dir)
+        write_safetensors(os.path.join(base_dir, "base.safetensors"), [
+            ("embed_tokens.weight", "BF16", [700000], base),
+            ("lm_head.weight", "BF16", [700000], base),
+        ])
+        target = os.path.join(d, "target.safetensors")
+        write_safetensors(target, [
+            ("embed_tokens.weight", "BF16", [700000], base),
+            ("lm_head.weight", "BF16", [700000], moved),
+        ])
+
+        def run(delta):
+            arc = os.path.join(d, f"{'delta' if delta else 'plain'}.lmz")
+            lmz.compress(base_dir, arc)
+            before = os.path.getsize(arc)
+            stats = lmz.append(arc, target, delta=delta)
+            return arc, stats, os.path.getsize(arc) - before
+
+        plain_arc, _plain_stats, plain_cost = run(False)
+        delta_arc, delta_stats, delta_cost = run(True)
+        assert delta_stats.detail["delta_bytes"] == len(moved), delta_stats.detail
+        assert delta_cost < plain_cost // 4, (delta_cost, plain_cost)
+
+        with open(delta_arc, "rb") as fh:
+            reader = ArchiveReader(fh)
+            target_member = next(m for m in reader.members
+                                 if m.path == "target.safetensors")
+            chunks = [c for c in reader.chunks
+                      if target_member.dst <= c.dst <
+                      target_member.dst + target_member.size]
+            assert any(c.codec == lmzformat.CODEC_DELTA for c in chunks), \
+                [(c.codec, c.rlen, c.clen) for c in chunks]
+
+        out = os.path.join(d, "out")
+        lmz.decompress(delta_arc, out)
+        assert digest(os.path.join(out, "target.safetensors")) == digest(target)
+        lmz.verify(delta_arc)
+
+
+def test_append_dedups_a_copy_of_a_delta_coded_member():
+    """A re-upload is free even when its twin is stored as a difference.
+
+    This is the hub's normal shape, not a corner: a fine-tune deltas well
+    against its base -- that is what the delta coding is for -- and exact
+    re-uploads of that fine-tune are everywhere. The copy cannot be a
+    reference, because a reference may only name a plain chunk: sources are
+    decoded straight from the archive so decompression stays a bag of
+    independent jobs, and naming a coded chunk would make resolution a chain
+    of unknown depth.
+
+    It does not need to be one. The copy codes to the same difference against
+    the same plain source, so its stored payload is byte for byte the payload
+    already in the file, and a chunk record can simply point at it. Both
+    entries still name the plain source they were coded against, so resolution
+    is still a single hop.
+
+    Found by measuring the hub against ZipLLM's method: five byte-identical
+    re-uploads of one Qwen3.5-0.8B fine-tune were charged 0.76 GB each, which
+    ZipLLM's per-tensor dedup took for nothing.
+    """
+    base = weights_bf16(700000, 61)
+    ft = nudged_bf16(base, 70)
+    assert ft != base
+    with tempfile.TemporaryDirectory() as d:
+        first = os.path.join(d, "first")
+        os.makedirs(first)
+        write_safetensors(os.path.join(first, "base.safetensors"),
+                          [("layer.0.weight", "BF16", [700000], base)])
+        p_ft = os.path.join(d, "ft.safetensors")
+        write_safetensors(p_ft, [("layer.0.weight", "BF16", [700000], ft)])
+        p_copy = os.path.join(d, "copy.safetensors")
+        shutil.copy(p_ft, p_copy)
+
+        arc = os.path.join(d, "fam.lmz")
+        lmz.compress(first, arc)
+        before = os.path.getsize(arc)
+        lmz.append(arc, p_ft)
+        after_ft = os.path.getsize(arc)
+        st = lmz.append(arc, p_copy)
+        cost_ft = after_ft - before
+        cost_copy = os.path.getsize(arc) - after_ft
+
+        assert st.detail["shared_bytes"] > 0, st.detail
+        assert cost_copy < max(cost_ft // 100, 4096), (cost_ft, cost_copy)
+
+        # Sharing a payload is only legitimate if it reads back exactly.
+        lmz.verify(arc)
+        out = os.path.join(d, "out")
+        lmz.decompress(arc, out)
+        for name in ("ft.safetensors", "copy.safetensors"):
+            got = open(os.path.join(out, name), "rb").read()
+            assert got[-len(ft):] == ft, name
+        got = open(os.path.join(out, "base.safetensors"), "rb").read()
+        assert got[-len(base):] == base
+
+
+def test_shared_payloads_survive_a_second_append():
+    """A third copy shares with the first, and the archive still reads back.
+
+    The index has to carry chunks written by this append as well as the ones
+    already in the file, or only the first duplicate of a run is cheap.
+    """
+    base = weights_bf16(400000, 91)
+    ft = nudged_bf16(base, 92)
+    with tempfile.TemporaryDirectory() as d:
+        first = os.path.join(d, "first")
+        os.makedirs(first)
+        write_safetensors(os.path.join(first, "base.safetensors"),
+                          [("layer.0.weight", "BF16", [400000], base)])
+        arc = os.path.join(d, "fam.lmz")
+        lmz.compress(first, arc)
+
+        costs = []
+        prev = os.path.getsize(arc)
+        for i in range(4):
+            p = os.path.join(d, f"copy{i}.safetensors")
+            write_safetensors(p, [("layer.0.weight", "BF16", [400000], ft)])
+            lmz.append(arc, p)
+            now = os.path.getsize(arc)
+            costs.append(now - prev)
+            prev = now
+
+        assert costs[0] > 1000, costs
+        for c in costs[1:]:
+            assert c < max(costs[0] // 100, 4096), costs
+
+        lmz.verify(arc)
+        out = os.path.join(d, "out")
+        lmz.decompress(arc, out)
+        for i in range(4):
+            got = open(os.path.join(out, f"copy{i}.safetensors"), "rb").read()
+            assert got[-len(ft):] == ft, i
 
 
 if __name__ == "__main__":

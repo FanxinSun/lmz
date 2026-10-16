@@ -23,14 +23,15 @@ from dataclasses import dataclass, field
 
 from . import codec as _codec
 from . import entropy, kernels
-from .format import (CODEC_DELTA, CODEC_REF, FLAG_ALIGNED, FLAG_PAGE_MAPPED,
-                     HEADER_SIZE, PAGE_ALIGN, RECORD, ArchiveReader,
-                     ArchiveWriter, ChunkTable, CorruptArchive, FormatError,
-                     Member)
+from .format import (BATCH_DECODABLE, CODEC_DELTA, CODEC_MIN_VERSION,
+                     CODEC_NAMES, CODEC_REF, CODEC_SPLIT, CODEC_STORED,
+                     FLAG_ALIGNED, FLAG_PAGE_MAPPED,
+                     HEADER_SIZE, PAGE_ALIGN, ArchiveReader, ArchiveWriter,
+                     ChunkTable, CorruptArchive, FormatError, Member)
 from .parallel import (default_workers, gil_enabled, ordered_map,
                         unordered_map)
-from .planner import (KIND_BF16, KIND_BYTES, KIND_DELTA, KIND_REF,
-                      chunkify, probe)
+from .planner import KIND_DELTA, KIND_REF, chunkify, probe
+from .freqs import Primer, TableSet, key as _tkey, sample_plan
 
 DEFAULT_CHUNK_SIZE = 8 << 20
 DEFAULT_LEVEL = 1
@@ -61,10 +62,94 @@ DEDUP_MIN_TENSOR = 64 << 10
 DELTA_MIN_TENSOR = DEDUP_MIN_TENSOR
 DELTA_SAMPLE = 1 << 20
 DELTA_MIN_GAIN = 0.05  # the difference must beat coding alone by this much
+# Sources evaluated per group. The pairwise table costs one sample encode
+# per pair, so it is capped; past this the field is narrowed by content
+# hash, which keeps the choice independent of the order files arrived in.
+DELTA_MAX_SOURCES = 6
 
 # Files that are not model weights but belong with them; kept so a compressed
 # model directory round-trips into something directly usable.
 SKIP_NAMES = {".DS_Store"}
+
+
+@dataclass(frozen=True)
+class Option:
+    """One keyword `compress` accepts, and what kind of thing it decides."""
+
+    name: str
+    default: object
+    kind: str          # "format" | "schedule" | "observe"
+    describes: str
+
+
+# What every keyword of `compress` is for, and -- the part a caller cannot
+# otherwise discover -- whether lmz chose its default knowing anything about
+# the caller's machine.
+#
+#   "format"   decides what the coded bytes are. lmz's to choose, and the
+#              same input plus the same format options gives the same archive
+#              on any machine.
+#   "schedule" decides how the work is spread, and nothing about the bytes.
+#              A default here is a *fallback, never a decision*: lmz may
+#              derive one by interrogating the host -- a static capability
+#              query, nothing timed -- but never from a rate. Nothing timed,
+#              fitted, adapted from observed throughput, or cached as a
+#              measured profile; that would be a second rate model, and the
+#              stack has one. So a scheduling default is chosen in ignorance
+#              of the caller's machine and workload, and is the caller's to
+#              override.
+#   "observe"  watches the work without changing it or its bytes.
+#
+# `workers` is the only schedule option today. Its default comes from
+# `default_workers()`, which asks the OS for a CPU count honouring affinity
+# and cgroups and clamps it -- a question, not a measurement. It is a weak
+# proxy on purpose: compression goes memory-bus-bound around four threads on
+# real weights, so a core count is a fallback and a caller that knows its
+# workload should say so.
+#
+# Undeclared keywords are already rejected: `compress` is keyword-only, so
+# Python raises TypeError before anything runs. This table exists so a caller
+# can tell the kinds apart, not to police the call.
+ENCODE_OPTIONS = {
+    o.name: o for o in (
+        Option("level", DEFAULT_LEVEL, "format",
+               "effort the general-purpose coder spends"),
+        Option("chunk_size", None, "format",
+               "bytes per chunk; None takes the default for `mapped`"),
+        Option("checksum", True, "format", "per-chunk CRC32 in the archive"),
+        Option("dedup", True, "format",
+               "store a repeated tensor once, as a ref chunk"),
+        Option("delta", True, "format",
+               "code a near-copy as a difference from the earlier file"),
+        Option("mapped", False, "format",
+               "small blocks, so any byte range decodes on its own"),
+        Option("align", False, "format",
+               "start every payload on a 4 KiB boundary"),
+        Option("shared_tables", False, "format",
+               "one rANS table per plane kind in the manifest; writes v7"),
+        Option("workers", None, "schedule",
+               "threads; None falls back to a CPU count, not a measurement"),
+        Option("progress", None, "observe",
+               "called with (done, total) as the work proceeds"),
+    )
+}
+
+
+def encode_options() -> dict:
+    """Every keyword `compress` accepts, by name, with its kind.
+
+    The kind is the part a caller cannot otherwise discover. A `format`
+    option decides what the coded bytes are and is lmz's to choose; a
+    `schedule` option decides only how the work is spread, and its default is
+    a fallback lmz picked without knowing anything about the caller's machine
+    or workload -- so a caller that does know should override it. `observe`
+    watches without changing anything.
+
+    The split is a real property of lmz, not a naming convention: compressing
+    the same input at 1, 2, 8 and 16 workers produces byte-identical
+    archives, which the test suite checks.
+    """
+    return dict(ENCODE_OPTIONS)
 
 
 @dataclass
@@ -126,14 +211,15 @@ class TensorBlocks:
             sum(c.rlen for c in self.chunks) == self.size)
 
 
-def _annotate_tensor_blocks(members: list[Member], chunks: ChunkTable) -> None:
+def _annotate_tensor_blocks(members: list[Member], chunks) -> None:
     """Record the `[first_block, end_block)` range covering each tensor."""
+    table = ChunkTable.from_chunks(chunks)
     for m in members:
         if not m.tensors:
             continue
         for meta in m.tensors.values():
             s, e = meta["offsets"]
-            lo, hi = chunks.range_indices(m.dst + s, m.dst + e)
+            lo, hi = table.range_indices(m.dst + s, m.dst + e)
             meta["blocks"] = [lo, hi]
 
 
@@ -367,7 +453,7 @@ def _find_duplicate_tensors(paths: list[str], members: list[Member],
 
 def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
            workers: int | None = None, checksum: bool = True,
-           delta: bool = True, progress=None) -> Stats:
+           dedup: bool = True, delta: bool = True, progress=None) -> Stats:
     """Add files to an existing archive, coded against what is already in it.
 
     This is what makes the corpus-level savings reachable in practice. A
@@ -426,15 +512,28 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
 
     arc = MappedArchive(archive, verify=False, cache_blocks=8)
     try:
+        refs_by_member: dict[int, list] = {}
+        dedup_bytes = 0
+        if dedup:
+            refs_by_member, dedup_bytes = _find_append_refs(
+                paths, members, layouts, old_members, arc)
+
+        # Dedup before delta, as the one-shot path does: a tensor already in
+        # the archive byte for byte becomes a reference costing eight bytes,
+        # not a difference of all zeros -- and, more to the point, not a
+        # difference against something else entirely when its twin is itself
+        # delta-coded and so cannot be named as a base.
         deltas_by_member: dict[int, list] = {}
         delta_bytes = 0
         if delta:
             deltas_by_member, delta_bytes = _find_append_deltas(
-                paths, members, layouts, old_members, arc, level)
+                paths, members, layouts, old_members, arc, level,
+                refs_by_member)
 
         plan: list[tuple] = []
         for idx, layout in enumerate(layouts):
             for task in chunkify(layout, sizes[idx], chunk_size,
+                                 refs=refs_by_member.get(idx),
                                  deltas=deltas_by_member.get(idx)):
                 plan.append((idx,) + task)
 
@@ -443,11 +542,20 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
         tally = _codec.MethodTally()
         stats = Stats(input_bytes=total_new, files=len(members),
                       chunks=len(plan),
-                      detail={"delta_bytes": delta_bytes, "appended": True})
-        shared_freqs = reader.shared_freqs
+                      detail={"delta_bytes": delta_bytes,
+                              "dedup_bytes": dedup_bytes, "appended": True})
 
         def work(task):
             idx, start, end, esize, kind, src_off, btype, ikind = task
+            if kind == KIND_REF:
+                # The bytes equal a range already in the archive; nothing is
+                # read and nothing needs a checksum of its own, since the
+                # source chunks carry theirs and resolution decodes through
+                # them. The one-shot path has always done this; without it
+                # here a reference fell through to plain coding and cost more
+                # than the difference it replaced.
+                return (members[idx].dst + start, end - start,
+                        [struct.pack("<Q", src_off)], CODEC_REF, 1, 0, 0)
             data = os.pread(pool.get(idx), end - start, start)
             if len(data) != end - start:
                 raise IOError(f"short read on {members[idx].path} at {start}")
@@ -455,13 +563,12 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
                 base_bytes = arc.read(src_off, end - start)
                 parts, flags, crc = _codec.encode_delta(
                     data, base_bytes, esize, level, checksum, kind=ikind,
-                    btype=btype, src=src_off, tally=tally,
-                    shared_freqs=shared_freqs)
+                    btype=btype, src=src_off, tally=tally)
                 return (members[idx].dst + start, end - start, parts,
                         CODEC_DELTA, esize, flags, crc)
             parts, cid, flags, crc = _codec.encode_chunk(
                 data, esize, level, checksum, kind=kind, btype=btype,
-                tally=tally, shared_freqs=shared_freqs)
+                tally=tally)
             return (members[idx].dst + start, end - start, parts, cid, esize,
                     flags, crc)
 
@@ -474,20 +581,64 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
         if delta_bytes:
             manifest["delta_bytes"] = (old_manifest.get("delta_bytes", 0)
                                        + delta_bytes)
+        if dedup_bytes:
+            manifest["dedup_bytes"] = (old_manifest.get("dedup_bytes", 0)
+                                       + dedup_bytes)
+
+        # Chunks with the same stored payload decode to the same bytes, so the
+        # second needs only a table entry pointing at the first. This is what
+        # makes an exact re-upload free even when its twin is held as a
+        # difference: the copy codes to the same difference against the same
+        # plain source, and that payload is already in the file. A reference
+        # could not do it -- a reference may only name a plain chunk -- but
+        # sharing a payload is not a reference, and resolution stays one hop.
+        payload_at: dict = {}
+        if dedup:
+            for c in old_chunks:
+                payload_at.setdefault(
+                    (c.codec, c.esize, c.flags, c.rlen, c.crc, c.clen),
+                    []).append(c.off)
+        shared_bytes = 0
 
         with open(archive, "r+b") as out:
             writer = ArchiveWriter(out, manifest, flags=reader.flags,
                                    align=PAGE_ALIGN if reader.aligned else 0,
                                    resume_at=table_off, chunks=old_chunks)
+            rfd = os.open(archive, os.O_RDONLY)
             nw = _worker_cap([e - s for _i, s, e, *_r in plan], workers)
             for results in ordered_map(
                     work_batch, _batches(plan, lambda t: t[2] - t[1]), nw,
                     lookahead=nw * 2):
                 for dst_off, rlen, parts, cid, esize, flags, crc in results:
-                    writer.append(parts, dst_off, rlen, crc, cid, esize, flags)
+                    clen = sum(len(p) for p in parts)
+                    key = (cid, esize, flags, rlen, crc, clen)
+                    cands = payload_at.get(key) if dedup else None
+                    hit = None
+                    if cands:
+                        # Only now is the payload worth materialising, and the
+                        # comparison is exact rather than a digest: a shared
+                        # payload is a claim about every byte, and one that
+                        # agreed by chance would put wrong data in the archive.
+                        blob = b"".join(bytes(p) for p in parts)
+                        out.flush()
+                        for off in cands:
+                            if os.pread(rfd, clen, off) == blob:
+                                hit = off
+                                break
+                    if hit is None:
+                        writer.append(parts, dst_off, rlen, crc, cid, esize,
+                                      flags)
+                        if dedup:
+                            payload_at.setdefault(key, []).append(
+                                writer.chunks[-1].off)
+                    else:
+                        writer.alias(hit, clen, dst_off, rlen, crc, cid, esize,
+                                     flags)
+                        shared_bytes += clen
                     done += rlen
                 if progress:
                     progress(done, total_new)
+            os.close(rfd)
             # The table describes the whole archive after an append, so the
             # method counts have to as well.
             merged = _codec.merge_methods(old_manifest.get("methods"),
@@ -503,14 +654,163 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
     finally:
         arc.close()
 
+    stats.detail["shared_bytes"] = shared_bytes
     stats.detail["methods"] = tally.to_json()   # this append's share, not the whole
-    stats.detail["shared_table"] = bool(shared_freqs)
     stats.output_bytes = os.path.getsize(archive)
     stats.seconds = time.perf_counter() - started
     return stats
 
 
-def _find_append_deltas(paths, members, layouts, old_members, arc, level):
+def _same_bytes(path, s, e, arc, src, window=1 << 20):
+    """Whether a file range and an archive range hold the same bytes.
+
+    A sample first, because almost every candidate differs immediately and
+    decoding the archive side is the expensive part. Then in full, because a
+    reference is a claim about every byte: a sampled digest that agreed by
+    chance would put wrong data in the archive and nothing downstream would
+    notice until someone decompressed it.
+    """
+    n = e - s
+    with open(path, "rb") as fh:
+        probe = min(1 << 16, n)
+        fh.seek(s)
+        if fh.read(probe) != arc.read(src, probe):
+            return False
+        fh.seek(s)
+        off = 0
+        while off < n:
+            k = min(window, n - off)
+            if fh.read(k) != arc.read(src + off, k):
+                return False
+            off += k
+    return True
+
+
+def _plain_source_for_coded_range(arc, lo, hi, coded, allowed):
+    """Return the plain source range behind an old ref/delta, if there is one.
+
+    Append normally indexes a tensor by its own output range.  That misses a
+    useful case in a tied-weight file: the old tensor may be a ref to another
+    tensor, while the incoming tensor has changed a little and needs a delta.
+    Following the existing pointer to its plain source preserves the
+    single-hop decoder rule.  A mixed or malformed range is ignored because
+    this is only an optimisation.
+    """
+    if hi <= lo:
+        return None
+    chunks = arc._chunks
+    starts = arc._starts
+    i = bisect_right(starts, lo) - 1
+    pos = lo
+    source = source_end = None
+    while pos < hi:
+        if i < 0 or i >= len(chunks):
+            return None
+        c = chunks[i]
+        cend = c.dst + c.rlen
+        if c.dst > pos or cend <= pos or cend <= lo:
+            return None
+        if c.codec not in allowed:
+            return None
+        payload = arc._payload_of(c)
+        if c.codec == CODEC_REF:
+            if len(payload) != 8:
+                return None
+            src = struct.unpack("<Q", payload)[0]
+        else:
+            try:
+                src, _inner, _off = _codec.delta_source(payload)
+            except (ValueError, FormatError):
+                return None
+        take_end = min(cend, hi)
+        src += pos - c.dst
+        take = take_end - pos
+        if source is None:
+            source, source_end = src, src + take
+        elif src != source_end:
+            return None
+        else:
+            source_end += take
+        pos = take_end
+        i += 1
+
+    if source is None or source_end - source != hi - lo:
+        return None
+    if any(cs < source_end and source < ce for cs, ce in coded):
+        return None
+    return source
+
+
+def _find_append_refs(paths, members, layouts, old_members, arc,
+                      max_candidates=8):
+    """Incoming tensors that are already in the archive, byte for byte.
+
+    A reference costs eight bytes and may name any plain range already stored.
+    An old tensor held as a reference can contribute that plain source range,
+    so a later exact copy does not need to be coded again under its own name.
+    A delta still cannot name a coded range: resolving every source remains a
+    single hop.
+
+    Measured on the hub against ZipLLM's method, that was five byte-identical
+    re-uploads of one Qwen3.5-0.8B fine-tune charged 0.76 GB each. The one-shot
+    path has always had this right, which is why compressing the same files
+    together beat growing the archive one at a time.
+    """
+    # A reference may only name a plain chunk, exactly as a delta may: sources
+    # are decoded straight from the archive so that decompression stays a bag
+    # of independent jobs, and naming a coded chunk would make resolution a
+    # chain of unknown depth. An old ref can safely donate its own plain source
+    # range; an old delta can donate the plain range it subtracts from, but an
+    # exact copy of a delta remains handled by payload sharing below.
+    coded = [(c.dst, c.dst + c.rlen) for c in arc._chunks
+             if c.codec in (CODEC_DELTA, CODEC_REF)]
+
+    def is_plain(lo, hi):
+        return not any(cs < hi and lo < ce for cs, ce in coded)
+
+    known: dict = {}
+    for m in old_members:
+        for name, meta in (m.tensors or {}).items():
+            s, e = meta["offsets"]
+            if e - s < DEDUP_MIN_TENSOR:
+                continue
+            lo, hi = m.dst + s, m.dst + e
+            source = lo if is_plain(lo, hi) else \
+                _plain_source_for_coded_range(arc, lo, hi, coded,
+                                               (CODEC_REF,))
+            if source is None:
+                continue
+            known.setdefault((name, meta.get("dtype", ""), e - s),
+                             []).append(source)
+    if not known:
+        return {}, 0
+
+    refs: dict[int, list] = {}
+    covered = 0
+    for idx, layout in enumerate(layouts):
+        seen: set[tuple[int, int]] = set()
+        for name, meta in ((layout.tensors or {}) if layout else {}).items():
+            s, e = meta["offsets"]
+            # Aliased names over one range would emit the same reference twice.
+            if (s, e) in seen or e - s < DEDUP_MIN_TENSOR:
+                continue
+            # Newest first, and only a few: a re-upload almost always follows
+            # the model it copies, and every candidate that does not match
+            # costs a decode of the archive side to find that out.
+            cands = known.get((name, meta.get("dtype", ""), e - s)) or ()
+            for src in list(reversed(cands))[:max_candidates]:
+                if _same_bytes(paths[idx], s, e, arc, src):
+                    seen.add((s, e))
+                    refs.setdefault(idx, []).append((s, e, src))
+                    covered += e - s
+                    break
+    for items in refs.values():
+        items.sort()
+    return refs, covered
+
+
+def _find_append_deltas(paths, members, layouts, old_members, arc, level,
+                        refs_by_member=None):
     """New tensors that are close to one already in the archive.
 
     Same rule as within a single job -- matched by name, dtype and size, and
@@ -523,7 +823,8 @@ def _find_append_deltas(paths, members, layouts, old_members, arc, level):
     # only base, and the difference grows with the gap: measured 12.9 points
     # at a 1000-step distance against 11.6 at 2000. Later checkpoints
     # therefore gain a little less than a fresh archive would give them.
-    coded = arc._chunks.coded_ranges()
+    coded = [(c.dst, c.dst + c.rlen) for c in arc._chunks
+             if c.codec in (CODEC_DELTA, CODEC_REF)]
 
     def is_plain(lo, hi):
         return not any(cs < hi and lo < ce for cs, ce in coded)
@@ -532,17 +833,28 @@ def _find_append_deltas(paths, members, layouts, old_members, arc, level):
     for m in old_members:
         for name, meta in (m.tensors or {}).items():
             s, e = meta["offsets"]
-            if e - s < DELTA_MIN_TENSOR or not is_plain(m.dst + s, m.dst + e):
+            if e - s < DELTA_MIN_TENSOR:
+                continue
+            lo, hi = m.dst + s, m.dst + e
+            source = lo if is_plain(lo, hi) else \
+                _plain_source_for_coded_range(arc, lo, hi, coded,
+                                               (CODEC_REF, CODEC_DELTA))
+            if source is None:
                 continue
             # Latest wins: the nearer the base, the smaller the difference.
-            known[(name, meta.get("dtype", ""), e - s)] = m.dst + s
+            known[(name, meta.get("dtype", ""), e - s)] = source
 
     deltas: dict[int, list] = {}
     covered = 0
     for idx, layout in enumerate(layouts):
         region_at = {r.start: r for r in (layout.regions if layout else ())}
+        # A range already a reference is done: it costs eight bytes, which no
+        # difference will beat, and coding it twice would be a contradiction.
+        taken = {(s, e) for s, e, _src in (refs_by_member or {}).get(idx, ())}
         for name, meta in ((layout.tensors or {}) if layout else {}).items():
             s, e = meta["offsets"]
+            if (s, e) in taken:
+                continue
             key = (name, meta.get("dtype", ""), e - s)
             src_off = known.get(key)
             r = region_at.get(s)
@@ -605,21 +917,39 @@ def extract(archive: str, member: str, dst: str, *, overwrite: bool = False,
 
 
 def _find_delta_candidates(paths, members, layouts, refs, workers, level):
-    """Tensors that are close to one in an earlier member, but not identical.
+    """Tensors that are close to another copy of themselves, but not identical.
 
     Matched by name, dtype and size -- which is exactly what a checkpoint
     series or a fine-tune of a known base produces -- then decided by encoding
-    a sample both ways. That costs two encodes per candidate and settles the
-    question with the coder that will actually run, so a pair that has drifted
+    a sample with the coder that will actually run, so a pair that has drifted
     too far declines on its own rather than on a rule of thumb.
 
-    Sources are always the earliest member holding the tensor, so a delta
-    never points at another delta and resolving one stays a single hop.
-    Returns ({member index: [(start, end, source output offset)]}, bytes covered).
+    Which copy to subtract from is decided the same way, and that is the point.
+    Taking the earliest member, as this did until 2026-09-03, makes the choice
+    by filename sort order: on a base plus four fine-tunes of it, whichever
+    file happened to sort first became everyone's source, and siblings ended up
+    subtracted from each other rather than from their common parent -- roughly
+    twice the distance. Measured on Qwen2.5-0.5B plus four of its fine-tunes,
+    that was 17.6 points of ratio, 34.0% against 51.6%, decided by nothing but
+    a hyphen sorting before a dot. So every member is a candidate source and
+    the group keeps whichever one leaves the rest smallest.
+
+    One member per group is the source and is coded directly, so a delta never
+    points at another delta and resolving one stays a single hop. Returns
+    ({member index: [(start, end, source output offset)]}, bytes covered).
     """
     taken = {}
+    pinned = set()
     for idx, items in (refs or {}).items():
         taken[idx] = {(s, e) for s, e, _src in items}
+        # Whatever a dedup ref already points at has to stay plain. Making it a
+        # delta target instead would leave the ref resolving through a
+        # difference, which is the chain the single-hop rule exists to prevent.
+        # This never bit while the source was always the earliest member,
+        # because dedup picks the earliest occurrence too and the two agreed by
+        # accident; choosing the source by measurement breaks that coincidence.
+        for _s, _e, src in items:
+            pinned.add(_locate_output(members, src))
 
     groups: dict = {}
     region_at: list = []
@@ -630,6 +960,9 @@ def _find_delta_candidates(paths, members, layouts, refs, workers, level):
                 at[r.start] = r
             for name, meta in (layout.tensors or {}).items():
                 s, e = meta["offsets"]
+                # A tensor dedup already claimed is neither source nor target:
+                # as a target it is already free, and as a source it is a ref,
+                # which a delta pointing at it would chain through.
                 if e - s < DELTA_MIN_TENSOR or (s, e) in taken.get(idx, ()):
                     continue
                 groups.setdefault((name, meta.get("dtype", ""), e - s), []) \
@@ -641,48 +974,109 @@ def _find_delta_candidates(paths, members, layouts, refs, workers, level):
         if len(group) < 2:
             continue
         group.sort()
-        pidx, ps, _pe = group[0]
-        for idx, s, e in group[1:]:
-            r = region_at[idx].get(s)
-            if r is None or r.start != s or r.end != e:
-                continue  # only whole, singly-owned regions
-            work.append((pidx, ps, idx, s, e, r))
+        # A source only has to be readable; a target has to be a whole region
+        # this archive owns outright, and must not already be a dedup ref.
+        targets = [(idx, s, e, region_at[idx].get(s)) for idx, s, e in group]
+        targets = [t for t in targets
+                   if t[3] is not None and t[3].start == t[1] and t[3].end == t[2]
+                   and (t[0], t[1]) not in pinned]
+        if not targets:
+            continue
+        r = targets[0][3]
+        work.append((group, targets, r))
     if not work:
         return {}, 0
 
     pool = _FdPool(paths, os.O_RDONLY)
     try:
         def decide(item):
-            pidx, ps, idx, s, e, r = item
-            n = e - s
+            group, targets, r = item
+            n = group[0][2] - group[0][1]
+            esize = max(r.esize, 1)
             take = min(DELTA_SAMPLE, n)
-            take -= take % max(r.esize, 1)
+            take -= take % esize
             if take <= 0:
                 return None
-            off = ((n - take) // 2 // max(r.esize, 1)) * max(r.esize, 1)
-            a = os.pread(pool.get(pidx), take, ps + off)
-            b = os.pread(pool.get(idx), take, s + off)
-            if len(a) != take or len(b) != take or a == b:
-                return None  # identical samples are dedup's job, not this one
-            diff = bytes(kernels.xor_bytes(b, a))
+            off = ((n - take) // 2 // esize) * esize
+
+            samples = []
+            for idx, s, _e in group:
+                b = os.pread(pool.get(idx), take, s + off)
+                if len(b) != take:
+                    return None
+                samples.append(b)
 
             def coded(buf):
                 parts = _codec.encode_chunk(buf, r.esize, level, False,
                                             kind=r.kind, btype=r.btype)[0]
                 return sum(len(p) for p in parts)
 
-            if coded(diff) < coded(b) * (1 - DELTA_MIN_GAIN):
-                return idx, s, e, members[pidx].dst + ps
-            return None
+            # Candidate sources. Beyond a handful the pairwise table stops
+            # being worth its own cost, so the field is narrowed by a hash of
+            # the sample rather than by position -- the same members are
+            # picked whatever order the files arrived in.
+            cand = list(range(len(group)))
+            if len(cand) > DELTA_MAX_SOURCES:
+                cand.sort(key=lambda i: hashlib.blake2b(samples[i],
+                                                        digest_size=8).digest())
+                cand = sorted(cand[:DELTA_MAX_SOURCES])
+
+            # Every member of the group is coded somehow, so every one has to
+            # appear in the bill. Counting only the members eligible to be
+            # targets makes a source with few eligible neighbours look cheap
+            # for the wrong reason -- the ones it cannot claim are still there,
+            # still being coded, just not on its tab.
+            alone = {i: coded(samples[i]) for i in range(len(group))}
+            pair: dict = {}
+            for a in cand:
+                for j in range(len(group)):
+                    if j == a or (min(a, j), max(a, j)) in pair:
+                        continue
+                    if samples[a] == samples[j]:
+                        pair[(min(a, j), max(a, j))] = None  # dedup's job
+                        continue
+                    pair[(min(a, j), max(a, j))] = coded(
+                        bytes(kernels.xor_bytes(samples[j], samples[a])))
+
+            tpos = {group.index(t[:3]): t for t in targets}
+
+            def bill(a):
+                total = alone[a]
+                picks = []
+                for j in range(len(group)):
+                    if j == a:
+                        continue
+                    t = tpos.get(j)
+                    d = pair.get((min(a, j), max(a, j))) if t is not None else None
+                    if d is not None and d < alone[j] * (1 - DELTA_MIN_GAIN):
+                        total += d
+                        picks.append((t, a))
+                    else:
+                        total += alone[j]
+                return total, picks
+
+            best = None
+            for a in cand:
+                total, picks = bill(a)
+                key = (total, hashlib.blake2b(samples[a], digest_size=8).digest())
+                if best is None or key < best[0]:
+                    best = (key, picks)
+            if best is None or not best[1]:
+                return None
+            out = []
+            for (idx, s, e, _r), a in best[1]:
+                sidx, ss, _se = group[a]
+                out.append((idx, s, e, members[sidx].dst + ss))
+            return out
 
         deltas: dict[int, list] = {}
         covered = 0
         for got in unordered_map(decide, work, workers):
-            if got is None:
+            if not got:
                 continue
-            idx, s, e, src = got
-            deltas.setdefault(idx, []).append((s, e, src))
-            covered += e - s
+            for idx, s, e, src in got:
+                deltas.setdefault(idx, []).append((s, e, src))
+                covered += e - s
     finally:
         pool.close()
     for items in deltas.values():
@@ -703,7 +1097,7 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
              workers: int | None = None, chunk_size: int | None = None,
              checksum: bool = True, dedup: bool = True, delta: bool = True,
              mapped: bool = False, align: bool = False, progress=None,
-             shared_table: bool = False) -> Stats:
+             shared_tables: bool = False) -> Stats:
     """Compress a file or directory into the archive at `dst`.
 
     `mapped` cuts the archive into small blocks so any byte range can be
@@ -711,6 +1105,13 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
     demand-paging loader needs underneath it. `align` additionally starts
     every payload on a 4 KiB boundary; it costs the padding it writes and only
     repays it where reads bypass the page cache, so it is off by default.
+
+    `shared_tables` reads a bounded sample of the input first and fits one
+    rANS frequency table per plane kind, carried in the manifest instead of in
+    every stream. It writes a v7 archive that older builds cannot read, which
+    is why it is opt-in; where it wins is small archives, whose per-chunk
+    tables are a material fraction of the payload, and the GPU decoder, which
+    can hold one table in shared memory for a whole warp.
     """
     workers = workers or default_workers()
     if chunk_size is None:
@@ -787,30 +1188,6 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
 
     pool = _FdPool(paths, os.O_RDONLY)
     done = 0
-    shared_freqs = None
-    if shared_table and kernels.have_rans():
-        counts = [1] * 256
-        has_bf16 = False
-        for task in plan:
-            idx, start, end, esize, kind, ref_src, btype, ikind = task
-            if kind == KIND_BF16 and esize == 2 and (end - start) % 2 == 0:
-                n = end - start
-                take = min(n, 1 << 20)
-                take -= take % 2
-                if take > 0:
-                    raw = os.pread(pool.get(idx), take, start)
-                    planes = kernels.split_bf16(raw)
-                    exp = planes[:take // 2]
-                    for s, c in enumerate(kernels.histogram(exp)):
-                        counts[s] += c
-                    has_bf16 = True
-        if has_bf16:
-            freqs = kernels.rans_freqs(counts)
-            if freqs:
-                shared_hdr = kernels.rans_shared_header(freqs)
-                manifest["shared_table"] = shared_hdr.hex()
-                shared_freqs = freqs
-
     # Which coder actually earned the bytes. The chunk table records the codec
     # that framed each chunk, never the coder that compressed the planes inside
     # it, so a split chunk says nothing about whether rANS or zstd did the work.
@@ -818,6 +1195,30 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
     stats = Stats(input_bytes=total_in, files=len(members), chunks=len(plan),
                   detail={"dedup_bytes": dedup_bytes,
                           "delta_bytes": delta_bytes})
+
+    # Priming. The tables have to exist before the first chunk is coded, so
+    # this is a real extra read -- but a bounded one, strided across the plan,
+    # and on anything small enough for the fixed costs to matter it is the
+    # whole input and the page cache serves the second pass from memory.
+    tset = TableSet()
+    if shared_tables and kernels.have_rans():
+        primer = Primer()
+        for i in sample_plan(plan):
+            idx, start, end, esize, kind, _ref, _bt, _ik = plan[i]
+            if kind in (KIND_REF, KIND_DELTA):
+                continue          # nothing of their own to count
+            data = os.pread(pool.get(idx), end - start, start)
+            if len(data) != end - start:
+                raise IOError(f"short read on {members[idx].path} at {start}")
+            planes = _codec.table_planes(data, esize, kind)
+            if planes is None:
+                continue
+            for k, plane in enumerate(planes):
+                primer.add(_tkey(CODEC_SPLIT, esize, k),
+                           kernels.histogram(plane))
+        tset = primer.build()
+        if tset:
+            manifest["tables"] = tset.to_json()
 
     def work(task):
         idx, start, end, esize, kind, ref_src, btype, ikind = task
@@ -837,13 +1238,12 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
                 raise IOError(f"short read on {members[midx].path} at {moff}")
             parts, flags, crc = _codec.encode_delta(
                 data, base, esize, level, checksum, kind=ikind, btype=btype,
-                src=ref_src, tally=tally, shared_freqs=shared_freqs)
+                src=ref_src, tally=tally)
             return (members[idx].dst + start, end - start, parts, CODEC_DELTA,
                     esize, flags, crc)
         parts, cid, flags, crc = _codec.encode_chunk(data, esize, level, checksum,
                                                      kind=kind, btype=btype,
-                                                     tally=tally,
-                                                     shared_freqs=shared_freqs)
+                                                     tally=tally, tables=tset)
         return members[idx].dst + start, end - start, parts, cid, esize, flags, crc
 
     def work_batch(batch):
@@ -889,7 +1289,6 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
 
     stats.detail["padding_bytes"] = writer.padding
     stats.detail["methods"] = methods
-    stats.detail["shared_table"] = bool(shared_freqs)
     stats.output_bytes = os.path.getsize(dst)
     stats.seconds = time.perf_counter() - started
     return stats
@@ -898,7 +1297,18 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
 # ---------------------------------------------------------------- decompress
 
 
-def _range_resolver(chunks, payload_of, verify_checksums: bool, shared_freqs=None):
+def _by_dst(chunks):
+    """Chunks in destination order, whatever kind of sequence they came in.
+
+    A ChunkTable can order itself from the packed u64 column and build each
+    Chunk once; a plain list is already objects and just sorts. Both callers
+    below want the same list out.
+    """
+    order = getattr(chunks, "order_by_dst", None)
+    return order() if order is not None else sorted(chunks, key=lambda c: c.dst)
+
+
+def _range_resolver(chunks, payload_of, verify_checksums: bool, tables=None):
     """A function that materialises the bytes at any earlier output range.
 
     Source chunks are decoded straight from the archive rather than read back
@@ -907,17 +1317,15 @@ def _range_resolver(chunks, payload_of, verify_checksums: bool, shared_freqs=Non
     may not itself be a ref or a delta, which keeps resolution a single hop
     instead of a chain of unknown depth.
     """
-    table = ChunkTable.from_chunks(chunks)
+    ordered = _by_dst(chunks)
+    starts = [c.dst for c in ordered]
 
     def resolve(src: int, rlen: int) -> bytearray:
         out = bytearray(rlen)
         pos, end = src, src + rlen
-        try:
-            i = table.locate(pos)
-        except CorruptArchive:
-            raise CorruptArchive(f"source at byte {pos} is not covered")
+        i = bisect_right(starts, pos) - 1
         while pos < end:
-            c = table[i] if 0 <= i < len(table) else None
+            c = ordered[i] if 0 <= i < len(ordered) else None
             if c is None or not (c.dst <= pos < c.dst + c.rlen):
                 raise CorruptArchive(f"source at byte {pos} is not covered")
             if c.codec in (CODEC_REF, CODEC_DELTA):
@@ -925,7 +1333,7 @@ def _range_resolver(chunks, payload_of, verify_checksums: bool, shared_freqs=Non
                     "a ref or delta chunk points at another one")
             data = _codec.decode_chunk(payload_of(c), c.codec, c.esize, c.flags,
                                        c.rlen, c.crc, verify_checksums,
-                                       shared_freqs=shared_freqs)
+                                       tables=tables)
             a = pos - c.dst
             b = min(end - c.dst, c.rlen)
             out[pos - src:pos - src + (b - a)] = data[a:b]
@@ -936,10 +1344,9 @@ def _range_resolver(chunks, payload_of, verify_checksums: bool, shared_freqs=Non
     return resolve
 
 
-def _chunk_decoder(chunks, payload_of, verify_checksums: bool, shared_freqs=None):
+def _chunk_decoder(chunks, payload_of, verify_checksums: bool, tables=None):
     """Decode any chunk, resolving ref and delta sources as needed."""
-    resolve = _range_resolver(chunks, payload_of, verify_checksums,
-                              shared_freqs=shared_freqs)
+    resolve = _range_resolver(chunks, payload_of, verify_checksums, tables)
 
     def decode(chunk, payload, out=None):
         if chunk.codec == CODEC_REF:
@@ -951,12 +1358,10 @@ def _chunk_decoder(chunks, payload_of, verify_checksums: bool, shared_freqs=None
             src, _inner, _off = _codec.delta_source(payload)
             return _codec.decode_delta(payload, chunk.esize, chunk.flags,
                                        chunk.rlen, resolve(src, chunk.rlen),
-                                       chunk.crc, verify_checksums,
-                                       shared_freqs=shared_freqs)
+                                       chunk.crc, verify_checksums)
         return _codec.decode_chunk(payload, chunk.codec, chunk.esize,
                                    chunk.flags, chunk.rlen, chunk.crc,
-                                   verify_checksums, out=out,
-                                   shared_freqs=shared_freqs)
+                                   verify_checksums, out=out, tables=tables)
 
     return decode
 
@@ -977,7 +1382,7 @@ def decompress(src: str, dst: str, *, workers: int | None = None,
         members = reader.members
         chunks = reader.chunks
         manifest = reader.manifest
-        shared_freqs = reader.shared_freqs
+        tables = TableSet.from_json(manifest.get("tables"))
 
     single = len(members) == 1 and "/" not in members[0].path
     if single and not os.path.isdir(dst):
@@ -1013,8 +1418,7 @@ def decompress(src: str, dst: str, *, workers: int | None = None,
             raise FormatError("archive is truncated")
         return payload
 
-    decode = _chunk_decoder(chunks, payload_of, verify_checksums,
-                            shared_freqs=shared_freqs)
+    decode = _chunk_decoder(chunks, payload_of, verify_checksums, tables)
 
     def work(batch):
         done_bytes = 0
@@ -1095,12 +1499,6 @@ def _worker_cap(sizes, workers: int) -> int:
 
 
 def _decode_workers(chunks, workers: int) -> int:
-    if isinstance(chunks, ChunkTable):
-        if not chunks or workers <= GIL_DECODE_WORKERS or not gil_enabled():
-            return workers
-        if chunks.total_rlen() / len(chunks) >= THREADS_SCALE_ABOVE:
-            return workers
-        return GIL_DECODE_WORKERS
     return _worker_cap([c.rlen for c in chunks], workers)
 
 
@@ -1120,7 +1518,22 @@ def _batches(items, size_of, target: int = DECODE_BATCH):
 
 def _check_coverage(chunks, total: int) -> None:
     """Confirm the chunks tile the output exactly, with no gap or overlap."""
-    ChunkTable.from_chunks(chunks).check_coverage(total)
+    pos = 0
+    # Only the two u64/u32 columns are needed to check tiling, so on a large
+    # archive this walks the packed table rather than building every Chunk.
+    col = getattr(chunks, "column", None)
+    if col is not None:
+        pairs = sorted(zip(col("dst"), col("rlen")))
+    else:
+        pairs = sorted((c.dst, c.rlen) for c in chunks)
+    for dst, rlen in pairs:
+        if dst != pos:
+            raise FormatError(
+                f"archive does not cover its output: gap or overlap at byte {pos}")
+        pos += rlen
+    if pos != total:
+        raise FormatError(
+            f"archive covers {pos} bytes but declares {total}")
 
 
 # -------------------------------------------------------------------- verify
@@ -1135,14 +1548,17 @@ def verify(src: str, *, workers: int | None = None, progress=None) -> Stats:
         reader = ArchiveReader(fh)
         chunks = reader.chunks
         members = reader.members
-        shared_freqs = reader.shared_freqs
+        tables = TableSet.from_json(reader.manifest.get("tables"))
 
     total = sum(m.size for m in members)
     _check_coverage(chunks, total)
     pool = _FdPool([src], os.O_RDONLY)
     done = 0
 
-    table = ChunkTable.from_chunks(chunks)
+    # verify decodes every chunk anyway, so materialising them all is what it
+    # was always going to do.
+    ordered = _by_dst(chunks)
+    ordered_starts = [c.dst for c in ordered]
 
     def check_source(src: int, rlen: int, what: str):
         """The whole source range must lie on plain chunks.
@@ -1151,12 +1567,9 @@ def verify(src: str, *, workers: int | None = None, progress=None) -> Stats:
         this same pass, so decoding them again here would only repeat work.
         """
         pos, end = src, src + rlen
-        try:
-            i = table.locate(pos)
-        except CorruptArchive:
-            raise CorruptArchive(f"{what} at byte {pos} is not covered")
+        i = bisect_right(ordered_starts, pos) - 1
         while pos < end:
-            c = table[i] if 0 <= i < len(table) else None
+            c = ordered[i] if 0 <= i < len(ordered) else None
             if c is None or not (c.dst <= pos < c.dst + c.rlen):
                 raise CorruptArchive(f"{what} at byte {pos} is not covered")
             if c.codec in (CODEC_REF, CODEC_DELTA):
@@ -1170,7 +1583,7 @@ def verify(src: str, *, workers: int | None = None, progress=None) -> Stats:
             raise FormatError("archive is truncated")
         return payload
 
-    resolve = _range_resolver(chunks, payload_of, True, shared_freqs=shared_freqs)
+    resolve = _range_resolver(chunks, payload_of, True, tables)
 
     def work(batch):
         done_bytes = 0
@@ -1189,12 +1602,11 @@ def verify(src: str, *, workers: int | None = None, progress=None) -> Stats:
                 check_source(src, chunk.rlen, "delta source")
                 _codec.decode_delta(payload, chunk.esize, chunk.flags,
                                     chunk.rlen, resolve(src, chunk.rlen),
-                                    chunk.crc, True, shared_freqs=shared_freqs)
+                                    chunk.crc, True)
             else:
                 _codec.decode_chunk(payload, chunk.codec, chunk.esize,
                                     chunk.flags, chunk.rlen, chunk.crc, True,
-                                    out=_scratch(chunk.rlen),
-                                    shared_freqs=shared_freqs)
+                                    out=_scratch(chunk.rlen), tables=tables)
             done_bytes += chunk.rlen
         return done_bytes
 
@@ -1216,22 +1628,90 @@ def verify(src: str, *, workers: int | None = None, progress=None) -> Stats:
 # --------------------------------------------------------------- inspection
 
 
+def capabilities(src: str) -> dict:
+    """Which decoders can read this archive, declared rather than inferred.
+
+    A consumer choosing a route needs to know whether lmz's batch decoder can
+    take an archive's chunks before it commits to a device path. Until this
+    existed the only way to find out was to reproduce lmz's own encoder
+    threshold downstream -- a copy of a constant that goes stale silently the
+    day the encoder changes it.
+
+    Returns::
+
+        {"batch_decodable": bool,        # every coded chunk can ride the batch
+         "batch_decodable_fraction": float, # share of it that can, 0..1
+         "blocker_bytes": int,           # plaintext behind those chunks
+         "blockers": {name: chunks},     # codecs standing in the way
+         "min_reader_version": int,
+         "shared_tables": bool,
+         "derived": False}
+
+    `derived` is False because this is read from the archive's own chunk table
+    rather than guessed from a chunk size or a dtype. A consumer that infers
+    the same answer some other way should report True, so that a cached
+    inference is never mistaken for a declaration -- the same discipline as
+    marking a projection a projection.
+
+    A chunk that is not coded at all (stored, or a ref to bytes elsewhere) is
+    not a blocker: there is nothing for a decoder to do, and a route that
+    handles the coded chunks handles the archive. `batch_decodable_fraction`
+    counts only what is coded, so an archive of entirely stored chunks reports
+    True with a share of 1.0. It is a fraction and not a byte count -- the
+    name says so because it sits beside `blocker_bytes`, which is bytes, and a
+    router misreading one for the other would send the wrong work to a
+    device.
+
+    **Read the bytes, not only the boolean.** `batch_decodable` is True only
+    when *every* coded chunk can ride the batch decoder, and a single small
+    chunk makes it False -- a safetensors JSON header is one general-purpose
+    stream and is enough on its own. On a real 1.87 GB checkpoint that is
+    12 KB against 1873 MB: the boolean says no, and 99.999% of the output is
+    still batch-decodable. `blocker_bytes` (a count) and
+    `batch_decodable_fraction` (a share) are there so a caller can tell "one
+    header" from "224 weight chunks" and route the bulk on the device either
+    way.
+    """
+    with open(src, "rb") as fh:
+        reader = ArchiveReader(fh)
+        blockers: dict[str, int] = {}
+        coded = ok = blocked = 0
+        for c in reader.chunks:
+            if c.codec in (CODEC_STORED, CODEC_REF):
+                continue          # nothing coded here for any decoder to read
+            coded += c.rlen
+            if BATCH_DECODABLE.get(c.codec, False):
+                ok += c.rlen
+            else:
+                blocked += c.rlen
+                name = CODEC_NAMES.get(c.codec, f"codec {c.codec}")
+                blockers[name] = blockers.get(name, 0) + 1
+        return {
+            "batch_decodable": not blockers,
+            "batch_decodable_fraction": (ok / coded) if coded else 1.0,
+            "blocker_bytes": blocked,
+            "blockers": blockers,
+            "min_reader_version": max(
+                (CODEC_MIN_VERSION.get(c.codec, 1) for c in reader.chunks),
+                default=1),
+            "shared_tables": bool(reader.manifest.get("tables")),
+            "derived": False,
+        }
+
+
 def info(src: str) -> dict:
     """Archive metadata: members, tensors, and how the chunks were encoded."""
     with open(src, "rb") as fh:
         reader = ArchiveReader(fh)
         by_codec: dict[str, list[int]] = {}
         payload_bytes = 0
-        for _off, _dst, clen, rlen, _crc, codec, _esize, _flags in RECORD.iter_unpack(
-                reader.chunks.to_bytes()):
-            name = {0: "stored", 1: "entropy", 2: "split", 3: "bf16-split",
-                    4: "ref", 5: "bf16-cond", 6: "q8-block",
-                    7: "blk-split", 8: "delta"}.get(codec, "?")
+        for c in reader.chunks:
+            payload_bytes += c.clen
+            name = CODEC_NAMES.get(c.codec, f"codec {c.codec}")
             slot = by_codec.setdefault(name, [0, 0, 0])
             slot[0] += 1
-            slot[1] += rlen
-            slot[2] += clen
-            payload_bytes += clen
+            slot[1] += c.rlen
+            slot[2] += c.clen
         return {
             "path": src,
             "archive_size": reader.file_size,
@@ -1246,6 +1726,92 @@ def info(src: str) -> dict:
             "methods": reader.manifest.get("methods") or {},
             "payload_bytes": payload_bytes,
         }
+
+
+@dataclass(frozen=True)
+class ChunkRef:
+    """Where a chunk's payload is, and what it decodes to.
+
+    Enough to fetch the bytes yourself and hand them back to `decode`, and
+    nothing more: the offsets are into the archive file, `rlen` is the
+    plaintext length, and `codec` says which decoders can read it.
+    """
+
+    index: int
+    off: int           # byte offset of the payload in the archive
+    clen: int          # coded length
+    dst: int           # where the plaintext belongs in the output
+    rlen: int          # plaintext length
+    codec: int
+    batch_decodable: bool
+
+
+class ArchiveIndex:
+    """An archive's chunk table and tables, with a decode that does no I/O.
+
+    `decompress` reads and decodes inside one worker, which ties the thread
+    count that sets decode throughput to the number of reads outstanding.
+    Those want opposite things -- an NVMe device reaches its rated rate only
+    with a dozen requests in flight, while past two threads lmz's own
+    interpreter overhead turns into GIL contention. That coupling cannot be
+    tuned from outside; it can only be escaped by decoding a payload the
+    caller fetched. This is that escape.
+
+    It opens the archive to read the chunk table and the manifest, then holds
+    no file: `chunks()` says where every payload is, the caller fetches them
+    however it likes -- one thread, twelve, io_uring, over a network -- and
+    `decode` turns bytes into bytes with no I/O and no threads of its own.
+
+        idx = ArchiveIndex("model.lmz")
+        for c in idx.chunks():
+            payload = my_reader.pread(c.off, c.clen)
+            plain = idx.decode(c, payload)
+
+    Ref and delta chunks are the exception and say so: they are defined as a
+    difference from an earlier output range, so decoding one needs bytes from
+    elsewhere in the archive. `decode` raises `NeedsSource` for those rather
+    than reaching for the file behind the caller's back, and `decompress`
+    remains the thing to use when you want lmz to handle it.
+    """
+
+    class NeedsSource(FormatError):
+        """This chunk is defined against another range; use `decompress`."""
+
+    def __init__(self, path: str):
+        self.path = path
+        with open(path, "rb") as fh:
+            reader = ArchiveReader(fh)
+            self._chunks = reader.chunks.order_by_dst()
+            self.manifest = reader.manifest
+            self.members = reader.members
+            self.tables = TableSet.from_json(reader.manifest.get("tables"))
+            self.original_size = reader.original_size
+
+    def chunks(self) -> list["ChunkRef"]:
+        """Every chunk, in output order, with where to read it from."""
+        return [ChunkRef(i, c.off, c.clen, c.dst, c.rlen, c.codec,
+                         BATCH_DECODABLE.get(c.codec, False))
+                for i, c in enumerate(self._chunks)]
+
+    def decode(self, ref: "ChunkRef", payload, *, verify: bool = True,
+               out=None):
+        """Turn one chunk's coded bytes into its plaintext. No I/O, no threads.
+
+        `payload` is the `clen` bytes at `ref.off`, however the caller got
+        them. `verify` checks the chunk's CRC, which is on by default because
+        a silently wrong weight is worse than a slow one.
+        """
+        chunk = self._chunks[ref.index]
+        if len(payload) != chunk.clen:
+            raise FormatError(
+                f"chunk {ref.index} is {chunk.clen} coded bytes, got {len(payload)}")
+        if chunk.codec in (CODEC_REF, CODEC_DELTA):
+            raise self.NeedsSource(
+                f"chunk {ref.index} is coded against an earlier range; "
+                f"use decompress() or MappedArchive, which can fetch it")
+        return _codec.decode_chunk(payload, chunk.codec, chunk.esize,
+                                   chunk.flags, chunk.rlen, chunk.crc,
+                                   verify, out=out, tables=self.tables)
 
 
 class MappedArchive:
@@ -1291,9 +1857,13 @@ class MappedArchive:
         except BaseException:
             self._fh.close()
             raise
-        self._chunks = self._reader.chunks
-        self._decode = _chunk_decoder(self._chunks, self._payload_of, verify,
-                                      shared_freqs=self._reader.shared_freqs)
+        # A mount resolves an arbitrary byte to a block on every read, so this
+        # is the one caller that genuinely wants every Chunk materialised.
+        self._chunks = _by_dst(self._reader.chunks)
+        self._starts = [c.dst for c in self._chunks]
+        self._decode = _chunk_decoder(
+            self._chunks, self._payload_of, verify,
+            TableSet.from_json(self._reader.manifest.get("tables")))
         self._cache: "OrderedDict[int, bytes]" = OrderedDict()
         self._cap = max(1, cache_blocks)
         self._lock = threading.Lock()
@@ -1324,19 +1894,9 @@ class MappedArchive:
         return self._reader.aligned
 
     @property
-    def shared_table(self) -> bytes | None:
-        """The 516-byte shared frequency header, or None."""
-        return self._reader.shared_table
-
-    @property
-    def shared_freqs(self) -> list[int] | None:
-        """The 256 uint16 frequencies of the shared table, or None."""
-        return self._reader.shared_freqs
-
-    @property
     def block_bytes(self) -> int:
         """Largest block in the archive: what a one-byte read can cost."""
-        return self._chunks.max_rlen()
+        return max((c.rlen for c in self._chunks), default=0)
 
     # -- reading ----------------------------------------------------------
     def _payload_of(self, c):
@@ -1495,7 +2055,13 @@ class MappedArchive:
         return [d if d is not None else done[i] for i, d in zip(idx, got)]
 
     def _locate(self, pos: int) -> int:
-        return self._chunks.locate(pos)
+        i = bisect_right(self._starts, pos) - 1
+        if not 0 <= i < len(self._chunks):
+            raise CorruptArchive(f"byte {pos} is not covered by any chunk")
+        c = self._chunks[i]
+        if not (c.dst <= pos < c.dst + c.rlen):
+            raise CorruptArchive(f"byte {pos} is not covered by any chunk")
+        return i
 
     def read(self, offset: int, length: int) -> bytes:
         """Bytes [offset, offset+length) of the restored output."""
@@ -1506,27 +2072,27 @@ class MappedArchive:
             return b""
 
         first = self._locate(offset)
-        dst0, rlen0 = self._chunks.span_of(first)
+        c = self._chunks[first]
         # The common case by count -- a small read inside one block -- takes
         # nothing but a slice. Assembling a buffer for it copied every byte
         # twice over for no reason.
-        if end <= dst0 + rlen0:
-            a = offset - dst0
+        if end <= c.dst + c.rlen:
+            a = offset - c.dst
             return bytes(self._block(first)[a:a + (end - offset)])
 
         idx, pos = [], offset
+        i = first
         while pos < end:
             i = self._locate(pos)
             idx.append(i)
-            cdst, crlen = self._chunks.span_of(i)
-            pos = cdst + crlen
+            pos = self._chunks[i].dst + self._chunks[i].rlen
 
         out = bytearray(end - offset)
         for i, data in zip(idx, self._blocks(idx)):
-            cdst, crlen = self._chunks.span_of(i)
-            a = max(offset, cdst) - cdst
-            b = min(end, cdst + crlen) - cdst
-            out[cdst + a - offset:cdst + b - offset] = data[a:b]
+            c = self._chunks[i]
+            a = max(offset, c.dst) - c.dst
+            b = min(end, c.dst + c.rlen) - c.dst
+            out[c.dst + a - offset:c.dst + b - offset] = data[a:b]
         return bytes(out)
 
     def prefetch(self, offset: int, length: int) -> int:
@@ -1546,8 +2112,7 @@ class MappedArchive:
         while pos < end:
             i = self._locate(pos)
             idx.append(i)
-            cdst, crlen = self._chunks.span_of(i)
-            pos = cdst + crlen
+            pos = self._chunks[i].dst + self._chunks[i].rlen
         if not idx:
             return 0
         missing = [i for i, got in zip(idx, self._lookup(idx)) if got is None]
@@ -1563,6 +2128,19 @@ class MappedArchive:
                 return self.read(m.dst + offset, max(0, min(n, m.size - offset)))
         raise KeyError(f"no member named {member!r}")
 
+    def tensor(self, name: str, member: str | None = None):
+        """One tensor as (dtype, shape, raw little-endian bytes)."""
+        for m in self._reader.members:
+            if member is not None and m.path != member:
+                continue
+            if m.tensors and name in m.tensors:
+                meta = m.tensors[name]
+                start, end = meta["offsets"]
+                raw = self.read(m.dst + start, end - start)
+                return meta.get("dtype", ""), meta.get("shape", []), raw
+        where = f" in {member}" if member else ""
+        raise KeyError(f"no tensor named {name!r}{where}")
+
     def _build_tensor_blocks(self, m: Member, name: str,
                              meta: dict) -> TensorBlocks:
         start, end = meta["offsets"]
@@ -1572,8 +2150,8 @@ class MappedArchive:
         if recorded is not None and len(recorded) == 2:
             lo, hi = int(recorded[0]), int(recorded[1])
         else:
-            lo, hi = self._chunks.range_indices(offset, offset + size)
-        chunks = self._chunks[lo:hi]
+            lo, hi = self._reader.chunks.range_indices(offset, offset + size)
+        chunks = self._reader.chunks[lo:hi]
         block_offset = (offset - chunks[0].dst) if chunks else 0
         return TensorBlocks(
             name=name,
@@ -1610,19 +2188,6 @@ class MappedArchive:
                                           for m in self._reader.members):
             raise KeyError(f"no member named {member!r}")
         return out
-
-    def tensor(self, name: str, member: str | None = None):
-        """One tensor as (dtype, shape, raw little-endian bytes)."""
-        for m in self._reader.members:
-            if member is not None and m.path != member:
-                continue
-            if m.tensors and name in m.tensors:
-                meta = m.tensors[name]
-                start, end = meta["offsets"]
-                raw = self.read(m.dst + start, end - start)
-                return meta.get("dtype", ""), meta.get("shape", []), raw
-        where = f" in {member}" if member else ""
-        raise KeyError(f"no tensor named {name!r}{where}")
 
     def close(self) -> None:
         if self._pool is not None:

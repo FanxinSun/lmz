@@ -21,10 +21,13 @@ single-file and directory cases on exactly the same path.
 
 from __future__ import annotations
 
+import array
 import io
 import json
 import struct
+import sys
 from dataclasses import dataclass, field
+from itertools import islice
 
 MAGIC = b"LMZ\x01"
 TAIL = b"LMZTAIL\x01"
@@ -34,10 +37,21 @@ TAIL = b"LMZTAIL\x01"
 # quantisation rather than one; v5 adds a field mode that codes a k-quant's
 # quants per sub-block class, described in the payload alongside the rest;
 # v6 adds delta chunks, which name an earlier output range the way a ref does
-# and carry the coded difference from it; v7 adds shared frequency tables across chunks.
-# Earlier archives contain none of the newer codecs, so this build reads every version listed.
+# and carry the coded difference from it; v7 adds a byte-plane split whose
+# rANS streams are coded against a table carried once in the manifest instead
+# of once per stream. Earlier archives contain none of the newer codecs, so
+# this build reads every version listed.
 FORMAT_VERSION = 7
 READABLE_VERSIONS = (1, 2, 3, 4, 5, 6, 7)
+
+# What an archive is stamped with when it uses none of the newest codecs.
+# The stamp is a *requirement on the reader*, not a build number: writing
+# FORMAT_VERSION unconditionally would make every ordinary archive this build
+# produces unreadable to the previous release, which can decode all of it. So
+# the writer stamps the lowest version that can read what it actually wrote,
+# and only a chunk below raises it.
+BASE_VERSION = 6
+CODEC_MIN_VERSION = {}
 
 HEADER = struct.Struct("<4sHHQQQ")  # magic, version, flags, original_size, 2x reserved
 HEADER_SIZE = 32
@@ -51,7 +65,6 @@ assert FOOTER.size == FOOTER_SIZE
 RECORD = struct.Struct("<QQIIIBBH")
 RECORD_SIZE = 32
 assert RECORD.size == RECORD_SIZE
-
 _DST_STRUCT = struct.Struct("<Q")
 _SPAN_STRUCT = struct.Struct("<QQII")
 
@@ -64,6 +77,62 @@ CODEC_BF16C = 5  # BF16 field split; sign+mantissa coded per exponent bucket
 CODEC_BLK = 6  # v3 Q8_0 block split; still decoded, no longer written
 CODEC_GBLK = 7  # block split whose field grouping is described in the payload
 CODEC_DELTA = 8  # payload names an earlier output range plus a coded difference
+# As CODEC_SPLIT, but every rANS plane is headerless and is decoded against
+# the archive's shared table for that plane kind. A separate codec id rather
+# than a flag bit because a split chunk's 16 flag bits are already two per
+# plane for eight planes, with nothing spare -- and because a reader that does
+# not know about shared tables must refuse the chunk rather than misread it,
+# which an unknown codec id gets for free.
+CODEC_SPLIT_ST = 9
+CODEC_MIN_VERSION[CODEC_SPLIT_ST] = 7
+
+# Short names for the codec ids, for anything that reports what an archive
+# holds. Here rather than in a caller so that adding a codec updates every
+# report at once -- the previous inline copy silently printed "?" for
+# CODEC_SPLIT_ST from the day it was added.
+CODEC_NAMES = {
+    CODEC_STORED: "stored",
+    CODEC_ZSTD: "entropy",
+    CODEC_SPLIT: "split",
+    CODEC_BF16: "bf16-split",
+    CODEC_REF: "ref",
+    CODEC_BF16C: "bf16-cond",
+    CODEC_BLK: "q8-block",
+    CODEC_GBLK: "blk-split",
+    CODEC_DELTA: "delta",
+    CODEC_SPLIT_ST: "split-shared",
+}
+
+# Which codecs a batch decoder can read, and which only the CPU can.
+#
+# lmz's GPU decoder takes a *batch of equal-length rANS streams* -- that is
+# the shape that fills a device, since one stream is only 8 lanes of work. A
+# codec whose payload is that shape can ride it; one whose payload is a single
+# stream, a pointer, or segments of unequal length cannot, and no amount of
+# effort on the decoder's side changes that. It is a property of the chunk
+# layout, so it is declared here rather than inferred by a consumer from a
+# chunk size or a dtype.
+#
+# The one that matters is CODEC_BF16C: it codes sign+mantissa per exponent
+# bucket, so its segments have unequal lengths by construction. A consumer
+# that wants an archive its GPU can read has to make lmz not emit it, and
+# until this table existed the only way to know that was to reproduce lmz's
+# own encoder threshold.
+#
+# `False` here does not mean slow or unsupported -- every codec decodes
+# correctly on the CPU. It means the batch decoder cannot take this chunk.
+BATCH_DECODABLE = {
+    CODEC_STORED: False,   # not coded at all
+    CODEC_ZSTD: False,     # one stream, whatever coder produced it
+    CODEC_SPLIT: True,     # esize equal-length planes
+    CODEC_BF16: True,      # two equal-length planes
+    CODEC_REF: False,      # a pointer; decoding is a copy from elsewhere
+    CODEC_BF16C: False,    # per-bucket segments, unequal by construction
+    CODEC_BLK: True,       # equal-length stride lanes
+    CODEC_GBLK: False,     # field groups of differing widths
+    CODEC_DELTA: False,    # a source range plus a difference
+    CODEC_SPLIT_ST: True,  # equal-length planes; table comes from the manifest
+}
 
 # Header flags. Both are advisory: the chunk table already addresses every
 # payload by explicit (offset, length), so a reader that ignores these still
@@ -71,9 +140,6 @@ CODEC_DELTA = 8  # payload names an earlier output range plus a coded difference
 # random access will be cheap before it starts.
 FLAG_PAGE_MAPPED = 1 << 0  # blocks are small enough to decode one at a time
 FLAG_ALIGNED = 1 << 1  # payloads start on PAGE_ALIGN boundaries
-
-# Chunk flags (RECORD.flags, uint16). Lower bits 0..7 are used for 2-bit plane methods.
-FLAG_SHARED_TABLE = 1 << 8  # plane 0 was encoded against the shared frequency table
 
 # What a page-mapped archive aligns to, when it aligns at all. Storage below
 # this is indivisible: filesystems allocate whole 4 KiB blocks and flash reads
@@ -107,45 +173,48 @@ class Chunk:
 
 
 class ChunkTable:
-    """The archive's chunk directory, kept as its raw 32-byte records.
+    """The chunk table, read in place instead of expanded into objects.
 
-    A 70B model in 64 KiB blocks has 2.1 million chunks. Unpacking that into
-    Python `Chunk` instances and a parallel offset list costs ~305 bytes per
-    record (~0.6 GiB of heap) and ~11 seconds before the first byte is read.
-    Keeping the decompressed table buffer intact and binary-searching `dst`
-    in place makes opening an archive O(1) in chunk count and unpacks a
-    `Chunk` only for the blocks a read actually touches.
+    The table is fixed-width records, so the decompressed bytes *are* the
+    index and a `Chunk` can be built from any record on demand. Building all
+    of them up front is what used to dominate opening an archive: for a 70B
+    checkpoint the table is 70 MB of records that become 0.51 GB of Python
+    objects and take about 7 s, and the zstd decode of those 70 MB is only
+    0.07 s of it. Every process paid that before reading a single byte.
+
+    This holds the flat buffer and unpacks per access, which is a trade rather
+    than a free win: one record costs a few microseconds, so code that walks
+    the whole table repeatedly should hoist it into a list. The aggregate
+    columns below exist so the callers that only want a total do not have to.
+
+    A sequence, so anything that indexes, iterates, sorts or len()s a list of
+    chunks keeps working unchanged.
     """
 
     __slots__ = ("_buf", "_n", "_sorted_checked")
 
-    def __init__(self, buf: bytes | bytearray | memoryview = b""):
+    def __init__(self, buf):
         if len(buf) % RECORD_SIZE:
             raise FormatError("chunk table has a partial record")
-        self._buf = bytes(buf)
-        self._n = len(self._buf) // RECORD_SIZE
+        self._buf = buf
+        self._n = len(buf) // RECORD_SIZE
         self._sorted_checked = False
 
+    def to_bytes(self) -> bytes:
+        return bytes(self._buf)
+
     @classmethod
-    def from_chunks(cls, chunks) -> "ChunkTable":
+    def from_chunks(cls, chunks):
         if isinstance(chunks, ChunkTable):
             return chunks
         return cls(b"".join(c.pack() for c in chunks))
 
-    def to_bytes(self) -> bytes:
-        return self._buf
-
     def __len__(self) -> int:
         return self._n
 
-    def __bool__(self) -> bool:
-        return self._n > 0
-
-    def __getitem__(self, idx):
-        if isinstance(idx, slice):
-            return [Chunk(*RECORD.unpack_from(self._buf, i * RECORD_SIZE))
-                    for i in range(*idx.indices(self._n))]
-        i = int(idx)
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return [self[k] for k in range(*i.indices(self._n))]
         if i < 0:
             i += self._n
         if not 0 <= i < self._n:
@@ -254,6 +323,72 @@ class ChunkTable:
             raise FormatError(
                 f"archive covers {pos} bytes but declares {total}")
 
+    def column(self, name: str) -> "array.array":
+        """One field of every record, without building any Chunk.
+
+        `sum(c.clen for c in chunks)` over a 70B table builds 2.2M objects to
+        add one integer. Reading the column straight out of the buffer is
+        about a hundred times less work and is what `info` and the coverage
+        check want.
+        """
+        width, start = _COLUMNS[name]
+        code = _TYPECODE.get(width)
+        if code is None:                       # no native type of that width
+            return array.array("Q", [getattr(c, name) for c in self])
+        col = array.array(code)
+        col.frombytes(self._buf)
+        if sys.byteorder != "little":          # records are little-endian
+            col.byteswap()
+        stride = RECORD_SIZE // width
+        return col[start::stride]
+
+    def order_by_dst(self) -> list["Chunk"]:
+        """Every chunk, in destination order.
+
+        Chunks are appended as their workers finish, so the table is *nearly*
+        sorted but not reliably so, and the callers that need an order cannot
+        assume one.
+
+        This deliberately materialises in one `iter_unpack` pass and sorts the
+        objects, rather than sorting the packed column and then picking
+        records out by index: a per-record `unpack_from` loop measured almost
+        twice the cost of the single pass, which more than spends whatever the
+        cheaper sort saves. Sorting a column is the right instinct and the
+        wrong trade here, so it is written down rather than re-attempted.
+        """
+        out = list(self)
+        # islice rather than dst[1:], which would copy the whole column just
+        # to look at it once.
+        dst = self.column("dst")
+        if all(a <= b for a, b in zip(dst, islice(dst, 1, None))):
+            return out                  # already ordered: skip the sort
+        out.sort(key=_dst_of)
+        return out
+
+
+def _dst_of(c: "Chunk") -> int:
+    """Sort key for chunk order. A module-level function rather than a lambda
+    so the hot sort does not rebuild a closure per call site."""
+    return c.dst
+
+
+# field -> (width in bytes, index of the field's first element within a record
+# measured in units of that width). RECORD is "<QQIIIBBH": two u64 then three
+# u32 then two u8 and a u16, in 32 bytes.
+_COLUMNS = {
+    "off": (8, 0),
+    "dst": (8, 1),
+    "clen": (4, 4),
+    "rlen": (4, 5),
+    "crc": (4, 6),
+}
+
+# array's typecode widths are platform-defined rather than fixed, so they are
+# discovered instead of assumed; a build where nothing is 4 or 8 bytes falls
+# back to unpacking, which is slower but still correct.
+_TYPECODE = {array.array(c).itemsize: c for c in ("I", "L", "Q")
+             if array.array(c).itemsize in (4, 8)}
+
 
 @dataclass(slots=True)
 class Member:
@@ -297,7 +432,7 @@ class ArchiveWriter:
     """Streams chunk payloads out, then writes the table, manifest and footer."""
 
     def __init__(self, fileobj, manifest: dict, flags: int = 0, align: int = 0,
-                 resume_at: int | None = None, chunks=None):
+                 resume_at: int | None = None, chunks: list | None = None):
         """Start a new archive, or carry on writing an existing one.
 
         `resume_at` is where the old chunk table began: everything from there
@@ -307,12 +442,9 @@ class ArchiveWriter:
         """
         self.f = fileobj
         self.manifest = manifest
-        if chunks is None:
-            self._table = bytearray()
-        elif isinstance(chunks, ChunkTable):
-            self._table = bytearray(chunks.to_bytes())
-        else:
-            self._table = bytearray(b"".join(c.pack() for c in chunks))
+        self.chunks: list[Chunk] = list(chunks or ())
+        self.version = max((CODEC_MIN_VERSION.get(c.codec, BASE_VERSION)
+                            for c in self.chunks), default=BASE_VERSION)
         self.flags = flags
         self.align = align
         self.padding = 0
@@ -322,10 +454,6 @@ class ArchiveWriter:
         else:
             self.offset = resume_at
             self.f.seek(resume_at)
-
-    @property
-    def chunks(self) -> ChunkTable:
-        return ChunkTable(self._table)
 
     def append(self, parts, dst: int, rlen: int, crc: int,
                codec: int, esize: int, flags: int) -> None:
@@ -343,18 +471,43 @@ class ArchiveWriter:
         for part in parts:
             self.f.write(part)
             clen += len(part)
-        self._table += RECORD.pack(self.offset, dst, clen, rlen, crc,
-                                   codec, esize, flags)
+        self.chunks.append(Chunk(self.offset, dst, clen, rlen, crc,
+                                 codec, esize, flags))
+        need = CODEC_MIN_VERSION.get(codec)
+        if need is not None and need > self.version:
+            self.version = need
         self.offset += clen
 
+    def alias(self, off: int, clen: int, dst: int, rlen: int, crc: int,
+              codec: int, esize: int, flags: int) -> None:
+        """Record a chunk whose payload is one already in the file.
+
+        Nothing is written. Two chunks with the same stored bytes and the same
+        codec, element size, flags, length and checksum decode to the same
+        thing, so the second only needs a table entry pointing at the first.
+        The offset in a record has always been explicit and readers resolve a
+        payload by (off, clen) without assuming those are unique, so this is
+        the format as it stands rather than a change to it.
+
+        This is what makes an exact re-upload free even when its twin is
+        stored as a difference: a reference may only name a plain chunk, but
+        sharing a payload is not a reference -- both entries still name the
+        plain source they were coded against, and resolution stays one hop.
+        """
+        self.chunks.append(Chunk(off, dst, clen, rlen, crc, codec, esize,
+                                 flags))
+        need = CODEC_MIN_VERSION.get(codec)
+        if need is not None and need > self.version:
+            self.version = need
+
     def close(self, original_size: int) -> None:
-        table = bytes(self._table)
+        table = b"".join(c.pack() for c in self.chunks)
         table_c = _zstd_compress(table, 3)
         table_off = self.offset
         self.f.write(table_c)
         self.offset += len(table_c)
 
-        self.manifest["chunks"] = len(table) // RECORD_SIZE
+        self.manifest["chunks"] = len(self.chunks)
         self.manifest["table_raw_len"] = len(table)
         man = json.dumps(self.manifest, separators=(",", ":")).encode()
         man_c = _zstd_compress(man, 3)
@@ -368,7 +521,7 @@ class ArchiveWriter:
         self.end = self.offset + FOOTER_SIZE
 
         self.f.seek(0)
-        self.f.write(HEADER.pack(MAGIC, FORMAT_VERSION, self.flags,
+        self.f.write(HEADER.pack(MAGIC, self.version, self.flags,
                                  original_size, 0, 0))
         self.f.flush()
 
@@ -419,7 +572,8 @@ class ArchiveReader:
     @property
     def payload_end(self) -> int:
         """First byte after the chunk payloads."""
-        return self.chunks.min_off(default=self.file_size)
+        off = self.chunks.column("off")
+        return min(off) if off else self.file_size
 
     @property
     def page_mapped(self) -> bool:
@@ -429,22 +583,3 @@ class ArchiveReader:
     @property
     def aligned(self) -> bool:
         return bool(self.flags & FLAG_ALIGNED)
-
-    @property
-    def shared_table(self) -> bytes | None:
-        """The 516-byte shared frequency header, or None."""
-        val = self.manifest.get("shared_table")
-        if not val:
-            return None
-        b = bytes.fromhex(val)
-        if len(b) != 516 or b[:2] != b"R1":
-            raise FormatError("invalid shared_table in manifest")
-        return b
-
-    @property
-    def shared_freqs(self) -> list[int] | None:
-        """The 256 uint16 frequencies of the shared table, or None."""
-        tbl = self.shared_table
-        if tbl is None:
-            return None
-        return list(struct.unpack("<256H", tbl[4:]))

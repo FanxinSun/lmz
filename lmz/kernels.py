@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 import threading
 
 _lock = threading.Lock()
@@ -22,6 +23,11 @@ _lib = None
 _state = "unloaded"
 
 SUPPORTED_ESIZES = (1, 2, 4, 8)
+
+# A rANS stream header: magic(2) + reserved(2) + 256 little-endian uint16
+# frequencies, matching RANS_HEADER in the kernel. It is a constant of the
+# format, so a shared table is exactly this many bytes however it is stored.
+RANS_HEADER = 516
 
 # Widest fixed-period record split_stride/merge_stride accept, matching
 # LMZ_MAX_PERIOD in the kernel. The widest GGUF block in use is Q6_K's 210.
@@ -48,7 +54,7 @@ def _load_native():
                 return None
             lib = ctypes.CDLL(path)
             lib.lmz_abi_version.restype = ctypes.c_int
-            if lib.lmz_abi_version() != 12:
+            if lib.lmz_abi_version() != 11:
                 _state = "abi-mismatch"
                 return None
             lib.lmz_isa.restype = ctypes.c_char_p
@@ -86,7 +92,12 @@ def _load_native():
             lib.lmz_decode_planes.restype = ctypes.c_int
             lib.lmz_decode_planes.argtypes = [
                 v, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
-                ctypes.c_uint32, ctypes.c_int, v, v, ctypes.c_size_t, v]
+                ctypes.c_uint32, ctypes.c_int, v, v, ctypes.c_size_t]
+            lib.lmz_decode_planes_shared.restype = ctypes.c_int
+            lib.lmz_decode_planes_shared.argtypes = [
+                v, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+                ctypes.c_uint32, ctypes.c_int, v, v, ctypes.c_size_t,
+                v, ctypes.c_uint32]
             lib.lmz_xor.restype = ctypes.c_int
             lib.lmz_xor.argtypes = [v, v, ctypes.c_size_t, v]
             lib.lmz_k4_scales.restype = ctypes.c_int
@@ -107,22 +118,25 @@ def _load_native():
             lib.lmz_rans_encode_portable.restype = ctypes.c_long
             lib.lmz_rans_encode_portable.argtypes = [v, ctypes.c_size_t, v,
                                                      ctypes.c_size_t, v]
+            lib.lmz_rans_decode.restype = ctypes.c_int
+            lib.lmz_rans_decode.argtypes = [v, ctypes.c_size_t, v, ctypes.c_size_t]
+            lib.lmz_rans_table.restype = ctypes.c_int
+            lib.lmz_rans_table.argtypes = [v, v]
             lib.lmz_rans_encode_shared.restype = ctypes.c_long
             lib.lmz_rans_encode_shared.argtypes = [v, ctypes.c_size_t, v,
                                                    ctypes.c_size_t, v]
-            lib.lmz_rans_decode.restype = ctypes.c_int
-            lib.lmz_rans_decode.argtypes = [v, ctypes.c_size_t, v, ctypes.c_size_t]
             lib.lmz_rans_decode_shared.restype = ctypes.c_int
             lib.lmz_rans_decode_shared.argtypes = [v, ctypes.c_size_t, v,
                                                    ctypes.c_size_t, v]
-            lib.lmz_rans_decode_many4.restype = ctypes.c_int
-            lib.lmz_rans_decode_many4.argtypes = [
-                ctypes.POINTER(ctypes.c_void_p),
-                ctypes.POINTER(ctypes.c_size_t),
-                ctypes.POINTER(ctypes.c_void_p),
-                ctypes.c_size_t,
-                ctypes.POINTER(ctypes.c_void_p),
-            ]
+            if hasattr(lib, "lmz_rans_decode_many4"):
+                lib.lmz_rans_decode_many4.restype = ctypes.c_int
+                lib.lmz_rans_decode_many4.argtypes = [
+                    ctypes.POINTER(ctypes.c_void_p),
+                    ctypes.POINTER(ctypes.c_size_t),
+                    ctypes.POINTER(ctypes.c_void_p),
+                    ctypes.c_size_t,
+                    ctypes.POINTER(ctypes.c_void_p),
+                ]
             _lib = lib
             _state = "native:" + lib.lmz_isa().decode()
         except Exception:
@@ -602,8 +616,43 @@ def _planes_buf(nbytes: int):
     return buf
 
 
+_flat_cache: dict[bytes, "ctypes.Array"] = {}
+
+
+def _flat_tables(tables, nplanes: int):
+    """One flat frequency array for a chunk's planes, and a have-bitmask.
+
+    A plane with no shared table still occupies its 256 slots so the kernel
+    can index by plane without a second length; the bitmask is what says the
+    slots are meaningless and the stream carries its own header.
+    """
+    have, parts = 0, []
+    for k in range(nplanes):
+        t = tables[k] if k < len(tables) else None
+        if t is None:
+            parts.append(b"\0" * 512)
+            continue
+        if len(t) != RANS_HEADER:
+            raise ValueError(f"a shared table is {RANS_HEADER} bytes")
+        have |= 1 << k
+        parts.append(bytes(t)[4:4 + 512])
+    blob = b"".join(parts)
+    got = _flat_cache.get(blob)
+    if got is None:
+        arr = ctypes.c_uint16 * (nplanes * 256)
+        if sys.byteorder == "little":
+            got = arr.from_buffer_copy(blob)
+        else:                                # the header is little-endian
+            got = arr()
+            for i in range(nplanes * 256):
+                got[i] = blob[2 * i] | (blob[2 * i + 1] << 8)
+        if len(_flat_cache) < 256:
+            _flat_cache[blob] = got
+    return got, have
+
+
 def decode_planes(payload, nplanes: int, nelem: int, methods: int,
-                  bf16: bool, out=None, shared_freqs=None):
+                  bf16: bool, out=None, tables=None):
     """Decode and merge every plane of a split chunk in one native call.
 
     Returns a memoryview of the merged bytes, or None when the kernel will not
@@ -614,7 +663,10 @@ def decode_planes(payload, nplanes: int, nelem: int, methods: int,
     The point is not the arithmetic, which is identical, but the GIL: crossing
     once per plane and again to merge hands the interpreter three chances to
     hold up every other thread, and that is what made threaded reads slower
-    than serial ones.
+    than serial ones. `tables` is a per-plane list of shared tables, or None
+    entries where a plane carries its own header -- and it is here rather than
+    in a Python loop for exactly the reason above: decoding the shared form a
+    plane at a time measured 2.5x the cost of this call on a real checkpoint.
     """
     lib = _load_native()
     n = nplanes * nelem
@@ -626,10 +678,16 @@ def decode_planes(payload, nplanes: int, nelem: int, methods: int,
     pa, _a = _ptr(payload)
     da, _b = _ptr(dst)
     sa, _c = _ptr(scr)
-    fa = _freqs_arg(shared_freqs)
-    fa_ptr = ctypes.byref(fa) if fa is not None else None
-    rc = lib.lmz_decode_planes(pa, len(payload), nplanes, nelem, methods,
-                               1 if bf16 else 0, da, sa, need, fa_ptr)
+    if tables is None:
+        rc = lib.lmz_decode_planes(pa, len(payload), nplanes, nelem, methods,
+                                   1 if bf16 else 0, da, sa, need)
+    else:
+        if not hasattr(lib, "lmz_decode_planes_shared"):
+            return None            # an older kernel built before this landed
+        flat, have = _flat_tables(tables, nplanes)
+        rc = lib.lmz_decode_planes_shared(pa, len(payload), nplanes, nelem,
+                                          methods, 1 if bf16 else 0, da, sa,
+                                          need, ctypes.byref(flat), have)
     return memoryview(dst)[:n] if rc == 0 else None
 
 
@@ -884,6 +942,109 @@ def rans_encode(src, hist=None, portable: bool = False) -> bytes | None:
     return bytes(memoryview(buf)[:written])
 
 
+def rans_table(hist) -> bytes | None:
+    """The 516-byte stream header for `hist`, to be shared by many streams.
+
+    This is byte-for-byte the header `rans_encode` would write into a single
+    stream, which is what makes the shared form cheap to verify: prepending it
+    to a stream from `rans_encode_shared` yields an ordinary lmz stream, so the
+    existing decoder is the oracle rather than a second implementation.
+
+    The counts must cover every stream the table will code. A symbol with zero
+    frequency cannot be represented at all, and `rans_encode_shared` refuses
+    rather than emitting a stream that decodes to the wrong bytes.
+    """
+    lib = _load_native()
+    if lib is None:
+        return None
+    freqs = (ctypes.c_uint16 * 256)()
+    if lib.lmz_rans_table(_counts_arg(hist), freqs) != 0:
+        return None
+    hdr = bytearray(RANS_HEADER)
+    hdr[0:2] = b"R1"
+    for s in range(256):
+        hdr[4 + 2 * s] = freqs[s] & 0xFF
+        hdr[5 + 2 * s] = freqs[s] >> 8
+    return bytes(hdr)
+
+
+_FREQS = ctypes.c_uint16 * 256
+_freqs_cache: dict[bytes, "ctypes.Array"] = {}
+
+
+def _freqs_from_table(table):
+    """Unpack a 516-byte header back into the array the kernel takes.
+
+    Cached on the table bytes, and copied wholesale rather than element by
+    element. Both matter more than they look: an archive has a handful of
+    shared tables and decodes them across thousands of planes, so a 256-step
+    Python loop per plane was the dominant cost of decoding a shared-table
+    chunk -- three times the cost of the coding itself.
+
+    The cache is keyed by value, so two identical tables share one array, and
+    a plain dict is enough for the races that can happen here: the worst
+    outcome of two threads missing at once is that both build the same
+    immutable array and one of them is discarded.
+    """
+    if len(table) != RANS_HEADER:
+        raise ValueError(f"a shared table is {RANS_HEADER} bytes")
+    key = bytes(table)
+    got = _freqs_cache.get(key)
+    if got is not None:
+        return got
+    if sys.byteorder == "little":
+        freqs = _FREQS.from_buffer_copy(key[4:4 + 512])
+    else:                                   # the header is little-endian
+        freqs = _FREQS()
+        for s in range(256):
+            freqs[s] = key[4 + 2 * s] | (key[5 + 2 * s] << 8)
+    if len(_freqs_cache) < 256:             # an archive has a few, not many
+        _freqs_cache[key] = freqs
+    return freqs
+
+
+def rans_encode_shared(src, table) -> bytes | None:
+    """Encode against a shared table, writing no per-stream header.
+
+    Returns None when the kernel is unavailable, the input is empty, or `src`
+    holds a symbol the table cannot represent -- the last of which is a caller
+    error, and is refused here rather than silently mis-coded.
+    """
+    lib = _load_native()
+    if lib is None or len(src) == 0:
+        return None
+    n = len(src)
+    cap = lib.lmz_rans_bound(n)
+    buf = getattr(_rans_scratch, "buf", None)
+    if buf is None or len(buf) < cap:
+        buf = _rans_scratch.buf = bytearray(cap)
+    src_addr, _a = _ptr(src)
+    dst_addr, _b = _ptr(buf)
+    written = lib.lmz_rans_encode_shared(src_addr, n, dst_addr, cap,
+                                         _freqs_from_table(table))
+    if written < 0:
+        return None
+    return bytes(memoryview(buf)[:written])
+
+
+def rans_decode_shared(payload, n: int, table, out=None):
+    """Decode a headerless rANS stream against a shared table."""
+    lib = _load_native()
+    if lib is None:
+        raise RuntimeError(
+            "this archive uses lmz's rANS coder, which needs the native kernel; "
+            "a C compiler (cc/gcc/clang) is required to build it")
+    dst = out if (out is not None and len(out) >= n) else bytearray(n)
+    if n == 0:
+        return memoryview(dst)[:0]
+    src_addr, _a = _ptr(payload)
+    dst_addr, _b = _ptr(dst)
+    if lib.lmz_rans_decode_shared(src_addr, len(payload), dst_addr, n,
+                                  _freqs_from_table(table)) != 0:
+        raise ValueError("malformed rANS stream")
+    return memoryview(dst)[:n]
+
+
 def rans_decode(payload, n: int, out=None):
     """Decode a rANS stream to exactly `n` bytes."""
     lib = _load_native()
@@ -915,47 +1076,6 @@ def rans_shared_header(freqs) -> bytes:
     return b"R1\x00\x00" + struct.pack("<256H", *freqs)
 
 
-def rans_encode_shared(src, freqs) -> bytes | None:
-    """Order-0 rANS encode with a shared frequency table (no 516-byte header)."""
-    lib = _load_native()
-    if lib is None or len(src) == 0:
-        return None
-    n = len(src)
-    cap = lib.lmz_rans_bound(n)
-    buf = getattr(_rans_scratch, "buf", None)
-    if buf is None or len(buf) < cap:
-        buf = _rans_scratch.buf = bytearray(cap)
-    src_addr, _a = _ptr(src)
-    dst_addr, _b = _ptr(buf)
-    fa = _freqs_arg(freqs)
-    if fa is None:
-        return None
-    written = lib.lmz_rans_encode_shared(src_addr, n, dst_addr, cap, ctypes.byref(fa))
-    if written < 0:
-        return None
-    return bytes(memoryview(buf)[:written])
-
-
-def rans_decode_shared(payload, n: int, freqs, out=None):
-    """Decode a shared-table rANS stream (states directly followed by coded bytes)."""
-    lib = _load_native()
-    if lib is None:
-        raise RuntimeError(
-            "this archive uses lmz's rANS coder, which needs the native kernel; "
-            "a C compiler (cc/gcc/clang) is required to build it")
-    dst = out if (out is not None and len(out) >= n) else bytearray(n)
-    if n == 0:
-        return memoryview(dst)[:0]
-    src_addr, _a = _ptr(payload)
-    dst_addr, _b = _ptr(dst)
-    fa = _freqs_arg(freqs)
-    if fa is None:
-        raise ValueError("shared frequency table required")
-    if lib.lmz_rans_decode_shared(src_addr, len(payload), dst_addr, n, ctypes.byref(fa)) != 0:
-        raise ValueError("malformed rANS stream")
-    return memoryview(dst)[:n]
-
-
 def rans_decode_many4(payloads, n: int, freqs=None, outs=None):
     """Decode four independent rANS streams in parallel.
 
@@ -966,8 +1086,11 @@ def rans_decode_many4(payloads, n: int, freqs=None, outs=None):
     lib = _load_native()
     if lib is None or not hasattr(lib, "lmz_rans_decode_many4"):
         if freqs is not None:
-            return [rans_decode_shared(payloads[m], n, freqs[m], None if outs is None else outs[m]) for m in range(4)]
-        return [rans_decode(payloads[m], n, None if outs is None else outs[m]) for m in range(4)]
+            return [rans_decode_shared(payloads[m], n, rans_shared_header(freqs[m]),
+                                       None if outs is None else outs[m])
+                    for m in range(4)]
+        return [rans_decode(payloads[m], n, None if outs is None else outs[m])
+                for m in range(4)]
 
     dsts = [
         outs[m] if (outs is not None and len(outs[m]) >= n) else bytearray(n)

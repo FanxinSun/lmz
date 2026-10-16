@@ -220,7 +220,7 @@ LMZ_API const char *lmz_isa(void)
 #endif
 }
 
-LMZ_API int lmz_abi_version(void) { return 12; }
+LMZ_API int lmz_abi_version(void) { return 11; }
 
 /*
  * out = a ^ b, the whole of a delta chunk's arithmetic.
@@ -1317,34 +1317,33 @@ static uint8_t *rans_enc_body_neon(const uint8_t *src, size_t n, uint8_t *end,
  * actually takes -- a stale slice, the wrong segment -- so they are rejected
  * and the histogram is taken here instead.
  */
-static long rans_encode_core(const uint8_t *src, size_t n, uint8_t *dst,
-                             size_t cap, const uint16_t *freqs,
-                             int allow_simd, int write_header)
+static long rans_encode_impl(const uint8_t *src, size_t n, uint8_t *dst,
+                             size_t cap, const uint64_t *counts, int allow_simd)
 {
     if (n == 0) return -1;
-    size_t needed_cap = 2 * n + 4 * RANS_STREAMS + 64;
-    if (write_header) needed_cap += RANS_HEADER;
-    if (cap < needed_cap) return -1;
+    if (cap < lmz_rans_bound(n)) return -1;
 
-    uint32_t sum = 0, start = 0, maxf = 0;
-    RansEncSym syms[256];
-    for (int s = 0; s < 256; s++) {
-        uint32_t f = freqs[s];
-        sum += f;
-        if (f) {
-            rans_enc_sym_init(&syms[s], start, f);
-            if (f > maxf) maxf = f;
-            start += f;
-        } else {
-            syms[s].freq = 0;
-            syms[s].bias = 0;
-            syms[s].cmpl_freq = 0;
-        }
+    uint64_t own[256];
+    if (counts) {
+        uint64_t total = 0;
+        for (int s = 0; s < 256; s++) total += counts[s];
+        if (total != n) counts = NULL;
     }
-    if (sum != RANS_PROB_SCALE) return -1;
+    if (!counts) {
+        lmz_hist(src, n, own);
+        counts = own;
+    }
+    uint16_t freqs[256];
+    if (rans_normalize(counts, freqs) != 0) return -1;
 
-    for (size_t i = 0; i < n; i++) {
-        if (!syms[src[i]].freq) return -1;
+    RansEncSym syms[256];
+    uint32_t start = 0, maxf = 0;
+    for (int s = 0; s < 256; s++) {
+        if (freqs[s]) {
+            rans_enc_sym_init(&syms[s], start, freqs[s]);
+            if (freqs[s] > maxf) maxf = freqs[s];
+            start += freqs[s];
+        }
     }
 
     /* rANS is last-in-first-out, so encoding runs backwards from the end of
@@ -1369,46 +1368,19 @@ static long rans_encode_core(const uint8_t *src, size_t n, uint8_t *dst,
     }
 
     size_t coded = (size_t)(end - ptr);
-    if (write_header) {
-        size_t total = RANS_HEADER + coded;
-        if (total > cap) return -1;
-        dst[0] = RANS_MAGIC0;
-        dst[1] = RANS_MAGIC1;
-        dst[2] = 0;
-        dst[3] = 0;
-        for (int s = 0; s < 256; s++) {
-            dst[4 + 2 * s] = (uint8_t)(freqs[s] & 0xff);
-            dst[5 + 2 * s] = (uint8_t)(freqs[s] >> 8);
-        }
-        memmove(dst + RANS_HEADER, ptr, coded);
-        return (long)total;
-    } else {
-        if (coded > cap) return -1;
-        memmove(dst, ptr, coded);
-        return (long)coded;
-    }
-}
+    size_t total = RANS_HEADER + coded;
+    if (total > cap) return -1;
 
-static long rans_encode_impl(const uint8_t *src, size_t n, uint8_t *dst,
-                             size_t cap, const uint64_t *counts, int allow_simd)
-{
-    if (n == 0) return -1;
-    if (cap < lmz_rans_bound(n)) return -1;
-
-    uint64_t own[256];
-    if (counts) {
-        uint64_t total = 0;
-        for (int s = 0; s < 256; s++) total += counts[s];
-        if (total != n) counts = NULL;
+    dst[0] = RANS_MAGIC0;
+    dst[1] = RANS_MAGIC1;
+    dst[2] = 0;
+    dst[3] = 0;
+    for (int s = 0; s < 256; s++) {
+        dst[4 + 2 * s] = (uint8_t)(freqs[s] & 0xff);
+        dst[5 + 2 * s] = (uint8_t)(freqs[s] >> 8);
     }
-    if (!counts) {
-        lmz_hist(src, n, own);
-        counts = own;
-    }
-    uint16_t freqs[256];
-    if (rans_normalize(counts, freqs) != 0) return -1;
-
-    return rans_encode_core(src, n, dst, cap, freqs, allow_simd, 1);
+    memmove(dst + RANS_HEADER, ptr, coded);
+    return (long)total;
 }
 
 LMZ_API long lmz_rans_encode_h(const uint8_t *src, size_t n, uint8_t *dst,
@@ -1416,6 +1388,86 @@ LMZ_API long lmz_rans_encode_h(const uint8_t *src, size_t n, uint8_t *dst,
 {
     return rans_encode_impl(src, n, dst, cap, counts, 1);
 }
+
+/*
+ * Normalise counts to a frequency table the caller keeps, so many streams can
+ * be coded against one table instead of carrying 516 bytes each.
+ *
+ * Returns 0, or -1 if the counts are empty. `freqs` is the same table
+ * lmz_rans_encode writes into a stream header, so a caller that stores it once
+ * and prepends it to any stream below gets an ordinary lmz stream back --
+ * which is exactly how the round trip is verified.
+ */
+LMZ_API int lmz_rans_table(const uint64_t *counts, uint16_t *freqs)
+{
+    return rans_normalize(counts, freqs);
+}
+
+/*
+ * Encode against a caller-supplied table, writing no header.
+ *
+ * The output is a headerless stream: [8 initial states][coded bytes]. It is
+ * decoded by prepending the 516-byte header built from `freqs`, which makes
+ * it an ordinary lmz stream -- there is no second decoder, and no second
+ * format to keep in step.
+ *
+ * Returns the byte count, -1 on failure, or -2 when `src` contains a symbol
+ * the table gives zero frequency. That case is a caller error rather than a
+ * corruption: a shared table must come from counts covering every stream it
+ * will code, and a coder cannot represent a symbol it believes impossible.
+ * It is checked rather than assumed because getting it wrong silently would
+ * produce a stream that decodes to the wrong bytes.
+ */
+LMZ_API long lmz_rans_encode_shared(const uint8_t *src, size_t n, uint8_t *dst,
+                                    size_t cap, const uint16_t *freqs)
+{
+    if (n == 0) return -1;
+    if (cap < lmz_rans_bound(n)) return -1;
+
+    uint32_t sum = 0;
+    for (int s = 0; s < 256; s++) sum += freqs[s];
+    if (sum != RANS_PROB_SCALE) return -1;
+
+    RansEncSym syms[256];
+    uint32_t start = 0, maxf = 0;
+    for (int s = 0; s < 256; s++) {
+        if (freqs[s]) {
+            rans_enc_sym_init(&syms[s], start, freqs[s]);
+            if (freqs[s] > maxf) maxf = freqs[s];
+            start += freqs[s];
+        }
+    }
+
+    /* Every symbol present must be representable. One pass over a 256-entry
+     * occupancy map, not over the data twice. */
+    uint8_t seen[256];
+    memset(seen, 0, sizeof seen);
+    for (size_t i = 0; i < n; i++) seen[src[i]] = 1;
+    for (int s = 0; s < 256; s++)
+        if (seen[s] && !freqs[s]) return -2;
+
+    uint8_t *end = dst + cap;
+    uint8_t *ptr;
+#if LMZ_X86
+    if (lmz_have_avx2() && maxf <= RANS_SIMD_MAX_FREQ && n >= RANS_SIMD_MIN)
+        ptr = rans_enc_body_avx2(src, n, end, syms, freqs);
+    else
+#elif LMZ_NEON_ENC
+    if (maxf <= RANS_SIMD_MAX_FREQ && n >= RANS_SIMD_MIN)
+        ptr = rans_enc_body_neon(src, n, end, syms, freqs);
+    else
+#endif
+    {
+        (void)maxf;
+        ptr = rans_enc_body(src, n, end, syms);
+    }
+
+    size_t coded = (size_t)(end - ptr);
+    if (coded > cap) return -1;
+    memmove(dst, ptr, coded);
+    return (long)coded;
+}
+
 
 /* The portable path on its own, so the two can be held side by side. The
  * vector path must write the same bytes as this one -- that is the whole
@@ -1434,20 +1486,8 @@ LMZ_API long lmz_rans_encode(const uint8_t *src, size_t n, uint8_t *dst, size_t 
     return rans_encode_impl(src, n, dst, cap, NULL, 1);
 }
 
-/* Encode with a caller-supplied frequency table, omitting the 516-byte header.
- * Writes [32 B initial states][coded bytes] into dst and returns its length, or -1. */
-LMZ_API long lmz_rans_encode_shared(const uint8_t *src, size_t n, uint8_t *dst,
-                                    size_t cap, const uint16_t *freqs)
-{
-    return rans_encode_core(src, n, dst, cap, freqs, 1, 0);
-}
-
 static int rans_build_dec_lut(const uint16_t *freqs, uint32_t *lut)
 {
-    uint32_t sum = 0;
-    for (int s = 0; s < 256; s++) sum += freqs[s];
-    if (sum != RANS_PROB_SCALE) return -1;
-
     uint32_t start = 0;
     for (int s = 0; s < 256; s++) {
         uint32_t f = freqs[s];
@@ -1459,12 +1499,17 @@ static int rans_build_dec_lut(const uint16_t *freqs, uint32_t *lut)
     return (start == RANS_PROB_SCALE) ? 0 : -1;
 }
 
-static int rans_decode_body(const uint8_t *src, size_t src_len, uint8_t *dst,
-                            size_t n, const uint16_t *freqs)
+/*
+ * Decode `n` bytes of a coded body against an already-parsed table.
+ *
+ * Split out from lmz_rans_decode so a shared-table stream -- one whose 516
+ * header bytes live once for a whole chunk rather than once per stream --
+ * decodes through exactly this code and not a second copy of it. `src` points
+ * at the coded bytes, past any header.
+ */
+static int rans_decode_body(const uint16_t *freqs, const uint8_t *src,
+                            size_t src_len, uint8_t *dst, size_t n)
 {
-    if (n == 0) return src_len == 0 ? 0 : -1;
-    if (src_len < 4 * RANS_STREAMS) return -1;
-
     /* One 32-bit entry per probability slot: frequency, cumulative start and
      * symbol together, so a decode step is a single dependent load. 16 KiB,
      * kept on the stack because a per-call heap allocation here would sit in
@@ -1501,6 +1546,35 @@ static int rans_decode_body(const uint8_t *src, size_t src_len, uint8_t *dst,
         for (int k = 0; k < RANS_STREAMS; k++)
             dst[i + k] = (uint8_t)(e[k] & 0xff);
 
+        /*
+         * The refills go two ways, and which is faster is a property of the
+         * machine rather than of the code. Both are branchless: the refill
+         * word is always loaded, because whether a symbol needs one is close
+         * to a coin flip on a near-uniform plane and mispredicts about half
+         * the time as a branch. They differ in what they do about the cursor.
+         *
+         * Written one lane at a time, a lane cannot compute its own address
+         * until the lane before it has decided whether it consumed a word, so
+         * the eight loads run one behind another. But whether a lane refills
+         * depends on how many bits its own symbol consumed and on nothing
+         * else, so all eight decisions can be made first and the cursor
+         * becomes a prefix sum of small integers, leaving the loads
+         * independent. That trades a chain of loads for two dozen more
+         * arithmetic operations.
+         *
+         * Measured per plane, decoding: +11% on Zen 5, +4% on a Neoverse
+         * runner, -12% on Apple silicon, where the serial version is the
+         * fastest of the three machines outright and both planes decode at
+         * the same rate whatever their refill rate -- that core hides the
+         * chain completely, so the extra arithmetic is pure loss. arm64
+         * cannot tell those two parts apart at build time (a VM reports no
+         * implementer at all), so it takes the shape that does not cost 12%
+         * on the hardware people run models on.
+         *
+         * Either way the loads read up to two bytes past their own offset,
+         * the furthest fifteen bytes beyond the cursor, which the loop guard
+         * has established is readable.
+         */
         uint32_t x[RANS_STREAMS], need[RANS_STREAMS];
         for (int k = 0; k < RANS_STREAMS; k++)
             x[k] = ((e[k] >> 20) + 1) * (state[k] >> RANS_PROB_BITS)
@@ -1537,13 +1611,6 @@ static int rans_decode_body(const uint8_t *src, size_t src_len, uint8_t *dst,
     return 0;
 }
 
-/* Decode a shared-table rANS stream (states directly followed by coded bytes). */
-LMZ_API int lmz_rans_decode_shared(const uint8_t *src, size_t src_len, uint8_t *dst,
-                                   size_t n, const uint16_t *freqs)
-{
-    return rans_decode_body(src, src_len, dst, n, freqs);
-}
-
 /* Decode exactly `n` bytes. Returns 0 on success, -1 on malformed input. */
 LMZ_API int lmz_rans_decode(const uint8_t *src, size_t src_len, uint8_t *dst, size_t n)
 {
@@ -1552,10 +1619,33 @@ LMZ_API int lmz_rans_decode(const uint8_t *src, size_t src_len, uint8_t *dst, si
     if (src[0] != RANS_MAGIC0 || src[1] != RANS_MAGIC1) return -1;
 
     uint16_t freqs[256];
+    uint32_t sum = 0;
     for (int s = 0; s < 256; s++) {
         freqs[s] = (uint16_t)(src[4 + 2 * s] | ((uint16_t)src[5 + 2 * s] << 8));
+        sum += freqs[s];
     }
-    return rans_decode_body(src + RANS_HEADER, src_len - RANS_HEADER, dst, n, freqs);
+    if (sum != RANS_PROB_SCALE) return -1;
+
+    return rans_decode_body(freqs, src + RANS_HEADER, src_len - RANS_HEADER,
+                            dst, n);
+}
+
+/*
+ * Decode a headerless stream against a caller-supplied table.
+ *
+ * Equivalent to prepending the 516-byte header and calling lmz_rans_decode,
+ * without building that prefix for every stream in a chunk.
+ */
+LMZ_API int lmz_rans_decode_shared(const uint8_t *src, size_t src_len,
+                                   uint8_t *dst, size_t n,
+                                   const uint16_t *freqs)
+{
+    if (n == 0) return src_len == 0 ? 0 : -1;
+    if (src_len < 4 * RANS_STREAMS) return -1;
+    uint32_t sum = 0;
+    for (int s = 0; s < 256; s++) sum += freqs[s];
+    if (sum != RANS_PROB_SCALE) return -1;
+    return rans_decode_body(freqs, src, src_len, dst, n);
 }
 
 #if LMZ_NEON_DEC
@@ -1782,18 +1872,31 @@ LMZ_API int lmz_rans_decode_many4(const uint8_t *const *src, const size_t *slen,
  * block leaves the GIL released from start to finish.
  *
  * `methods` packs two bits per plane, matching the chunk record's flags: 0 is
- * stored, 3 is rANS. Bit 8 (1 << 8) indicates plane 0 uses the shared frequency table.
- * A plane coded any other way returns -2 so the caller can fall back; a
- * malformed payload returns -1 and the caller falls back too, so the Python
- * path stays the one place that decides what a bad chunk means.
+ * stored, 3 is rANS. A plane coded any other way returns -2 so the caller can
+ * fall back; a malformed payload returns -1 and the caller falls back too, so
+ * the Python path stays the one place that decides what a bad chunk means.
  *
  * `scratch` holds the decoded planes followed by whatever lmz_merge_planes
  * needs, so nothing is allocated here.
  */
-LMZ_API int lmz_decode_planes(const uint8_t *payload, size_t plen,
+/*
+ * The body of both entry points below. `tables`, when non-NULL, is nplanes
+ * blocks of 256 frequencies laid end to end, and `have` says which of those
+ * blocks are real -- a plane whose bit is clear carries its own 516-byte
+ * header and is decoded exactly as it always was.
+ *
+ * Shared-table planes have to be decoded here rather than one ctypes call at
+ * a time for the same reason the rest of this function exists: crossing per
+ * plane and again to merge hands the interpreter three chances to hold up
+ * every other thread. Measured on a 151 MB fp32 checkpoint, decoding the
+ * shared form from Python cost 2.5x what the per-stream form cost through
+ * this function -- all of it interpreter, none of it coding.
+ */
+static int decode_planes_impl(const uint8_t *payload, size_t plen,
                               size_t nplanes, size_t nelem, uint32_t methods,
                               int bf16, uint8_t *dst, uint8_t *scratch,
-                              size_t scratch_len, const uint16_t *shared_freqs)
+                              size_t scratch_len, const uint16_t *tables,
+                              uint32_t have)
 {
     if (nplanes == 0 || nplanes > 16 || nelem == 0) return -1;
     if (bf16 && nplanes != 2) return -1;
@@ -1819,15 +1922,14 @@ LMZ_API int lmz_decode_planes(const uint8_t *payload, size_t plen,
         size_t src_lens[4];
         uint8_t *dst_planes[4];
         const uint16_t *f_ptrs[4] = {NULL, NULL, NULL, NULL};
-        if (methods & (1u << 8)) {
-            if (!shared_freqs) return -2;
-            f_ptrs[0] = shared_freqs;
-        }
         for (size_t k = 0; k < 4; k++) {
             src_planes[k] = p;
             src_lens[k] = lens[k];
             dst_planes[k] = scratch + k * nelem;
             planes[k] = dst_planes[k];
+            if (tables != NULL && ((have >> k) & 1u)) {
+                f_ptrs[k] = tables + k * 256;
+            }
             p += lens[k];
         }
         if (lmz_rans_decode_many4(src_planes, src_lens, dst_planes, nelem, f_ptrs) != 0)
@@ -1840,11 +1942,11 @@ LMZ_API int lmz_decode_planes(const uint8_t *payload, size_t plen,
                 planes[k] = p;
             } else if (m == 3) {                       /* rANS */
                 uint8_t *d = scratch + k * nelem;
-                if (k == 0 && (methods & (1u << 8))) {
-                    if (!shared_freqs) return -2;
-                    if (lmz_rans_decode_shared(p, lens[k], d, nelem, shared_freqs) != 0) return -1;
-                } else {
-                    if (lmz_rans_decode(p, lens[k], d, nelem) != 0) return -1;
+                if (tables != NULL && (have >> k) & 1u) {
+                    if (lmz_rans_decode_shared(p, lens[k], d, nelem,
+                                               tables + k * 256) != 0) return -1;
+                } else if (lmz_rans_decode(p, lens[k], d, nelem) != 0) {
+                    return -1;
                 }
                 planes[k] = d;
             } else {
@@ -1860,4 +1962,23 @@ LMZ_API int lmz_decode_planes(const uint8_t *payload, size_t plen,
     const size_t need = lmz_scratch_size(nelem, nplanes);
     if (scratch_len < nplanes * nelem + need) return -1;
     return lmz_merge_planes(planes, dst, nelem, nplanes, mscratch);
+}
+
+LMZ_API int lmz_decode_planes(const uint8_t *payload, size_t plen,
+                              size_t nplanes, size_t nelem, uint32_t methods,
+                              int bf16, uint8_t *dst, uint8_t *scratch,
+                              size_t scratch_len)
+{
+    return decode_planes_impl(payload, plen, nplanes, nelem, methods, bf16,
+                              dst, scratch, scratch_len, NULL, 0);
+}
+
+LMZ_API int lmz_decode_planes_shared(const uint8_t *payload, size_t plen,
+                                     size_t nplanes, size_t nelem,
+                                     uint32_t methods, int bf16, uint8_t *dst,
+                                     uint8_t *scratch, size_t scratch_len,
+                                     const uint16_t *tables, uint32_t have)
+{
+    return decode_planes_impl(payload, plen, nplanes, nelem, methods, bf16,
+                              dst, scratch, scratch_len, tables, have);
 }

@@ -8,8 +8,8 @@
  * not.
  *
  *   nvcc -O3 -std=c++17 -arch=sm_120 -o libbench libbench.cu
- *   ./libbench perstream   # ordinary lmz streams, a table per chunk
- *   ./libbench shared      # one table for the batch
+ *   ./libbench perstream [dir]   # ordinary lmz streams, a table per chunk
+ *   ./libbench shared    [dir]   # one table for the batch
  */
 #include "../../../lmz/gpu/lmzgpu.cu"
 #include <cstdlib>
@@ -31,7 +31,11 @@ static std::vector<uint8_t> slurp(const char *p)
 int main(int argc, char **argv)
 {
     bool shared = argc > 1 && !strcmp(argv[1], "shared");
-    const char *dir = shared ? "/home/rog/.cache/lmz-gpu-shared" : "/home/rog/.cache/lmz-gpu";
+    // A directory, because a benchmark nobody else can run is not evidence.
+    // prep_synth.py writes one from lmz's own encoder in a few seconds, with
+    // no checkpoint and no 1.8 GB of cache to reproduce first.
+    const char *dir = argc > 2 ? argv[2]
+        : (shared ? "/home/rog/.cache/lmz-gpu-shared" : "/home/rog/.cache/lmz-gpu");
     char ps[512], pr[512];
     snprintf(ps, sizeof ps, "%s/streams.bin", dir);
     snprintf(pr, sizeof pr, "%s/ref.bin", dir);

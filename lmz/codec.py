@@ -21,8 +21,8 @@ from math import log2
 
 from . import entropy, kernels
 from .format import (CODEC_BF16, CODEC_BF16C, CODEC_BLK, CODEC_DELTA,
-                     CODEC_GBLK, CODEC_REF, CODEC_SPLIT, CODEC_STORED,
-                     CODEC_ZSTD, FLAG_SHARED_TABLE, CorruptArchive)
+                     CODEC_GBLK, CODEC_REF, CODEC_SPLIT, CODEC_SPLIT_ST,
+                     CODEC_STORED, CODEC_ZSTD, CorruptArchive)
 from .planner import (BLOCK_LAYOUTS, KIND_BF16, KIND_BLOCK, KIND_BYTES,
                       SUB_K4, SUBBLOCK_CTX)
 
@@ -369,16 +369,48 @@ def _encode_stream(buf, level: int, method: int, plane: bool = False, sink=None,
         try:
             best = entropy.compress(buf, level, method)
             best_method = method
+        except entropy.UnsupportedMethod:
+            # The caller named a coder this interpreter does not have -- zstd
+            # on anything before 3.14 without the package. Fall back to the
+            # one it does have rather than leaving `best` empty, which would
+            # hand the stream to rANS below without ever pricing it against a
+            # general-purpose coder.
+            try:
+                best = entropy.compress(buf, level, entropy.DEFAULT_METHOD)
+                best_method = entropy.DEFAULT_METHOD
+            except Exception:
+                best = None
         except Exception:
             best = None
         # A stream the general-purpose coder barely dented may still be a
         # plain symbol distribution -- quantised INT8 weights, for one.
-        if kernels.have_rans() and (best is None or len(best) > n - (n >> 5)):
+        #
+        # This used to run only where zstd had failed to dent the stream by
+        # 1/32, which is a threshold int8 weights never reach: a per-channel
+        # scale maps each filter's maximum to 127 and leaves the body
+        # concentrated, so zstd saves a comfortable 10-11% and rANS was never
+        # priced. It is worth pricing anyway, and not only for the ~0.8 points
+        # it wins there. `lmz.gpu` decodes rANS and nothing else, so a chunk
+        # that lands on METHOD_ZSTD can never ride the batch decoder -- for
+        # int8, the dtype every deployed perception model uses, choosing zstd
+        # by default strands the weights on the CPU permanently.
+        #
+        # `cost` is a floor on what rANS will charge. The general path is not
+        # given a histogram, so one is counted here -- a single pass over a
+        # stream zstd has already read, against a second full compression it
+        # saves wherever the floor says rANS cannot win.
+        if kernels.have_rans() and cost is None:
+            hist = kernels.histogram(buf)
+            cost = _rans_cost(hist, n)
+        if kernels.have_rans() and (best is None or cost is None
+                                    or cost < len(best)):
             alt = kernels.rans_encode(buf, hist)
             if alt is not None:
                 if best is None:
                     best_method, best = entropy.METHOD_RANS, alt
-                elif len(alt) < len(best):
+                elif len(alt) <= len(best):
+                    # Ties go to rANS: same bytes on disk, and the GPU can
+                    # decode it.
                     alt_size = len(best)   # both ran, so the loser is measured
                     best_method, best = entropy.METHOD_RANS, alt
                 else:
@@ -911,9 +943,65 @@ def _decode_q80(payload, nblocks: int, out=None):
     return kernels.merge_stride(streams, nblocks, Q80_PERIOD, buf)
 
 
+# What a headerless stream costs beyond its coded bytes: the flushed states
+# alone, since the 516-byte table lives in the manifest. `_min_gain`'s 1 KiB
+# floor is sized for a stream that carries its own header and is far too
+# conservative here -- it would decline exactly the small planes that sharing
+# a table exists to rescue.
+SHARED_OVERHEAD = 4 * 8
+
+
+def _min_gain_shared(n: int) -> int:
+    return max(SHARED_OVERHEAD * 2, n >> 8)
+
+
+def table_planes(data, esize: int, kind: int):
+    """The planes a chunk would code, keyed for the archive's table set.
+
+    Priming reads chunks before anything is encoded, so it has to reach the
+    same verdict `encode_chunk` will reach later or it will fit tables to
+    planes that never get coded against them. Returns None for every chunk
+    that will *not* take the plain byte-plane split -- bf16, block quants and
+    anything unsplittable -- rather than guessing.
+    """
+    n = len(data)
+    if kind == KIND_BLOCK or (kind == KIND_BF16 and esize == 2):
+        return None
+    if not (esize > 1 and n % esize == 0 and esize in kernels.SUPPORTED_ESIZES):
+        return None
+    planes = kernels.split(data, esize)
+    nelem = n // esize
+    mv = memoryview(planes)
+    return [mv[k * nelem:(k + 1) * nelem] for k in range(esize)]
+
+
+def _encode_stream_shared(buf, table, sink=None):
+    """Code one plane against a shared table, or store it.
+
+    The noise gate is the ordinary one: a plane at 7.98 bits a byte is not
+    made compressible by whose table it uses. What differs is the threshold
+    below -- see `_min_gain_shared`.
+    """
+    n = len(buf)
+    if n == 0:
+        return entropy.METHOD_STORED, b""
+    if estimate_entropy(buf) >= NOISE_BITS:
+        if sink is not None:
+            sink.add(entropy.METHOD_STORED, n, n)
+        return entropy.METHOD_STORED, buf
+    out = kernels.rans_encode_shared(buf, table)
+    if out is None or len(out) + _min_gain_shared(n) >= n:
+        if sink is not None:
+            sink.add(entropy.METHOD_STORED, n, n)
+        return entropy.METHOD_STORED, buf
+    if sink is not None:
+        sink.add(entropy.METHOD_RANS, n, len(out))
+    return entropy.METHOD_RANS, out
+
+
 def encode_chunk(data, esize: int, level: int = 1, checksum: bool = True,
                  method: int = -1, kind: int = KIND_BYTES, btype: int = -1,
-                 tally=None, shared_freqs=None):
+                 tally=None, tables=None):
     """Encode one chunk.
 
     Returns (payload, codec, flags, crc). `payload` may be a list of buffers,
@@ -956,7 +1044,7 @@ def encode_chunk(data, esize: int, level: int = 1, checksum: bool = True,
         nplanes, cid = 2, CODEC_BF16
         planes = kernels.split_bf16(data)
         nelem = n // 2
-        if shared_freqs is None and nelem >= COND_MIN_ELEMS and kernels.have_rans():
+        if nelem >= COND_MIN_ELEMS and kernels.have_rans():
             mv = memoryview(planes)
             sink = new_sink()
             cond = _encode_bf16_cond(mv[:nelem], mv[nelem:], nelem, level, method,
@@ -976,21 +1064,30 @@ def encode_chunk(data, esize: int, level: int = 1, checksum: bool = True,
     if nplanes:
         nelem = n // nplanes
         mv = memoryview(planes)
+        # Shared tables cover the plain byte-plane split only, and they are
+        # decided per *plane*, not per chunk. Pooling does not win everywhere
+        # in the same file -- an fp32 checkpoint's low byte planes pool
+        # beautifully while its high byte carries a per-tensor scale and does
+        # not -- so an all-or-nothing rule throws away the planes that did
+        # win. Nothing in the record has to say which: the manifest is the
+        # authority and the decoder consults the identical table set, so a
+        # kind with no table simply carries its own header as it always did.
+        shared = None
+        if tables and cid == CODEC_SPLIT and kernels.have_rans():
+            got = [tables.get(cid, esize, k) for k in range(nplanes)]
+            if any(t is not None for t in got):
+                shared = got
         parts, lengths, flags = [], [], 0
         total = 0
         any_compressed = False
         sink = new_sink()
         for k in range(nplanes):
-            plane_bytes = mv[k * nelem:(k + 1) * nelem]
-            used, payload = _encode_stream(plane_bytes, level,
-                                           method, plane=True, sink=sink)
-            if k == 0 and shared_freqs is not None and kernels.have_rans():
-                shared_payload = kernels.rans_encode_shared(plane_bytes, shared_freqs)
-                if shared_payload is not None:
-                    if used != entropy.METHOD_RANS or len(shared_payload) < len(payload):
-                        used = entropy.METHOD_RANS
-                        payload = shared_payload
-                        flags |= FLAG_SHARED_TABLE
+            pl = mv[k * nelem:(k + 1) * nelem]
+            if shared is not None and shared[k] is not None:
+                used, payload = _encode_stream_shared(pl, shared[k], sink=sink)
+            else:
+                used, payload = _encode_stream(pl, level, method, plane=True,
+                                               sink=sink)
             flags |= (used & 0x3) << (2 * k)
             lengths.append(len(payload))
             parts.append(payload)
@@ -1003,7 +1100,7 @@ def encode_chunk(data, esize: int, level: int = 1, checksum: bool = True,
             if tally is not None:
                 tally.commit(sink)
             return ([_plane_header(nplanes).pack(*lengths)] + parts,
-                    cid, flags, crc)
+                    CODEC_SPLIT_ST if shared is not None else cid, flags, crc)
         if tally is not None:
             tally.stored(n)   # the coded planes are discarded with the split
         return ([data], CODEC_STORED, 0, crc)
@@ -1025,7 +1122,7 @@ _delta_hdr = struct.Struct("<QB")
 
 def encode_delta(data, base, esize: int, level: int = 1, checksum: bool = True,
                  kind: int = KIND_BYTES, btype: int = -1, src: int = 0,
-                 tally=None, shared_freqs=None):
+                 tally=None):
     """Code a chunk as its difference from an earlier output range.
 
     The checksum is of the original bytes, not the difference, so it verifies
@@ -1035,8 +1132,7 @@ def encode_delta(data, base, esize: int, level: int = 1, checksum: bool = True,
     crc = zlib.crc32(data) & 0xFFFFFFFF if checksum else 0
     diff = kernels.xor_bytes(data, base)
     parts, cid, flags, _ = encode_chunk(bytes(diff), esize, level, False,
-                                        kind=kind, btype=btype, tally=tally,
-                                        shared_freqs=shared_freqs)
+                                        kind=kind, btype=btype, tally=tally)
     return [_delta_hdr.pack(src, cid)] + list(parts), flags, crc
 
 
@@ -1052,14 +1148,14 @@ def delta_source(payload):
 
 
 def decode_delta(payload, esize: int, flags: int, rlen: int, base, crc: int = 0,
-                 verify: bool = True, shared_freqs=None):
+                 verify: bool = True):
     """Rebuild a delta chunk from its source bytes and its coded difference."""
     _src, inner, off = delta_source(payload)
     if len(base) != rlen:
         raise CorruptArchive(
             f"delta source resolved to {len(base)} bytes, expected {rlen}")
     diff = decode_chunk(memoryview(payload)[off:], inner, esize, flags, rlen,
-                        0, False, shared_freqs=shared_freqs)
+                        0, False)
     result = kernels.xor_bytes(base, diff)
     if verify and crc and (zlib.crc32(result) & 0xFFFFFFFF) != crc:
         raise CorruptArchive("chunk failed its checksum; the archive is corrupt")
@@ -1156,7 +1252,7 @@ def _decode_bf16c(payload, nelem: int, out=None):
 
 
 def decode_chunk(payload, codec: int, esize: int, flags: int, rlen: int,
-                 crc: int = 0, verify: bool = True, out=None, shared_freqs=None):
+                 crc: int = 0, verify: bool = True, out=None, tables=None):
     """Decode one chunk back to its exact original bytes.
 
     `out` is an optional scratch buffer to decode into. Callers that hand one
@@ -1182,19 +1278,34 @@ def decode_chunk(payload, codec: int, esize: int, flags: int, rlen: int,
         if len(result) != rlen:
             raise CorruptArchive(
                 f"chunk decoded to {len(result)} bytes, expected {rlen}")
-    elif codec in (CODEC_SPLIT, CODEC_BF16):
+    elif codec in (CODEC_SPLIT, CODEC_BF16, CODEC_SPLIT_ST):
         if esize not in kernels.SUPPORTED_ESIZES or esize < 2 or rlen % esize:
             raise ValueError(f"split chunk has invalid element size {esize}")
         if codec == CODEC_BF16 and esize != 2:
             raise ValueError("a bf16 chunk must have 2-byte elements")
         nplanes = 2 if codec == CODEC_BF16 else esize
         nelem = rlen // nplanes
+        shared = None
+        if codec == CODEC_SPLIT_ST:
+            # Keyed by the codec the chunk would have used, so that priming,
+            # encoding and decoding all name a plane kind the same way. A
+            # plane whose kind has no table carries its own header, exactly as
+            # in an ordinary split -- but the set has to hold *something*, or
+            # the manifest this chunk was written against is not the one here.
+            got = [] if tables is None else [tables.get(CODEC_SPLIT, esize, k)
+                                             for k in range(nplanes)]
+            if not any(t is not None for t in got):
+                raise CorruptArchive(
+                    "this chunk is coded against the archive's shared tables "
+                    "and the manifest carries none for its planes")
+            shared = got
         # One crossing for the whole chunk. Identical arithmetic to the path
         # below, which still runs whenever the kernel declines -- a plane
-        # coded with zstd, a damaged payload, or no native build -- so error
-        # reporting and the fallback backends are unchanged.
+        # coded with zstd, a damaged payload, or a kernel built before shared
+        # tables existed -- so error reporting and the fallback backends are
+        # unchanged.
         fast = kernels.decode_planes(payload, nplanes, nelem, flags,
-                                     codec == CODEC_BF16, out, shared_freqs=shared_freqs)
+                                     codec == CODEC_BF16, out, tables=shared)
         if fast is not None:
             result = fast
             if verify and crc:
@@ -1218,14 +1329,18 @@ def decode_chunk(payload, codec: int, esize: int, flags: int, rlen: int,
                     raise ValueError(
                         f"plane {k} holds {ln} bytes, expected {nelem}")
                 planes.append((payload, pos))
-            elif k == 0 and (flags & FLAG_SHARED_TABLE):
-                if shared_freqs is None:
-                    raise CorruptArchive("chunk requires shared table but none in archive")
-                block = kernels.rans_decode_shared(mv[pos:pos + ln], nelem, shared_freqs)
-                if len(block) != nelem:
+            elif shared is not None and shared[k] is not None:
+                try:
+                    block = kernels.rans_decode_shared(mv[pos:pos + ln], nelem,
+                                                       shared[k])
+                except CorruptArchive:
+                    raise
+                except Exception as exc:
                     raise CorruptArchive(
-                        f"plane {k} decoded to {len(block)} bytes, expected {nelem}")
+                        f"plane {k} failed to decode: {exc}") from exc
                 planes.append((block, 0))
+                pos += ln
+                continue
             else:
                 block = _decode_stream(mv[pos:pos + ln], m, f"plane {k}", nelem)
                 if len(block) != nelem:

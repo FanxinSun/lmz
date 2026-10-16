@@ -19,9 +19,19 @@
   a C compiler exists. Without one, compression falls back to zstd (~31%
   instead of ~34%) and archives already written with rANS cannot be read —
   `./lmz-cli doctor` reports which backend is live.
-- **Already-quantised weights are mostly entropy — with one exception.**
-  Raw INT8 checkpoints are detected and stored unchanged. **FP8 is not one of
-  them**: `F8_E4M3` is a float, 1 sign + 4 exponent + 3 mantissa, and trained
+- **Already-quantised weights are mostly entropy — with two exceptions.**
+  This line used to say raw INT8 checkpoints were "detected and stored
+  unchanged". The tree has never done that: `I8` is a 1-byte element like any
+  other, every chunk under 7.98 bits/byte is priced and coded, and
+  **per-channel INT8 weights code well** — a 38 MB per-channel INT8 whisper
+  checkpoint gives up **16.7%**, byte-exact, against a 14.2% order-0 bound on
+  the weight bytes alone. The reading that produced the wrong sentence came
+  from GGUF Q8_0, whose quant payload really is flat at 7.64 of 8 bits;
+  per-channel INT8 is a different distribution, because mapping each filter's
+  maximum to 127 leaves the Gaussian body concentrated at 5.9–7.2 bits. Those
+  weights are also now coded with rANS rather than zstd, which is what lets
+  the GPU decoder read them. **FP8 is the other exception**:
+  `F8_E4M3` is a float, 1 sign + 4 exponent + 3 mantissa, and trained
   weights skew its exponent just as they skew BF16's. Measured on a real
   Qwen3.6-27B-FP8 shard (99.7% `F8_E4M3`), lmz removes **17.1%**, byte-exact.
   There is almost nothing left after that: the order-0 bound is 17.7%, and
@@ -44,25 +54,37 @@
   repository and does not suit shipping one model to one user. It also needs
   matching tensor names, dtype and size: a fine-tune that switches from BF16
   to F16 has no byte-level relationship to its base at all, and gets nothing.
-- **The GPU decoder ships, but nothing routes to it yet.** `lmz.gpu` is in
+- **The GPU decoder is a component, not a faster `lmz decompress`.** `lmz.gpu` is in
   the package and builds itself with `nvcc` on first use, the same bargain
   `lmz.native` makes with a C compiler: the wheel carries a `.cu` and no
   CUDA, installing needs no toolkit, and a machine with neither nvcc nor a
   card decodes on the CPU exactly as before. `lmz doctor` says which. What it
-  gives you is one call — `lmz.gpu.decode_batch`, a batch of lmz rANS streams
-  in, their plaintext out, verified byte-identical to `lmz_rans_decode` over
-  936 MB of real planes. What it does not give you is a faster
+  gives you is `lmz.gpu.decode_batch` — a batch of lmz rANS streams in, their
+  plaintext out, verified byte-identical to `lmz_rans_decode` over 936 MB of
+  real planes — plus `decode_batch_dev` for a caller that owns its own device
+  and stream, and `cost_model()` for one that needs to predict the kernel on
+  hardware this project has never run on. What it does not give you is a faster
   `lmz decompress`: nothing in the archive path calls it, because the useful
   thing to do with a GPU decode is leave the result in VRAM, and deciding
-  when to do that belongs to the layer above. Two further limits are real.
+  when to do that belongs to the caller. That is a division rather than a gap
+  -- `capabilities()`, `ArchiveIndex`, `decode_batch_dev` and `cost_model()`
+  are what a caller needs to make the decision -- but it does mean installing
+  lmz on a machine with a GPU makes nothing you already run faster. Two
+  further limits are real.
   **One stream is 8 lanes of work**, so a GPU is filled by many streams at
   once and never by one, however large — that is the format's 8-state
   interleave, not the kernel's. And **an archive written today codes a
   frequency table per chunk**, which costs 3.8× against a table shared across
-  chunks: 111 GB/s versus 418 on the same 936 MB. The shared table is a
-  format option that has not landed; it is item 1 of
-  [gpu-residency-handover.md](gpu-residency-handover.md). The Apple silicon
-  port under `scratchpad/gpu/metal/` is still written and never run.
+  chunks: 111 GB/s versus 418 on the same 936 MB. **The shared form now
+  writes**, as `CODEC_SPLIT_ST` under `--shared-tables`, off by default
+  because it writes a v7 archive an older build cannot read; the table is
+  shared per *plane kind* rather than per archive, which measurement showed is
+  otherwise six points worse than what lmz already did. **The GPU kernel does
+  not read it yet**, so the 3.8× above is still what an archive gives the
+  device decoder either way. The design and its three surprises are in
+  [portable-decoder-handover.md](portable-decoder-handover.md) §1 and
+  [perception-codec-handover.md](perception-codec-handover.md). The Apple
+  silicon port under `scratchpad/gpu/metal/` is still written and never run.
 - **Decompressing to a file is I/O bound** on real storage. The gain there is
   that there are a third fewer bytes to move.
 - **The mount is slower than an uncompressed file on fast local storage.**
@@ -76,6 +98,14 @@
   thread can only take the interpreter lock away from the thread whose reply
   the reader is waiting on. This is the one place where the interpreter build
   changes what lmz can do rather than just how fast it does it.
+- **Three tests fail with `LMZ_NO_NATIVE=1`** as of 2026-09-03:
+  `test_capabilities_are_declared_not_inferred`,
+  `test_gpu_device_entry_point_owns_nothing` (an `UnboundLocalError` on `ptrs`)
+  and `test_gpu_verify_reports_this_machine`. They are about the GPU and
+  capability reporting rather than the codec, and the suite is green on the
+  native kernel, which is what CI runs. Recorded here because the fallback path
+  is the one nobody exercises by accident, and a failure sitting in it is easy
+  to inherit and hard to date.
 - **Mounting is Linux-only and needs `fuse3`.** `fusermount3` must be on PATH
   and `/dev/fuse` readable; `lmz doctor` reports whether it is. The store and
   its random-access reader work everywhere, mount or no mount. Serving mmap
@@ -86,13 +116,32 @@
   the thread that would answer the fault never runs. `lmz mount` is a separate
   process by construction; embedding the server in a process that also reads
   the mount will deadlock.
-- **A large store costs memory to mount.** The chunk table is parsed into
-  Python objects at open: 305 bytes per 64 KiB block, which is 8 MiB for the
-  1.74 GiB model here and extrapolates to ~0.6 GiB for a 70B one, taking
-  about 11 s. That is the next thing to fix and it is a real limit today.
+- **A large store costs the size of its chunk table to open, and no more.**
+  The table used to be parsed into one Python object per chunk at open — 233
+  bytes per 64 KiB block, which for a 70B checkpoint is 0.51 GiB and about
+  5 s before a single byte is read. It is now read in place: the records are
+  fixed width, so the decompressed bytes *are* the index and a chunk is
+  unpacked when something asks for it. Opening a 70B index costs the 70 MB
+  the table actually occupies and about 140 ms, essentially all of it the
+  zstd decode. The trade is that touching one chunk costs a few microseconds
+  rather than an attribute load, so a caller that walks the whole table
+  repeatedly should hoist it into a list — `verify` and `mount` do, since
+  they were going to decode everything anyway.
 - GGUF block-quantised tensors are split on their ggml struct layout, which
   covers Q4_0 through Q8_1, every k-quant, the IQ types and the ternary ones.
   A layout this build does not recognise falls back to opaque bytes.
+- **ONNX is parsed only in its self-contained form.** The walk finds
+  `graph.initializer[]` and types each one from its `data_type` and
+  `raw_data` range, which is worth **4.3 points** on a real fp16 detector
+  against the same bytes as a blob — without the element width the
+  byte-position planes cannot phase-align, so an fp16 exponent smears across
+  positions instead of collecting in one plane. The **external-data** form,
+  where initializers name a sidecar file and carry no `raw_data`, is not
+  typed: those sidecars are flat and lmz codes them as raw regions, and
+  typing them needs the sidecar's own name resolved against the model's
+  directory. A dtype this build does not know, or a payload that is not a
+  whole number of elements, falls back to untyped bytes for that tensor
+  alone.
 - **CPython's bundled zstd is slow on macOS.** Measured on a GitHub
   `macos-latest` runner: 103 MiB/s compressing a 64 MiB BF16 sample through
   `compression.zstd`, against 767 MiB/s for the same work through the
@@ -111,7 +160,7 @@
 python3 tests/test_lmz.py          # also runs under pytest
 ```
 
-97 tests covering kernel equivalence across all backends, element sizes and
+120 tests covering kernel equivalence across all backends, element sizes and
 block periods,
 rANS round-trips over adversarial distributions (including single-symbol
 streams, which exposed a frequency-field overflow), rANS landing within 2% of
@@ -126,7 +175,9 @@ conditioning is taken only when it wins and declines when the quants owe
 nothing to their sub-block, that a damaged sub-block descriptor is rejected
 rather than acted on, that structureless blocks decline the split,
 that v3's Q8_0-only block payload still decodes,
-safetensors/GGUF/PyTorch-zip/raw layout detection, tensor dedup within
+safetensors/GGUF/PyTorch-zip/ONNX/raw layout detection — including that a
+malformed or unfamiliar ONNX degrades to opaque bytes rather than raising,
+since `probe` runs on every file compressed — tensor dedup within
 and across files, delta coding against a near-copy (chosen, reversed, and
 declined when the files are unrelated), hostile ref and delta chunks
 (self-referencing, out of range, damaged difference), v1
@@ -181,7 +232,13 @@ one that does not is that a card below the kernel's floor is declined with its
 compute capability in the message rather than handed to a compiler that will
 reject it. The decoder also checks itself: the first thing it does on any
 machine is decode a stream that machine just encoded and compare against the
-CPU decoder, and a device that disagrees is not used.
+CPU decoder, and a device that disagrees is not used. `lmz doctor --gpu-verify`
+runs the whole set on demand and prints a report, because the only evidence
+that will ever exist for an architecture nobody here owns is somebody else's.
+And that loading the CUDA library cannot kill the caller: a driver that is
+mid-upgrade faults inside `ctypes.CDLL` with no return code involved, so the
+first load happens in a child process, and the test kills one to prove the
+crash is reported rather than propagated.
 
 `tests/make_model.py` generates synthetic checkpoints with per-channel
 lognormal scaling, which reproduces the exponent skew of trained weights —

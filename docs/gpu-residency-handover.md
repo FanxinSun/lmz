@@ -1,9 +1,14 @@
 # GPU residency — what lmz has to ship for it
 
+> **Planning authority — 2026-10-03.** This handover is preserved as technical
+> evidence and rationale. Its sequence and remaining-item language is not a
+> separate active order; candidate future work is gated by `LMZ-T0` in the sole
+> canonical master, [`../plan/PLAN.md`](../plan/PLAN.md).
+
 *The pieces of work in lmz between a fast kernel and a residency layer, why
 each one is load-bearing, what is already measured about it, and where the
-boundary is between lmz and the thing that consumes it. One of the four has
-landed; this says what it cost and what it left. Written for whoever picks
+boundary is between lmz and the thing that consumes it. Three of the four
+have landed; this says what they cost and what they left. Written for whoever picks
 this up next, so that none of it has to be rediscovered.*
 
 [← back to the README](../README.md)
@@ -18,11 +23,12 @@ than plain safetensors end to end from cold disk to VRAM. `gpu_rans10.cu`
 carries the whole V0..V5 ladder and the ablations that attributed the time.
 
 The kernel is now also *shipped*: `lmz.gpu` is in the package, and item 2
-below records what that took. What still does not exist is a layer that can
-put it to work. The fast path needs a format option that is still an
-experiment, the archive index cannot be opened at the size a residency layer
-opens it at, and nothing can ask an archive where a tensor's blocks are. That
-is three pieces of work, and none of them is research.
+below records what that took. The index can now be opened at the size a
+residency layer opens it at — item 3, which was the precondition the rest
+waited on. What still does not exist is a layer that can put the kernel to
+work: the format option the fast path needs is now written (item 1), but
+nothing can yet ask an archive where a tensor's blocks are. That is one piece
+of work, and it is not research.
 
 The consumer is a residency engine that keeps weights coded in VRAM, in
 page-locked host RAM and on NVMe, and decodes them on the GPU. Its charter,
@@ -33,7 +39,7 @@ and the PCIe link into it at 28.8, so compression on that path is free by
 
 That engine is not lmz's job. This is the part that is.
 
-## 1. The shared frequency table, as a format option
+## 1. The shared frequency table, as a format option — **done**
 
 **Measured, and it is free in both directions.** A table shared across chunks
 instead of one per chunk is **1.7× of the GPU decode speed** — a per-stream
@@ -63,6 +69,100 @@ choosing between per-chunk and shared on measured cross-entropy rather than
 by assumption, and the round-trip in the test suite. This is the one item
 that touches the format, and it is the one that should land first, because
 everything else can be built against a stream that already exists.
+
+**The format side has now landed too, and what it cost is in
+[portable-decoder-handover.md](portable-decoder-handover.md) §1** — including
+three things this section did not anticipate: sharing has to be decided per
+*plane* rather than per chunk, the decision has to exclude planes the encoder
+stores as noise (counting them predicted +1.9 points on a real detector and
+delivered nothing), and a shared-table chunk needs its own native plane
+decoder, because `lmz_decode_planes` reads a per-stream header that is no
+longer there. `CODEC_SPLIT_ST` is the byte-plane split in that form;
+`--shared-tables` writes it. **The GPU kernel does not read it yet**, which
+is where the 3.8x below still sits.
+
+**The coder side is now promoted, and the format side has a design it did
+not have here.** `lmz_rans_table`, `lmz_rans_encode_shared` and
+`lmz_rans_decode_shared` are in `lmzcore.c` with Python bindings, sharing
+the decode body with `lmz_rans_decode` rather than copying it, and refusing
+the two ways a shared table can silently corrupt: a symbol the table cannot
+represent, and a table that does not sum to the probability scale.
+
+What changed is the *scope* of the sharing. This section assumed one table
+per archive. Measured on real models, that is **six points worse** than a
+table per stream, because fp32 planes have unrelated distributions and one
+table fits none of them; a chunk-local table loses the same six. Sharing
+within a **plane kind, across chunks** is what wins — +1.5 to +2.5 points on
+perception models. So the manifest needs a table *set* keyed by plane kind,
+and `decode_chunk` needs it threaded in. The numbers are in
+[perception-codec-handover.md](perception-codec-handover.md).
+
+## 1b. What the decoder costs, published — **done**
+
+A downstream consumer asked for the decoder's cost constants, because it has
+to decide whether the coded route beats the plain one *on its machine* and
+could only do that by guessing at lmz's kernel. The request noted that one
+point on one device — 418 GB/s, shared table, RTX 5080 — fits two readings
+that agree here and differ by 8× on a 2-CU integrated GPU: 84% of a
+bandwidth bound, or k = 128 cycles per byte if compute binds.
+
+**Measured, and neither reading was right.** The separator does not need a
+second device: the block size is a compute knob at *fixed byte traffic*.
+Every row below decodes the same 936.4 MB from the same 325.2 MB of coded
+bytes; only the number of resident lanes changes.
+
+| threads/block | GB/s | DRAM traffic | % of ~960 GB/s peak |
+|---|---|---|---|
+| 64 | 245.7 | 331 GB/s | 34% |
+| 96 | 262.9 | 354 | 37% |
+| 128 | 324.0 | 437 | 45% |
+| 160 | 397.5 | 536 | 56% |
+| **192** | **414.4** | 558 | 58% |
+| 256 | 404.6 | 545 | 57% |
+| 384 | 417.3 | 562 | 59% |
+
+Two runs, agreeing within 1% at every point, on an otherwise idle card.
+
+**Below 192 threads compute binds** — the rate tracks resident lanes, a
+1.70× spread bought by occupancy alone. **At and above 192 it saturates**,
+and adding 2× more lanes (192 → 384) buys nothing. So the ceiling is
+bandwidth, but at **59% of peak DRAM, not 84%**: the earlier figure counted
+only the 936 MB written and forgot the 325 MB read, and traffic per decoded
+byte is 1 + 1/2.88 = 1.347, not 1.
+
+**k is 230–330 lane-cycles per decoded byte**, from the rows below
+saturation, using each row's resident lanes against the kernel's own shared
+memory request (a 16 KiB LUT plus 640 B a group, against the device's 99 KiB
+opt-in block) and a 2.66 GHz sustained clock. It is published as an interval
+because it is one: occupancy hides part of the cost and the amount hidden
+varies with the block size.
+
+**And an interval is only a bracket where the occupancy holds**, which is why
+`cost_model()` publishes the shared-memory layout as numbers rather than
+prose: `shmem_lut_bytes` (16384), `shmem_per_group_bytes` (640) and
+`blocks_per_unit_at_measurement` (3, 4). A caller divides its own device's
+per-unit shared-memory budget by the block request to learn how many blocks
+it can hold, and compares. **Hold at least as many as the measurement did and
+the interval brackets that device; hold fewer and less of the dependent-load
+chain is hidden, so 330 is a floor with no published ceiling.** That is the
+case on a small integrated adapter — 128 KiB per unit gives four resident
+blocks and a two-sided bracket, 64 KiB gives two and the row collapses to a
+floor — and it is exactly the case the interval must not be quoted as a
+bracket for. The three numbers exist so a consumer can decide that
+automatically instead of a reader remembering the caveat.
+
+**It is latency-bound, not throughput-bound**, which is the part that
+travels to other devices. The inner loop is a dependent shared-memory load
+feeding a state update feeding the next load; the cost is a pointer chase,
+not arithmetic. So **k must not be scaled by a device's FP32 rate** — the
+consumer's instinct that FP32 FMA is the wrong unit for integer rANS is
+correct, and this says why.
+
+`lmz.gpu.cost_model()` publishes all of it with provenance. What is still
+missing is the low-FLOP-per-byte device the request asked for: this box's
+iGPU is not reachable from WSL2 (no `/dev/dri`, no Vulkan, no OpenCL) and
+locking clocks needs privileges this session does not have, so the interval
+is from one high-bandwidth card and is marked that way in `provenance`.
 
 ## 2. The GPU decoder as a library, not a benchmark — **done**
 
@@ -138,6 +238,19 @@ its compute capability in the message rather than handed to nvcc to reject.
 The fallback also emits PTX for the newest architecture it knows, because a
 card newer than the toolkit has nothing to JIT from otherwise.
 
+**A driver can fault on load, and no return code says so.** This one was
+found the hard way, when a driver update landed underneath a running session:
+`libcuda.so.1` stays on disk with an initialiser that segfaults, `nvidia-smi`
+comes back on PATH but answers nothing, and a bare `ctypes.CDLL` takes the
+interpreter down. Checking return codes cannot help, because the process is
+already gone. So the first load happens in a child that is allowed to die,
+and the parent turns a signal into a sentence. It costs one interpreter start
+and one CUDA context, once, and only on a machine that has both a toolkit and
+something that looks like a driver — everywhere else the build has already
+declined and none of it runs. The hardware gates also sit *ahead* of the
+"already built" check, because an artifact built when the driver worked is
+still sitting there after it stops.
+
 **The pipeline needs four slots, not two.** A two-slot `cp.async` buffer
 verifies byte-identical on the exponent plane and *races anyway*; the failure
 only appears on the sign+mantissa plane, whose 3× higher refill rate reaches
@@ -163,26 +276,349 @@ decodes to the same `plane`, and `plane` must be a multiple of 128, which the
 `scratchpad/gpu/metal/` is the Apple silicon port, **written but never run**.
 It is worth exactly what an unrun kernel is worth.
 
-## 3. The chunk table, which is the one that blocks a residency layer
+## 3. The chunk table, which was the one that blocked a residency layer — **done**
 
-`limitations.md` already calls this "the next thing to fix and it is a real
-limit today":
+`limitations.md` used to call this "the next thing to fix and it is a real
+limit today": the chunk table was parsed into one Python object per chunk at
+open, which for a 70B checkpoint is **0.51 GB and about 5 s** before a byte is
+read. For a compressor that is an annoyance. For a residency engine it is
+fatal: the archive is opened on every process start, a placement solver needs
+every extent before it can decide anything, and half a gigabyte of Python
+objects is a meaningful fraction of the host tier it is trying to manage.
 
-> A large store costs memory to mount. The chunk table is parsed into Python
-> objects at open: 305 bytes per 64 KiB block, which is 8 MiB for the
-> 1.74 GiB model here and extrapolates to **~0.6 GiB for a 70B one, taking
-> about 11 s**.
+**It needed no format change, because the records were already an index.**
+The table is fixed-width `RECORD`s, so the decompressed bytes can be held as
+they are and a `Chunk` unpacked when something asks for one. `ChunkTable` is
+that, and it is a sequence, so the nine call sites that indexed, iterated,
+sorted or `len`'d a list kept working untouched.
 
-For a compressor that is an annoyance. For a residency engine it is fatal:
-the archive is opened on every process start, a placement solver needs every
-extent before it can decide anything, and 0.6 GB of Python objects is a
-meaningful fraction of the host tier it is trying to manage.
+| 70B index, 2.2M chunks | before | after |
+|---|---|---|
+| open | 5.1 s | 54 µs |
+| resident | 0.51 GB | the 70 MB table |
+| one lookup | attribute load | ~5 µs |
 
-What it needs is an on-disk index that is **mmapped and used in place** —
-fixed-width records, sorted, binary-searched or directly indexed, with no
-Python objects between the file and a block address. Opening a 70B archive
-should cost a page fault, not eleven seconds. Everything else in this
-handover is an improvement; this one is a precondition.
+**The measurement that decided the design.** Of the 5 s, the zstd decode of
+those 70 MB is 0.07 s; everything else was building objects. So keeping the
+flat buffer captures essentially all of the win, and mmapping the file — the
+obvious move, and what this section used to ask for — would have needed the
+table stored uncompressed to work at all. It buys 0.07 s and costs a format
+change. Not worth it.
+
+**Two traps found while building it, both measured rather than reasoned.**
+Sorting the packed `dst` column and then pulling records out by index is the
+natural instinct and is *slower*: a per-record `unpack_from` loop cost 2.08 s
+against 1.13 s for one `iter_unpack` pass, which more than spends what the
+cheaper sort saves. And the aggregate paths (`info`, the coverage check) do
+want the column — `sum(c.clen for c in chunks)` built 2.2M objects to add one
+integer, and reading the column instead is about twice as fast *and* allocates
+nothing. `order_by_dst()` ends up 1.7× faster than the old sort because it
+also skips sorting entirely when the table is already ascending, which is the
+common case.
+
+What is still true: a caller that walks the whole table repeatedly should
+hoist it into a list, and `verify` and `mount` do, since they were going to
+materialise everything anyway.
+
+## 3b. Decoding a payload the caller fetched, and saying who can read it — **done**
+
+Two interfaces a downstream transport layer was reaching across the boundary
+for, both on the CPU side and both now public.
+
+**`ArchiveIndex` — a decode that does no I/O.** `decompress` reads and decodes
+inside one worker, so the thread count that sets decode throughput also sets
+how many reads are outstanding, and those want opposite things: an NVMe device
+reaches its rated rate only with a dozen requests in flight, while past two
+threads lmz's own interpreter overhead becomes GIL contention. That coupling
+cannot be tuned from outside — only escaped, by decoding a payload the caller
+fetched.
+
+    idx = lmz.ArchiveIndex("model.lmz")
+    for c in idx.chunks():                  # ChunkRef: off, clen, dst, rlen
+        plain = idx.decode(c, my_reader.pread(c.off, c.clen))
+
+It opens the archive once for the chunk table and manifest, then holds no
+file. Ref and delta chunks raise `NeedsSource` rather than reaching for the
+file behind the caller's back — they are *defined* as a difference from an
+earlier output range, so decoding one needs bytes from elsewhere, and
+`decompress` remains the thing that handles that.
+
+**`capabilities()` — the archive declares which decoders can read it.** lmz
+emits `CODEC_BF16C` when a chunk is large enough and the conditioning wins,
+and **the batch decoder cannot read it**: its per-bucket segments have unequal
+lengths by construction, which is not the shape `decode_batch` takes. Nothing
+in the archive said so, so a consumer wanting a GPU-readable archive had to
+reproduce lmz's own encoder threshold and would not notice the day it moved.
+
+    {"batch_decodable": False, "batch_decodable_fraction": 0.0,
+     "blockers": {"bf16-cond": 1}, "min_reader_version": 1,
+     "shared_tables": False, "derived": False}
+
+`derived` is False because this is read from the chunk table rather than
+guessed; a consumer inferring the same answer some other way should report
+True, so a cached inference is never mistaken for a declaration. `lmz info`
+prints it as a `batch` line. The declaration is the general answer rather than
+the invariant "every codec lmz emits is readable by every decoder lmz ships",
+because it survives a third decoder backend, which the invariant does not.
+
+`format.BATCH_DECODABLE` is the table, beside the codec ids so that adding a
+codec means answering the question. A test asserts every codec has an entry —
+without it a new codec would default to unreadable and silently make archives
+look unroutable.
+
+## 1d. The cost model validated at more than one operating point
+
+`1b` measured `k` on a card that saturates on bandwidth at 192 threads, which
+is the one regime where a compute constant is invisible. This tests it where it
+is visible, by shrinking the **grid** at fixed byte traffic: same streams, same
+936.4 MB, fewer resident blocks, so the kernel has to leave the bandwidth-bound
+corner. `scratchpad/gpu/cuda/gridsweep.cu`, 14 grid sizes from 1 block to 1191,
+byte-identical at every one.
+
+| blocks | GB/s | linear in blocks | binds |
+|---|---|---|---|
+| 1 | 2.3 | — | compute |
+| 8 | 18.8 | 1.02 | compute |
+| 32 | 74.7 | 1.01 | compute |
+| 84 | 186.7 | 0.97 | compute |
+| 168 | 331.6 | 0.86 | mixed |
+| 252 | 401.1 | 0.69 | bandwidth |
+| 1191 | 414.6 | 0.15 | bandwidth |
+
+**The model's shape is confirmed.** Rate is linear in resident blocks to within
+3% across 1–84 blocks, then bends over as bandwidth takes the ceiling — which
+is what `rate = min(lanes × clock ÷ k, BW ÷ (1 + 1/expansion))` predicts, and
+the crossing is where it says.
+
+**The constant was wrong, and this is how.** `k` measured in the compute-bound
+region is **217–248**, tight across ten grid sizes. The published 230–330 came
+from full-size runs where bandwidth binds: dividing a bandwidth-limited rate by
+resident lanes does not yield a compute constant, it yields whatever makes the
+arithmetic close. Direction right, interval skewed — every measured point sat
+~20% above the old band's midpoint, and the narrowed one fits 12 of 14 points
+against 7. `cost_model()` now publishes 217–248 with the grid sweep in its
+provenance.
+
+**And the instrument nearly produced a confident wrong answer.** The first
+version hand-rewrote `k_shared`'s body around a grid-stride loop and measured
+2.4× slower at the same occupancy — it was a *different kernel*, and its `k` of
+638–664 would have been published as a correction. What caught it was checking
+the instrument against the thing it claims to measure: at a full grid it must
+reproduce the shipped kernel's rate. It did not. The version in the repo
+extracts the body verbatim and reproduces 414.6 against the shipped 409.8–418,
+and its header says to make that check first.
+
+**The per-group table, priced.** Both this work and a downstream consumer's
+independent analysis point at shrinking the shared-memory footprint. Now that
+rate is *measured* linear in resident lanes, the arithmetic converts directly:
+
+| budget | 16 KiB LUT (today) | 4 KiB LUT | no fixed LUT |
+|---|---|---|---|
+| 32 KiB per workgroup | 192 lanes | **352** | 384 |
+| 64 KiB pool / 32 KiB cap | 384 lanes | **704** | 800 |
+| 100 KiB (this card) | 1024 lanes | 1152 | 1280 |
+
+A 4 KiB LUT is worth **1.8× the resident lanes on a 32 KiB budget** and almost
+nothing here — which is exactly why this card could not have shown it, and why
+the convergence of two independent analyses was worth more than either.
+
+**What that change now costs, which is more than composing two verified
+pieces.** `cost_model()`'s residency formula omits the per-unit thread limit,
+on the stated grounds that shared memory binds first at every block size — and
+that is true *because* the fixed LUT is 16 KiB. **A narrow table removes the
+very margin that makes the simplification hold**, so the `min()` term becomes
+live, every residency projection has to be re-checked against it, including the
+ones a consumer has already built, and the published formula changes. A test
+asserts shm still binds first precisely so this cannot happen quietly: whoever
+takes the LUT will trip it on their first commit, which is exactly when they
+should be reminded. Still days rather than weeks, but it is a contract change
+as well as a kernel change.
+
+**A side effect worth naming: the narrow table's cost is now measured.** With
+both kernels' constants taken in the compute-bound regime, they separate —
+**217–248 shared against 257–291 per-chunk**. That gap is the second dependent
+shared load the narrow table buys its size with, which §1 asserted from the
+design and nobody had priced. It is about 20% of cycles a byte, not a factor,
+which is why occupancy rather than the inner loop dominates the 3.8× gap. The
+suite now asserts the ordering and a sane bound on the ratio, since the
+per-chunk kernel costing *less* per byte would mean one of them was measured
+wrong.
+
+**The consequence that reaches furthest: the two readings collapse.** A
+consumer's gate has carried two interpretations of the single 418 GB/s point —
+that it is ~84% of a bandwidth bound, or that it defines a compute constant —
+which agree on the card that produced them and differ by 8× on a 2-CU adapter.
+It refused to choose, correctly, because one point cannot.
+
+The grid sweep does choose, by showing that **both are true in different
+places and which one binds is a property of the device**. The model is
+`min(compute, bandwidth)`; the crossing on this card is around 48,000 resident
+lanes. For a small part the compute term is nowhere near it:
+
+| | resident lanes | lanes needed to reach the bandwidth ceiling | margin |
+|---|---|---|---|
+| 2 CU, 1.5 GHz, 30 GB/s | ~768 | 5,800 | 7.6× |
+| 2 CU, 2.0 GHz, 30 GB/s | ~768 | 4,400 | 5.7× |
+| 2 CU, 1.5 GHz, 100 GB/s | ~768 | 19,500 | 25× |
+
+So on any device with few compute units **the compute term binds**, by a
+margin of at least ~6× under the least favourable assumptions, and the
+bandwidth reading is not live there at all. That is what makes the ambiguity
+collapsible: not that one reading was wrong, but that the regimes are now
+separated empirically and small devices are unambiguously in one of them.
+
+**What that does not settle**, and it is narrower and sharper than "small
+devices are unverified": whether the linear-in-lanes relation *extends* down to
+2 CUs, or meets a cache, scheduler or driver wall on the way; and how a
+unified-memory part behaves with a CPU contending for the same bus. Those are
+the two things that still require running on such a device.
+
+**What this instrument is not.** A 5080 held to a few blocks is a 5080 with
+less compute and **the same ~960 GB/s of DRAM behind it, and no CPU contending
+for the bus**. It validates the model's *shape* and the constant's *value on
+this kernel and this card*. It does not produce integrated-GPU numbers, and no
+row above should be read as one. The projections in `1b`, `3c` and elsewhere
+remain projections; what changed is that the model underneath them has now been
+checked at 14 operating points instead of assumed from one.
+
+## 1c. The per-chunk kernel's cost model — **done**, and its sweep is degenerate
+
+`cost_model("per_chunk")` publishes the other kernel's constants, because a
+gate routing an ordinary archive was otherwise quoting the shared kernel's and
+would predict about four times the real throughput.
+
+| | shared | per-chunk |
+|---|---|---|
+| shared memory | 16 KiB fixed + 640 B a group | **0 fixed + 5760 B a group** |
+| resident lanes (this card) | 21504–64512 | **10752, always** |
+| `k` lane-cycles/byte | 230–330 | **257–283** |
+| measured | 409.8 GB/s | 107–111 GB/s |
+
+**The sweep has one real row, not seven.** At 5.6 KiB a group this kernel
+cannot exceed 128 threads inside a 99 KiB block, and `pick_tpb` resolves
+*every* requested block size to the same launch — 32 threads, 4 blocks a unit.
+Asking for a wider block does nothing, which is worth publishing: a caller
+tuning this kernel by block size is tuning nothing.
+
+**So the 3.8× gap is mostly occupancy, not the second dependent load.** §1
+attributes it to the narrow table's extra shared load on the critical path.
+That is real but secondary: the two `k` intervals overlap (230–330 against
+257–291), which says the two kernels cost about the same per byte. What
+differs is that one keeps up to 6× more lanes resident. The fix for the gap is
+therefore a smaller per-group table, not a cheaper inner loop.
+
+**And that conclusion arrives twice, from opposite ends.** A downstream
+consumer, working out whether the published `k` brackets a 2-CU adapter, found
+that the shared kernel's *fixed* 16 KiB LUT is half of a 32 KiB budget and
+caps residency at one block there — two blocks would need 2 × 16384 with
+nothing left for groups, so it is a wall rather than a tuning problem. That
+analysis was about a device nobody here owns, for an unrelated purpose, and it
+lands on the same instruction as this one: **shrink the per-group and fixed
+shared-memory footprint.** Two independent routes to one answer is the closest
+thing this project has to an unforced verification, and it names the next
+kernel change without needing hardware neither party has.
+
+**One caution about the interval above, because the two are not the same kind
+of number.** The shared kernel's 230–330 brackets two occupancies — the low
+end from a 4-block row, the high from a 3-block row — so a device inside that
+range lands inside the interval. The per-chunk 257–291 cannot mean that: the
+sweep collapses to one launch, so there is one configuration and the width is
+run-to-run spread across twelve runs (98.2–111.2 GB/s). `cost_model()` carries
+`k_is_single_point_fit` for exactly this, because the field name is the same
+and the claim is weaker.
+
+**A measurement trap found while doing this, and it invalidated a published
+row.** The per-chunk sweep reported 84 GB/s at 96 threads against 110 either
+side — reproducibly, across two runs. It is an artifact of *sweep order*, not
+of block size: every row launches identically, and re-running the same value
+seven times gives 99–101 GB/s with no 84 anywhere. The shared-table sweep in
+§1b was re-run in reverse order as a check and holds its shape (384 fast, 64
+slow, same values within noise), so the `k` interval published there stands.
+The lesson for the next sweep: **a reproducible number is not an attributed
+one** — reproduce it, then reorder it.
+
+## 3c. Fusing the plane merge into the decode — measured, not built
+
+The GPU decoder returns byte planes plane-major; the plaintext is the
+transpose. A downstream consumer holds that transpose as a loaned kernel and
+asked lmz to take it back, either as a second launch or fused into the decode.
+lmz's own CPU path already merges inside itself, so the asymmetry is real
+whichever way this lands.
+
+**The design cost decides it, and it holds without any measurement.** A fused
+kernel must transpose in shared memory, which needs all `esize` planes of a
+chunk resident in one block. Today `gid` is a flat stream index, so that holds
+only where the group count divides the plane count — and at `tpb` 96 and 160
+it does not for 8-byte elements, while `pick_tpb` can choose 160. Fusing
+therefore takes back the block-size freedom `d989c49` won, on the class of
+device that needs it most. That argument would stand even if every number
+below came out the other way.
+
+The measurement is what makes it *safe* to stop rather than merely defensible,
+and it is recorded because whoever re-asks this will re-run `mergebench.cu`
+and find the throughput, not the divisibility.
+
+**The merge is already free as a kernel.** On this card, 936 MB of 4-byte
+elements:
+
+| | ms | GB/s of output |
+|---|---|---|
+| merge, plane-major → interleaved | 2.45 | 400.3 |
+| a plain copy of the same bytes | 2.43 | 403.5 |
+
+Within 0.8% of a pure copy. The scatter costs nothing — it is bandwidth-bound
+like any copy, and the loaned kernel's 264 GB/s is a different measurement of
+the same thing rather than a penalty to be engineered away.
+
+**So the prize is not the merge, it is the round trip.** Fused, the plaintext
+is written once instead of written, read back and written again — the merge's
+own 2×936 MB of traffic disappears rather than being made faster:
+
+| layout | decode | + merge | fusing worth up to |
+|---|---|---|---|
+| shared table, 409.8 GB/s measured | 2.29 ms | 4.74 ms | **2.07×** |
+| per-chunk, 107.1 GB/s measured — what archives hold today | 8.74 ms | 11.19 ms | **1.28×** |
+
+**And it is worth least on exactly the device the argument is aimed at.**
+Projecting both terms from the same device parameters — decode from the
+published `k` = 230–330 against lanes × clock, merge from bandwidth — gives a
+result that inverts the intuition:
+
+| device | decode (k-model) | merge | fusing |
+|---|---|---|---|
+| RTX 5080 (measured 2.29 ms; model says 1.67–2.40) | 1.67–2.40 ms | 3.34 ms | 2.39–3.00× |
+| 8-CU iGPU, ~1.8 GHz, ~100 GB/s — *projected* | 38.9–55.9 ms | 18.7 ms | 1.34–1.48× |
+| 2-CU iGPU, ~1.5 GHz, ~50 GB/s — *projected* | 187–268 ms | 37.5 ms | **1.14–1.20×** |
+
+The merge is a fixed bandwidth cost; the decode is not. On a compute-bound
+part the decode dominates so completely that removing the merge barely
+registers. The model is worth the weight given: it predicts 1.67–2.40 ms on
+the card where 2.29 was measured. The iGPU rows are projections and no such
+device is reachable from here.
+
+**One term in that model is optimistic on exactly the smallest row, and it is
+the row the verdict rests on.** The merge cost above is drawn from device
+bandwidth, which on a discrete card is right — VRAM traffic nothing else
+contends for. On a **unified-memory part it is not private**: the round trip
+shares one bus with the host, and specifically with the fetch stage feeding
+the decoder. That is not hypothetical. A downstream consumer's plan was 29%
+wrong on precisely this, its `max()` over overlapped stages treating them as
+free while a CPU decode and the DMA engine shared a bus. So 37.5 ms on the
+2-CU row is a **floor**, and under contention the merge costs more than the
+model says — which pushes *toward* fusing on the device where this table says
+fusing is worth least.
+
+It does not flip the verdict: 1.14–1.20× before contention is not worth
+`pick_tpb`'s freedom, and the contention would have to be severe to close that
+gap. But anyone re-asking this question on a unified-memory device needs the
+term, or they will re-derive the table and inherit the same optimism.
+
+**Verdict: not built, and the second launch is the right shape for now.** The
+merge is free, the round trip is the only prize, that prize is smallest on the
+device class this is for, and buying it costs the block-size freedom that a
+small device needs most. What should not be lost is that the merge belongs to
+lmz either way — the plane split is lmz's format, and a decoder that stops one
+step short of plaintext is unfinished however fast it is.
 
 ## 4. Tensor-level addressing
 
@@ -204,21 +640,76 @@ can address.
 
 ## Where the boundary is
 
-Not lmz's, and it should stay that way:
+Not lmz's, and it should stay that way. This table had two columns when
+there were two parties; there are now three, and the middle one is where
+most of the ambiguity lived — a transport layer that decides *when* bytes
+move is neither the codec nor the residency engine:
 
 | | whose |
 |---|---|
 | the placement solver, the tier budgets, eviction | the engine |
-| prefetch, queue depth, stream and event choreography | the engine |
-| page-locked staging buffers, the copy/compute overlap | the engine |
 | adapters for PyTorch, vLLM, llama.cpp | the engine |
 | a *fused* decode-into-GEMV kernel | the engine — it owns the matrix kernel |
+| prefetch, queue depth, stream and event choreography | **the transport layer** |
+| page-locked staging buffers, the copy/compute overlap | **the transport layer** |
+| measuring the machine and choosing the route | **the transport layer** |
 | the coded stream, its table, its blocks, its index | **lmz** |
 | a standalone GPU decoder with a stable ABI | **lmz** |
+| decoding all the way to plaintext, planes merged | **lmz** |
+| the decoder's own cost constants | **lmz** |
 | tensor → block addressing | **lmz** |
 
 The dividing line that keeps holding: lmz produces bytes and can turn them
 back into bytes as fast as anyone. It does not decide *when*.
+
+**And the boundary only works if the reasoning crosses it too.** `cost_model()`
+was built so nobody downstream would carry a copy of lmz's constants or a guess
+at them — and its first version left the single most useful fact about them
+outside the mechanism: *why* the published `k` had moved, and therefore whether
+a consumer was looking at a refinement or a contradiction. That reasoning lived
+in a message and a report, which do not survive a context boundary. A consumer
+wiring against the constants did the correct thing with what they had — they
+reconstructed the argument and labelled it as their own inference — and that is
+the only reason the gap was visible at all. `provenance["supersedes"]` is where
+it lives now. The general form: **if a consumer would have to re-derive it, it
+belongs in the artifact, not in the conversation that produced the artifact.**
+
+**The purity rule that follows, stated where a contributor will hit it.**
+lmz's decode path is bytes in, bytes out. A new entry point that opens a
+file, starts a thread pool, or measures the machine in order to choose a
+policy belongs to the caller instead — there is one rate model in the stack
+and it is the transport layer's. `cost_model()` is the shape that stays on
+lmz's side: it publishes what the *kernel* costs, with provenance and with
+an interval where the value is not pinned, and says nothing about the
+machine it is called on. `Store`'s fixed readahead is the one place inside
+lmz that looks like policy; it is a constant with no probe and no
+adaptation, which keeps it on the right side of the line. The day it wants
+to time a disk, it should take the model from downstream rather than grow a
+second one.
+
+**Interrogation is not measurement, and the line runs between them.**
+`compress(workers=None)` falls back to `default_workers()`, which asks the OS
+for a CPU count honouring affinity and cgroups. That is a *question* — it
+times nothing, probes no device, adapts to no observed throughput — and it
+stays. What must never happen is a default derived from a *rate*: nothing
+timed, fitted, adapted from measured throughput, or cached as a machine
+profile, because that is a second rate model and the stack has one.
+
+`encode_options()` publishes the distinction so a caller can act on it. Every
+keyword `compress` accepts is declared `format`, `schedule` or `observe`;
+`format` decides what the coded bytes are and is lmz's to choose, `schedule`
+decides only how the work is spread, and `observe` watches without changing
+anything. **A scheduling default is a fallback, never a decision** — it was
+chosen knowing nothing about the caller's machine or workload, which is
+precisely the fact a transport layer needs and could not otherwise discover.
+`workers` is the one today, and its default is deliberately a weak proxy:
+compression goes memory-bus-bound near four threads on real weights, so a
+core count is a starting point rather than an answer.
+
+The split is a verified property rather than a naming convention — the same
+input at 1, 2, 8 and 16 workers produces byte-identical archives, and the
+suite checks both that and the declaration against `compress`'s own signature
+by introspection, so a new keyword cannot be added without classifying it.
 
 ## What is already right and should not be touched
 
@@ -234,9 +725,105 @@ wrong weight. Keep them, keep them cheap, and keep them on by default.
 
 **The 8-state interleave.** It is what let 8 lanes replace 8 chains. See above.
 
-## Two traps, carried forward
+## Before you measure anything
 
-Both are from `vectorising-the-coder.md` and both apply here unchanged.
+Every defect this project found in one day came from the measurement setup
+rather than the code — none from computing a wrong answer. Two families: **you
+can measure the wrong object** (1, 6), or **measure the right one and attribute
+its cost to the wrong variable** (2–5, 9) — and two that are neither, where a
+number acquires authority by crossing a boundary and coming back (7), or where
+the machine silently edits the model by omitting a term that does not bind on
+it (8). All produce numbers that are
+reproducible, tight, and wrong, which is the shape that gets published.
+
+That the defects cluster this way is partly a fact about the work and partly a
+fact about the tests: a coder that computes a wrong answer is caught by a
+byte-identity check, and this suite has 292 of them across 120 tests, so those
+defects die in the suite and never reach a report. What survives to be found by
+hand is the measurement around the code. Read these before running a sweep, not
+after publishing one — and do not read the clustering as evidence the coder is
+beyond suspicion.
+
+1. **An instrument must reproduce the thing it claims to measure.** This is a
+   class above the rest: they are about attributing a cost to the wrong
+   variable, this one is about measuring the wrong object. A grid-stride
+   rewrite of `k_shared` decoded byte-identically at every grid size, scaled
+   linearly, and produced a tight reproducible `k` of 638–664 — and it was
+   2.4× slower than the shipped kernel, so its constant was wrong by more than
+   the error it was built to correct, and would have shipped *as the
+   correction* with more confidence than the value it replaced. The check that
+   caught it cost one run: at a full grid the wrapper has to match the kernel
+   it wraps (414.6 against 409.8–418). **Byte-identity proves the output and
+   says nothing about whether you are measuring the kernel you ship.** Compare
+   them in the regime where they can be compared, before any sweep means
+   anything.
+2. **Tune where the knob binds.** An optimum reached on the development box is
+   evidence the box cannot tell the choices apart, not evidence the choice is
+   right. `pick_tpb` maximised block width for a latency-bound kernel and
+   survived a full occupancy sweep, because this card saturates on bandwidth
+   at 192 threads and no measurement taken on it could see the difference.
+3. **Reproduce, then reorder.** A number reproducible twice can still be an
+   artifact of sweep order. The per-chunk sweep reported 84 GB/s at one block
+   size across two runs; every row launches identically, and running the same
+   value seven times shows no 84 anywhere. Reversing a sweep is cheap and
+   should not wait until something looks wrong — the shared-table sweep was
+   re-run in reverse for exactly that reason and held.
+4. **A sweep that collapses to a point cannot bracket an interval.** The
+   per-chunk sweep produced one launch, so its `k` interval is run-to-run
+   spread rather than a range over occupancy. Published as such
+   (`k_is_single_point_fit`), because the field name is identical to the
+   shared kernel's and the claim is not.
+5. **Assert what the machine has, not what yours has.** A test that asserts
+   this box's answer is testing the box; the environments that disagree are
+   the ones you cannot see. `LMZ_NO_GPU=1` before pushing, and the same rule
+   in `tests/test_lmz.py`'s docstring.
+6. **Verify the artifact that shipped, not the one you built.** A local build
+   and a CI build of the same commit are not the same file: lmz 1.3.0's wheel
+   matched byte for byte and its sdist did not, because CI rebuilt from the
+   tag. Inspecting a local tarball and concluding the published one is clean is
+   an inference about the artifact rather than an observation of it. The check
+   is `pip download --no-binary :all:` and it costs one command. (The 257-byte
+   difference turned out to be gzip framing — all 32 files byte-identical by
+   sha256 — but that is the answer, not the assumption.)
+7. **A number that crosses the boundary and comes back is not independent
+   evidence.** The first draft of `cost_model()`'s `supersedes` field said the
+   old sweep's compute ceiling was "above 1200". That figure traces to a
+   *consumer's* inferred k = 128, which lmz was about to publish as its own
+   finding and hand back to them — after which they would have cited lmz for a
+   value they supplied, and an unchecked inference would have acquired the
+   authority of a published constant. It happened also to be wrong (the real
+   ceilings across that sweep are 264–791), but **the wrongness is not the
+   point: a correct value acquired that way is just as unfounded.** This is not
+   rules 1 or 6 — nothing was measured badly, and the artifact was the right
+   one. It is a fact with no independent source acquiring one by round trip,
+   and a published boundary is precisely what makes it possible. Before
+   publishing a number, ask where it came from, and if the answer is "the
+   consumer", either measure it or attribute it.
+8. **A term that does not bind on your machine is invisible in your model.**
+   `cost_model()`'s residency formula shipped without the per-unit *thread*
+   limit, and without saying which shared-memory budget to divide by. Neither
+   was a reasoning error: on this card shared memory binds first at every
+   block size, so the thread term is inert, and its per-block cap and per-unit
+   pool are a kilobyte apart, so the divisor is unambiguous *here*. Both gaps
+   were found by a consumer substituting a different device's numbers — one of
+   which made the ambiguity a 2.3× error, the other of which would make the
+   omitted term bind. **The machine edits the model by omission**, and it does
+   so in the one place built to escape the machine.
+
+   That is also the argument for publishing a *formula* rather than constants,
+   which was not obvious before it happened twice: a published constant cannot
+   reveal a missing term, while a published formula gets substituted into by
+   someone whose numbers make the missing term bind, and then it tells you.
+   Write down the terms that are inert here, marked as inert, rather than
+   leaving them out.
+9. **Fix the byte traffic across a sweep.** Every row of the occupancy sweeps
+   decodes the identical archive; anything that moves is therefore the
+   variable under test and not the workload.
+
+## Three traps, carried forward
+
+The first two are from `vectorising-the-coder.md` and apply here unchanged;
+the third was found in this kernel.
 
 **Do not benchmark one stream twice.** The two-chunk test in `coderbench`
 originally decoded the same stream into two buffers and reported a clean 2×
@@ -249,6 +836,27 @@ two of the ablations in `scratchpad/gpu/README.md` contradicted a confident
 guess outright — coalescing the refill loads gained *exactly nothing*,
 because the cost was latency on the dependency chain and not transaction
 count.
+
+**A tuning knob measured only where it does not bind will be tuned wrong.**
+`pick_tpb` chose the widest block that fits, which is the wrong quantity for a
+latency-bound kernel -- what covers a dependent load is lanes resident on a
+unit, so a block twice as wide that therefore fits only once is a loss. It
+also read only the per-block cap and never the per-unit pool
+(`sharedMemPerMultiprocessor`, 100 KiB here against the 99 KiB a block may
+opt into), so it could not have reasoned about residency even in principle.
+
+The reason it survived a full occupancy sweep is the trap: **this card
+saturates on bandwidth at 192 threads**, so residency past that buys nothing
+here and no measurement taken on it could see the defect. It bites only where
+the kernel is compute-bound, which is every small device the "decode where it
+lands" argument is aimed at and none of the ones it was measured on. It was
+caught by a downstream consumer's arithmetic about a 2-CU adapter nobody in
+this project owns.
+
+The rule that follows: when a knob's optimum is reached on the development
+box, that is evidence the box cannot distinguish the choices -- not evidence
+the choice is right. Reason about what the knob *means* on a device where the
+binding resource is different.
 
 ## How to measure
 
@@ -265,7 +873,10 @@ in it deliberately produce wrong output and are labelled timing-only.
 `scratchpad/gpu/cuda/libbench.cu` times what the *package* builds against the
 same data — it `#include`s `lmz/gpu/lmzgpu.cu` rather than linking it, so
 there is no second copy of the kernel to drift — and sweeps the block size.
-It is the source of the 111 and 418 above.
+It is the source of the 111 and 418 above, and takes a directory so it can be
+pointed at `prep_synth.py`'s output instead of this machine's cache. Both
+numbers were re-measured after a driver upgrade from 580 to 610.88 (CUDA UMD
+13.3) and did not move: 111.1 and 417.4 GB/s.
 
 Verification is as easy here as it was for the vector decoder: a decoder
 either reproduces the plaintext or it does not, and `prep_fused.py` takes its
@@ -275,17 +886,23 @@ data: `test_gpu_decode_matches_cpu` builds streams with lmz's own encoder and
 compares against `lmz_rans_decode`, and skips where there is no GPU.
 
 **One card is one card, and the doc's own trap applies here.** What has been
-run on an RTX 5080 cannot be run on a Turing or a Hopper without one, so the
-evidence was widened in the two directions that do not need the hardware:
+run on an RTX 5080 cannot be run on a Turing or a Hopper without one — so the
+evidence was widened in every direction that does not need the hardware, and
+there turned out to be more of those than expected. A free T4 then closed the
+one direction that did need it; the whole sequence is below, in the order it
+happened, because the cheap steps are what made the last one a confirmation
+rather than a gamble:
 
 **And the decoder checks itself before it is used.** The first thing it ever
 does on a machine is decode a stream that machine just encoded and compare
 against `lmz_rans_decode`; a device that disagrees is not used at all, and
-`lmz doctor` says so by name. This is the mitigation that actually covers an
-architecture nobody has run, because a silently wrong decoder is far worse
+`lmz doctor` says so by name. This is the mitigation that actually covers
+silicon nobody has run on, because a silently wrong decoder is far worse
 than an absent one — the caller gets weights back rather than an error. It
-costs one launch, after a CUDA context that was being created anyway: 281 ms
-for the whole first probe, context included.
+costs one launch, after a CUDA context that was being created anyway: 385 ms
+for the whole first probe, context and the out-of-process driver check
+included, and 2 µs for every call after it. It was 281 ms before that check
+was added, so surviving a broken driver costs about 100 ms once per process.
 
     compute-sanitizer --tool=memcheck   python3 -c ...   # 0 errors
     compute-sanitizer --tool=racecheck  python3 -c ...   # 0 hazards
@@ -294,5 +911,112 @@ for the whole first probe, context included.
 clean on both kernels over real planes — which is the check that speaks
 directly to "a two-slot `cp.async` buffer verifies byte-identical and races
 anyway" — and the kernel compiles for every architecture CUDA 13 supports at
-or above the floor, sm_75 through sm_121. What is still untested is *running*
-it anywhere but Blackwell, and the numbers in the README are one card's.
+or above the floor, sm_75 through sm_121.
+
+**And the untested architectures are not equal, which narrows the problem to
+one.** Counting `LDGSTS` in the generated SASS says which of them is running
+the code that was actually verified:
+
+| | `LDGSTS` |
+|---|---|
+| sm_75 | **0** |
+| sm_80, sm_86, sm_89 | 38 |
+| sm_90, sm_120 | 41 |
+
+Turing has no `cp.async` instruction, so `__pipeline_memcpy_async` falls back
+to a synchronous copy and sm_75 is *different generated code*. Everything at
+sm_80 and above runs the algorithm that was verified and sanitized here and
+differs only in scheduling, so above the Turing line the open question was a
+throughput number, and at it the open question was correctness. That made a
+free Colab T4 worth more than a rented A100, which is why the notebook exists
+and why it asks for the card it does.
+
+**A code path can be run on silicon it was not compiled for, which is how the
+sm_75 question got answered without a Turing.** `-arch=compute_75` emits PTX
+and no cubin, so `__CUDA_ARCH__` is 750 while the header picks its scalar
+branch, and the driver JITs the result onto whatever card is present. That
+works for every architecture, not just Turing, so each variant lmz can emit
+was run on a Blackwell over the same 936 MB:
+
+| codegen | `LDGSTS` | per-chunk | shared |
+|---|---|---|---|
+| sm_120, native | 41 | 110.2 GB/s | 417.4 GB/s |
+| sm_90 | 41 | 104.4 GB/s | — |
+| sm_80 / 86 / 89 | 38 | 104.4 GB/s | — |
+| sm_75 | 0 | 86.7 GB/s | 391.8 GB/s |
+
+Every one byte-identical, at all seven block sizes. Both kernels under sm_75
+are also clean under `memcheck`, `racecheck` and `synccheck` — the shared one
+too, which the first pass missed by sanitizing only `k_perstream`.
+
+**This does not measure a T4.** It is each architecture's code on the wrong
+silicon, so the 21% sm_75 gives up is what dropping `cp.async` costs a
+Blackwell, not what Turing does. What it settles is that every variant lmz can
+emit decodes and does not race, which was the whole *correctness* column. The
+JIT'd rows sitting 5% under native is itself expected — the driver's JIT is
+not `ptxas -O3` on the exact target.
+
+**And then a real T4 ran it, which is the thing none of the above could
+substitute for.** Via the Colab notebook, on a stock runtime with nothing
+built by hand:
+
+    lmz 1.1.3 GPU verification
+      device   Tesla T4 sm_75 40 SMs
+      shapes   30 decoded byte-identically to the CPU decoder
+      verdict  OK
+
+CUDA 12.8, driver 580.82.07, compute capability 7.5. Every step ran as
+shipped: `pip install lmzip` fetched a pure-Python wheel with no CUDA in it,
+`build.py` found the toolkit and targeted `sm_75`, the out-of-process probe
+cleared the driver, the self-test agreed with the CPU coder, and thirty
+distributions and batch shapes came back byte-identical.
+
+**Two predictions this turned into measurements.** `pick_tpb` was expected to
+step the per-chunk kernel down to 64 threads inside Turing's 64 KiB, and the
+64 KiB figure came from a table rather than from a T4; both held. And the
+`_ARCH_FLOOR` of 7.5 is a boundary the only sm_75 card sits exactly on — an
+off-by-one there would have declined every Turing with a plausible-sounding
+message instead of decoding.
+
+**What is still open is now only Ampere through Hopper, and only as a
+number.** sm_75 and sm_120 are the two ends of the supported range, they are
+the two that generate *different* code, and both have now been verified on
+real silicon. sm_80/86/89/90 sit between them, share the 38/41 `LDGSTS` path,
+and have been JIT-run and sanitized here — so a report from an A100, A10G, L4
+or H100 buys a throughput figure, not an answer to whether it works.
+
+**A device that cannot fit the tables is refused, and that is arithmetic over
+one number, so no rented card is needed to check it either.**
+`scratchpad/gpu/cuda/shmfit.cu` runs the shipped `pick_tpb` against every
+architecture's `sharedMemPerBlockOptin` and re-derives the local card's row
+from the driver, so the table is checked against hardware at least once:
+
+| | optin | per-chunk | shared |
+|---|---|---|---|
+| sm_75 T4, RTX 2080 | 64 K | 64 thr, 45 K | 384 thr, 46 K |
+| sm_80 A100 | 163 K | 128 thr, 90 K | 384 thr, 46 K |
+| sm_86 / 89 A10G, L4, RTX 4090 | 99 K | 128 thr, 90 K | 384 thr, 46 K |
+| sm_90 / 100 H100, B200 | 227 K | 128 thr, 90 K | 384 thr, 46 K |
+| sm_120 RTX 5080 | 99 K | 128 thr, 90 K | 384 thr, 46 K |
+
+Nothing declines. Turing is the only architecture the per-chunk picker steps
+down for, and it steps down to 64 threads — which measured *faster* than 128
+here, so the narrower block Turing is forced into costs it nothing.
+
+**A benchmark nobody else can run is not evidence.** `prep_synth.py` writes
+libbench's input from lmz's own encoder with no checkpoint and no 1.8 GB of
+cache to reproduce first, bisecting the decay to land on the entropy real
+exponents have — 2.78 bits a symbol, because refill rate is a direct function
+of it and a flatter buffer would measure a different machine. It reproduces
+the real planes within 2.4% at the shipped default (107.6 against 110.2 GB/s)
+and reproduces the 96-thread occupancy cliff too, and it leans the right way:
+340.5 MB coded against the real 336.1 MB, so it asks for slightly more refills
+per byte than real weights do. Twenty minutes on a rented card is now enough
+to produce a number comparable with this one.
+
+`lmz doctor --gpu-verify` is the asking. It builds streams with lmz's own
+encoder, decodes thirty distributions and batch shapes, checks lmz's own CPU
+decoder agrees with every byte, and prints a block worth pasting. No data
+files and no network: the oracle travels with the question. That is what a
+stock Colab T4 ran to produce the sm_75 result above, so the mechanism is not
+theoretical — the same one click now wants an Ampere or an Ada.

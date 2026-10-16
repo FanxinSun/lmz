@@ -8,7 +8,7 @@ import os
 import sys
 import time
 
-from . import __version__, api
+from . import __version__, api, entropy
 from .format import FormatError
 from .parallel import default_workers
 
@@ -80,7 +80,7 @@ def cmd_compress(args) -> int:
                          chunk_size=args.chunk_size, checksum=not args.no_checksum,
                          dedup=not args.no_dedup, delta=not args.no_delta,
                          mapped=args.mapped, align=args.align, progress=bar,
-                         shared_table=args.shared_table)
+                         shared_tables=args.shared_tables)
     bar.done()
     if not args.quiet:
         print(f"{src} -> {dst}")
@@ -94,6 +94,14 @@ def cmd_compress(args) -> int:
         delta = stats.detail.get("delta_bytes", 0)
         if delta:
             print(f"  {human(delta)} coded as differences from an earlier file")
+        # An interpreter with no zstd binding silently codes every general
+        # chunk with deflate, which costs several points and looks like
+        # nothing at all -- until `doctor` is run, which nobody does after a
+        # ratio they were not expecting. Say it where the ratio is printed.
+        if not entropy.HAVE_ZSTD:
+            print("  note: no zstd backend, so general chunks used deflate "
+                  "and this archive is larger than lmz would normally make "
+                  "it; `lmz doctor` says what is available")
     return 0
 
 
@@ -139,8 +147,6 @@ def cmd_info(args) -> int:
           f"({(1 - size / orig) * 100 if orig else 0:.1f}% smaller)")
     print(f"chunks      {data['chunks']} of {human(man.get('chunk_size', 0))}  "
           f"level {man.get('level', '?')}  checksum {man.get('checksum', '?')}")
-    if man.get("shared_table"):
-        print("shared tbl  yes (516 B global table)")
     if man.get("dedup_bytes"):
         print(f"dedup       {human(man['dedup_bytes'])} of duplicate tensors stored once")
     if data["codecs"]:
@@ -166,6 +172,15 @@ def cmd_info(args) -> int:
                 by = (1 - m["contested_coded"] / alt) * 100 if alt else 0
                 print(f"  {'':10s} {m['contested']:7d} of those ran against the "
                       f"other coder and won by {by:.1f}%")
+    # Which decoders can read it, because "will my GPU take this archive" is
+    # otherwise answered by reproducing lmz's encoder thresholds downstream.
+    cap = api.capabilities(args.input)
+    if cap["blockers"]:
+        blocked = ", ".join(f"{n} x{c}" for n, c in sorted(cap["blockers"].items()))
+        print(f"batch       no -- {blocked} "
+              f"({cap['batch_decodable_fraction'] * 100:.0f}% of coded bytes can)")
+    else:
+        print("batch       yes -- every coded chunk can ride the batch decoder")
     print(f"members     {len(data['members'])}")
     for m in data["members"][:args.limit]:
         ntensors = len(m.get("tensors") or {})
@@ -182,10 +197,8 @@ def cmd_info(args) -> int:
                 if shown >= args.limit:
                     break
                 lo, hi = meta["offsets"]
-                blocks = meta.get("blocks")
-                where = f"  blocks {blocks[0]}..{blocks[1]}" if blocks else ""
                 print(f"  {name:<52s} {meta['dtype']:<8s} "
-                      f"{str(meta['shape']):<20s} {human(hi - lo)}{where}")
+                      f"{str(meta['shape']):<20s} {human(hi - lo)}")
                 shown += 1
     return 0
 
@@ -206,12 +219,20 @@ def cmd_append(args) -> int:
     bar = Progress("appending", not args.quiet)
     stats = api.append(args.archive, args.input, level=args.level,
                        workers=args.threads, checksum=not args.no_checksum,
-                       delta=not args.no_delta, progress=bar)
+                       dedup=not args.no_dedup, delta=not args.no_delta,
+                       progress=bar)
     bar.done()
     if not args.quiet:
         print(f"{args.input} -> {args.archive}")
         print(f"  added {human(stats.input_bytes)}, archive now "
               f"{human(stats.output_bytes)}  {stats.seconds:.2f}s")
+        dd = stats.detail.get("dedup_bytes", 0)
+        if dd:
+            print(f"  {human(dd)} already in the archive, stored once")
+        sh = stats.detail.get("shared_bytes", 0)
+        if sh:
+            print(f"  {human(sh)} of coded payload shared with what was "
+                  f"already there")
         d = stats.detail.get("delta_bytes", 0)
         if d:
             print(f"  {human(d)} coded as differences from what was already there")
@@ -227,8 +248,69 @@ def cmd_extract(args) -> int:
     return 0
 
 
+def cmd_bundle_create(args) -> int:
+    from . import bundle as bundle_api
+
+    manifest = None
+    if args.manifest:
+        with open(args.manifest, "r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    result = bundle_api.create_bundle(
+        args.input, args.output, manifest, level=args.level,
+        workers=args.threads, checksum=not args.no_checksum,
+        dedup=not args.no_dedup, delta=not args.no_delta,
+        mapped=args.mapped, align=args.align, overwrite=args.force)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"{args.input} -> {args.output}")
+        print(f"  bundle {result['bundle']['id']}  "
+              f"{result['archive_accounting']['decoded_bytes']} decoded bytes")
+        print(f"  archive {result['archive_bytes']} bytes, "
+              f"manifest {result['bundle_manifest_sha256']}")
+    return 0
+
+
+def cmd_bundle_inventory(args) -> int:
+    from . import bundle as bundle_api
+
+    result = bundle_api.inventory_bundle(
+        args.archive, expected_manifest_sha256=args.expected_manifest_sha256,
+        strict=not args.allow_invalid)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"{args.archive}: {result['status']}")
+        if result.get("validation", {}).get("reason"):
+            print(f"  {result['validation']['reason']}")
+        if result.get("bundle"):
+            print(f"  bundle {result['bundle']['id']}  "
+                  f"entries {len(result['entries'])}")
+            print(f"  decoded {result['archive_accounting']['decoded_bytes']}  "
+                  f"archive {result['archive_bytes']}")
+    return 0 if result["status"] == "verified" else 1
+
+
+def cmd_bundle_materialize(args) -> int:
+    from . import bundle as bundle_api
+
+    result = bundle_api.materialize_bundle(
+        args.archive, args.output,
+        expected_manifest_sha256=args.expected_manifest_sha256)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(f"{args.archive} -> {result['materialization']['path']}")
+        print(f"  {len(result['entries'])} entries, "
+              f"{result['archive_accounting']['materialized_bytes']} bytes")
+    return 0
+
+
 def cmd_doctor(args) -> int:
     from . import fuse, gpu
+
+    if getattr(args, "gpu_verify", False):
+        return _gpu_verify(gpu)
 
     b = api.backends()
     print(f"lmz {__version__}")
@@ -254,6 +336,39 @@ def cmd_doctor(args) -> int:
         print("        decodes batches of lmz streams straight into VRAM; the")
         print("        CPU path is unaffected either way.")
     return 0
+
+
+def _gpu_verify(gpu) -> int:
+    """Prove the GPU decoder on this machine, in a form worth pasting.
+
+    The kernel has been run on one architecture. Turing in particular gets
+    different generated code -- cp.async has no instruction there and the
+    intrinsic becomes a synchronous copy -- so a report from a card that is
+    not a Blackwell is worth more than any amount of further testing here.
+    """
+    r = gpu.verify()
+    print(f"lmz {r['lmz']} GPU verification")
+    if r["device"] is None:
+        print(f"  no GPU decoder -- {r['why']}")
+        return 1
+    print(f"  device   {r['device']}")
+    print(f"  shapes   {r['checked']} decoded byte-identically to the CPU decoder"
+          if not r["failures"] else
+          f"  shapes   {r['checked']} checked, {len(r['failures'])} FAILED")
+    for f in r["failures"]:
+        print(f"    FAIL   {f}")
+    if r["gbps"] is not None:
+        print(f"  batch    {r['gbps']} GB/s decoding a 67 MB batch, host round "
+              f"trip.")
+        print("           That includes PCIe in and out and is not the kernel's "
+              "own rate;")
+        print("           see docs/gpu-residency-handover.md for the resident "
+              "numbers.")
+    print(f"  verdict  {'OK' if r['ok'] else 'MISMATCH'}")
+    if not r["ok"]:
+        print("\n  Please open an issue with this block:")
+        print("  https://github.com/FanxinSun/lmz/issues")
+    return 0 if r["ok"] else 1
 
 
 # ------------------------------------------------------------------- the store
@@ -584,8 +699,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "own (default 64KiB; costs ~1 point of ratio)")
     c.add_argument("--align", action="store_true",
                    help="with --mapped, start every block on a 4KiB boundary")
-    c.add_argument("--shared-table", action="store_true",
-                   help="use one shared frequency table across chunks")
+    c.add_argument("--shared-tables", action="store_true",
+                   help="fit one rANS table per plane kind and carry it in the "
+                        "manifest instead of in every stream; writes a v7 "
+                        "archive older builds cannot read")
     c.add_argument("-f", "--force", action="store_true", help="overwrite output")
     common(c)
     c.set_defaults(func=cmd_compress)
@@ -595,6 +712,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap_.add_argument("input")
     ap_.add_argument("-l", "--level", type=int, default=api.DEFAULT_LEVEL)
     ap_.add_argument("--no-checksum", action="store_true")
+    ap_.add_argument("--no-dedup", action="store_true",
+                     help="skip duplicate-tensor detection against what is "
+                          "already there")
     ap_.add_argument("--no-delta", action="store_true",
                      help="skip delta coding against what is already there")
     common(ap_)
@@ -607,6 +727,41 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("-f", "--force", action="store_true", help="overwrite output")
     common(e)
     e.set_defaults(func=cmd_extract)
+
+    # -- complete artifact bundles ----------------------------------------
+    bundle = sub.add_parser("bundle", help="create, inspect and materialize a complete artifact")
+    bundle_sub = bundle.add_subparsers(dest="bundle_command", required=True)
+
+    bc = bundle_sub.add_parser("create", help="snapshot a source tree into a bundle")
+    bc.add_argument("input", help="regular-file source tree")
+    bc.add_argument("output", help="new .lmz archive")
+    bc.add_argument("--manifest", help="JSON bundle metadata and entry roles")
+    bc.add_argument("-l", "--level", type=int, default=api.DEFAULT_LEVEL)
+    bc.add_argument("--no-checksum", action="store_true")
+    bc.add_argument("--no-dedup", action="store_true")
+    bc.add_argument("--no-delta", action="store_true")
+    bc.add_argument("--mapped", action="store_true")
+    bc.add_argument("--align", action="store_true")
+    bc.add_argument("-f", "--force", action="store_true",
+                    help="replace the requested archive path")
+    bc.add_argument("--json", action="store_true")
+    common(bc)
+    bc.set_defaults(func=cmd_bundle_create)
+
+    bi = bundle_sub.add_parser("inventory", help="verify and print bundle inventory")
+    bi.add_argument("archive")
+    bi.add_argument("--expected-manifest-sha256")
+    bi.add_argument("--allow-invalid", action="store_true",
+                    help="return a structured invalid result instead of failing")
+    bi.add_argument("--json", action="store_true")
+    bi.set_defaults(func=cmd_bundle_inventory)
+
+    bm = bundle_sub.add_parser("materialize", help="safely materialize a verified bundle")
+    bm.add_argument("archive")
+    bm.add_argument("output")
+    bm.add_argument("--expected-manifest-sha256")
+    bm.add_argument("--json", action="store_true")
+    bm.set_defaults(func=cmd_bundle_materialize)
 
     d = sub.add_parser("decompress", aliases=["d", "x"], help="restore an archive")
     d.add_argument("input")
@@ -646,6 +801,9 @@ def build_parser() -> argparse.ArgumentParser:
     b.set_defaults(func=cmd_bench)
 
     doc = sub.add_parser("doctor", help="report the active backends")
+    doc.add_argument("--gpu-verify", action="store_true",
+                     help="decode every awkward shape on this GPU and check "
+                          "the CPU decoder agrees")
     doc.set_defaults(func=cmd_doctor)
 
     # -- the store ---------------------------------------------------------

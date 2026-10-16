@@ -1,0 +1,101 @@
+{
+ "target_tb": 45.0,
+ "built_at": "2026-09-04 11:15",
+ "families": 12,
+ "models": 236,
+ "total_bytes": 134737540040,
+ "rate_at_build_bps": 105295.08518490595,
+ "family_cap_bytes": 2250000000000.0,
+ "family_budget_bytes": 13646243039.963812,
+ "family_hours": 36.0,
+ "k_per_tier": {
+  "1": 50,
+  "2": 12,
+  "3": 3,
+  "4": 2
+ },
+ "closed_by": {
+  "distilbert/distilbert-base-uncased": "K",
+  "google-bert/bert-base-uncased": "T",
+  "google/vit-base-patch16-224-in21k": "T",
+  "FacebookAI/roberta-base": "T",
+  "FacebookAI/xlm-roberta-base": "probe",
+  "Qwen/Qwen3-0.6B": "T",
+  "Qwen/Qwen2.5-0.5B": "probe",
+  "BAAI/bge-base-en-v1.5": "T",
+  "google/gemma-3-1b-pt": "probe",
+  "microsoft/Florence-2-base-ft": "exhausted",
+  "Qwen/Qwen3.5-0.8B-Base": "exhausted",
+  "cmarkea/distilcamembert-base": "exhausted"
+ },
+ "time_limited": [
+  "BAAI/bge-base-en-v1.5",
+  "FacebookAI/roberta-base",
+  "FacebookAI/xlm-roberta-base",
+  "Qwen/Qwen2.5-0.5B",
+  "Qwen/Qwen3-0.6B",
+  "google-bert/bert-base-uncased",
+  "google/gemma-3-1b-pt",
+  "google/vit-base-patch16-224-in21k"
+ ],
+ "tiers_gb": [
+  2.0,
+  8.0,
+  32.0,
+  null
+ ],
+ "families_per_tier": {
+  "1": 12
+ },
+ "ordering": "fine-tunes per GB of base, descending; first family of each unseen (architecture, dtype) promoted; tiered by per-model ceiling, smallest tier first",
+ "sampled": {
+  "distilbert/distilbert-base-uncased": [
+   50,
+   96,
+   3986
+  ],
+  "google-bert/bert-base-uncased": [
+   30,
+   96,
+   3986
+  ],
+  "google/vit-base-patch16-224-in21k": [
+   38,
+   96,
+   2668
+  ],
+  "FacebookAI/roberta-base": [
+   26,
+   96,
+   2702
+  ],
+  "FacebookAI/xlm-roberta-base": [
+   11,
+   480,
+   3986
+  ],
+  "Qwen/Qwen3-0.6B": [
+   8,
+   192,
+   1801
+  ],
+  "Qwen/Qwen2.5-0.5B": [
+   12,
+   480,
+   1153
+  ],
+  "BAAI/bge-base-en-v1.5": [
+   30,
+   96,
+   481
+  ],
+  "google/gemma-3-1b-pt": [
+   5,
+   480,
+   488
+  ]
+ },
+ "notes": [
+  "plan materialised to a horizon of 12 families; re-run plan.py to extend it toward the 45 TB target"
+ ]
+}
