@@ -451,6 +451,34 @@ def test_rans_vector_path_writes_the_same_bytes():
             assert bytes(kernels.rans_decode(vector, n)) == data, f"{name}, n={n}"
 
 
+def test_rans_decode_many4_neon():
+    """Four independent rANS streams decoded in parallel with NEON vector rANS."""
+    if not kernels.have_rans():
+        return
+    sizes = (64, 512, 4088, 4096, 4097, 65536)
+    shapes = [
+        lambda n: weights_bf16(n // 2 + 1)[:n],
+        lambda n: rand(n, n + 3),
+        lambda n: bytes((i * 17) % 256 for i in range(n)),
+        lambda n: bytes(120 if i % 4 else (i & 0xFF) for i in range(n)),
+    ]
+    for n in sizes:
+        streams = [shapes[m](n) for m in range(4)]
+        # 1. Self-contained header streams
+        enc = [bytes(kernels.rans_encode(s)) for s in streams]
+        dec = kernels.rans_decode_many4(enc, n)
+        for m in range(4):
+            assert bytes(dec[m]) == streams[m], f"mismatch stream {m}, size {n}"
+
+        # 2. Shared frequency table streams
+        h0 = kernels.histogram(b"".join(streams))
+        f0 = kernels.rans_freqs(h0)
+        enc_shared = [bytes(kernels.rans_encode_shared(s, f0)) for s in streams]
+        dec_shared = kernels.rans_decode_many4(enc_shared, n, freqs=[f0] * 4)
+        for m in range(4):
+            assert bytes(dec_shared[m]) == streams[m], f"mismatch shared stream {m}, size {n}"
+
+
 def test_rans_accepts_a_precomputed_histogram():
     """Handing the coder counts it would otherwise take must change nothing.
 
@@ -770,6 +798,141 @@ def test_read_tensor_matches_original():
             raise AssertionError("missing tensor should raise")
         except KeyError:
             pass
+
+
+def test_chunk_table_is_buffer_backed():
+    """The table answers lookups from raw records, in order or not."""
+    from lmz.format import Chunk, ChunkTable, CorruptArchive
+
+    recs = [Chunk(100 + i, i * 10, 5, 10, 0, 0, 1, 0) for i in range(7)]
+    table = ChunkTable(b"".join(c.pack() for c in recs))
+    assert len(table) == 7 and table[3] == recs[3] and table[-1] == recs[-1]
+    assert list(table) == recs and table[2:5] == recs[2:5]
+    assert table.locate(0) == 0 and table.locate(69) == 6
+    assert table.range_indices(5, 25) == (0, 3)
+    assert table.range_indices(10, 20) == (1, 2)
+    assert table.range_indices(0, 0) == (0, 0)
+    table.check_coverage(70)
+    try:
+        table.locate(70)
+        raise AssertionError("an uncovered byte was located")
+    except CorruptArchive:
+        pass
+    shuffled = ChunkTable(b"".join(c.pack() for c in reversed(recs)))
+    assert shuffled.locate(35) == 3 and shuffled[3] == recs[3]
+    shuffled.check_coverage(70)
+    try:
+        ChunkTable(b"x" * 33)
+        raise AssertionError("a partial record was accepted")
+    except FormatError:
+        pass
+
+
+def test_tensor_blocks_addressing():
+    """Each tensor's block range is recorded and matches the chunk table."""
+    a = weights_bf16(300000, 81)
+    b = weights_bf16(200000, 83)
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "m.safetensors")
+        write_safetensors(path, [("a", "BF16", [300000], a),
+                                 ("b", "BF16", [200000], b)])
+        archive = os.path.join(d, "a.lmz")
+        lmz.compress(path, archive, mapped=True)
+        assert "blocks" in lmz.info(archive)["members"][0]["tensors"]["a"]
+        with lmz.MappedArchive(archive) as arc:
+            names = {t.name for t in arc.tensors()}
+            assert names == {"a", "b"}
+            for name, blob in (("a", a), ("b", b)):
+                tb = arc.tensor_blocks(name)
+                assert tb.size == len(blob) and tb.num_blocks == len(tb.chunks)
+                lo, hi = arc._chunks.range_indices(tb.offset, tb.offset + tb.size)
+                assert tb.blocks == (lo, hi)
+                raw = b"".join(arc._block(i) for i in range(lo, hi))
+                assert raw[tb.block_offset:tb.block_offset + tb.size] == blob
+        assert lmz.tensor_blocks(archive, "b").blocks[1] > 0
+        try:
+            lmz.tensor_blocks(archive, "missing")
+            raise AssertionError("missing tensor should raise")
+        except KeyError:
+            pass
+
+
+def test_shared_table_rans_kernels():
+    """rANS encoding and decoding against a shared global table."""
+    if not kernels.have_rans():
+        raise Skip("rANS coder not available")
+    src = bytes(0x3E + (i % 5) for i in range(10000))
+    counts = kernels.histogram(src)
+    freqs = kernels.rans_freqs(counts)
+    assert freqs is not None and sum(freqs) == 4096
+
+    hdr = kernels.rans_shared_header(freqs)
+    assert len(hdr) == 516 and hdr.startswith(b"R1\0\0")
+
+    coded = kernels.rans_encode_shared(src, freqs)
+    assert coded is not None and len(coded) < len(src)
+
+    decoded = kernels.rans_decode_shared(coded, len(src), freqs)
+    assert bytes(decoded) == src
+
+    # Prepended header decodes cleanly under ordinary rans_decode
+    assert bytes(kernels.rans_decode(hdr + coded, len(src))) == src
+
+    # Damaged stream should be caught
+    corrupt = bytearray(coded)
+    corrupt[len(corrupt) // 2] ^= 0xFF
+    try:
+        got = kernels.rans_decode_shared(bytes(corrupt), len(src), freqs)
+        assert bytes(got) != src, "corruption went undetected"
+    except (FormatError, ValueError):
+        pass
+
+
+def test_shared_table_archive_roundtrip():
+    """Archives with --shared-table store and reuse the global frequency table."""
+    if not kernels.have_rans():
+        raise Skip("rANS coder not available")
+    w1 = weights_bf16(200000, 11)
+    w2 = weights_bf16(200000, 23)
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "m.safetensors")
+        write_safetensors(path, [("w1", "BF16", [200000], w1),
+                                 ("w2", "BF16", [200000], w2)])
+        archive = os.path.join(d, "a.lmz")
+        stats = lmz.compress(path, archive, mapped=True, shared_table=True)
+        assert stats.detail.get("shared_table") is True
+
+        info = lmz.info(archive)
+        assert "shared_table" in info["manifest"]
+        st = bytes.fromhex(info["manifest"]["shared_table"])
+        assert len(st) == 516 and st.startswith(b"R1\0\0")
+
+        with open(archive, "rb") as fh:
+            reader = ArchiveReader(fh)
+            assert reader.shared_table == st
+            assert len(reader.shared_freqs) == 256
+            assert sum(reader.shared_freqs) == 4096
+            assert any(c.flags & lmzformat.FLAG_SHARED_TABLE for c in reader.chunks)
+
+        lmz.verify(archive)
+        out = os.path.join(d, "restored.safetensors")
+        lmz.decompress(archive, out)
+        assert digest(out) == digest(path)
+
+        with lmz.MappedArchive(archive) as arc:
+            assert arc.shared_table == st
+            assert arc.shared_freqs == reader.shared_freqs
+            assert arc.tensor("w1")[2] == w1
+            assert arc.tensor("w2")[2] == w2
+
+        # Appending to a shared-table archive preserves the table and decodes
+        w3 = weights_bf16(100000, 31)
+        path2 = os.path.join(d, "m2.safetensors")
+        write_safetensors(path2, [("w3", "BF16", [100000], w3)])
+        lmz.append(archive, path2)
+        lmz.verify(archive)
+        with lmz.MappedArchive(archive) as arc:
+            assert arc.tensor("w3", member="m2.safetensors")[2] == w3
 
 
 def test_options_are_honoured():
@@ -2234,6 +2397,39 @@ def test_gpu_decode_matches_cpu():
         assert bytes(kernels.rans_decode(bytes(streams[o:o + n]), plane)) == want
 
 
+def test_gpu_decode_shared_table():
+    """The GPU decoder accepts a shared frequency table across streams."""
+    from lmz import gpu
+
+    ok, why = gpu.available()
+    if not ok:
+        raise Skip(f"no GPU decoder: {why}")
+    if not kernels.have_rans():
+        raise Skip("building the streams needs the native coder")
+
+    nstr, plane = 64, 4096
+    assert plane % gpu.grain() == 0
+    plains, _s, _o = _gpu_streams(nstr, plane)
+
+    counts = kernels.histogram(plains[0])
+    freqs = kernels.rans_freqs(counts)
+    hdr = kernels.rans_shared_header(freqs)
+
+    sh_streams, sh_offsets = bytearray(), bytearray()
+    for buf in plains:
+        coded = kernels.rans_encode_shared(buf, freqs)
+        assert coded is not None
+        sh_offsets += struct.pack("<QQ", len(sh_streams), len(coded))
+        sh_streams += coded
+
+    out = gpu.decode_batch(sh_streams, bytes(sh_offsets), nstr, plane, header=hdr)
+    assert out is not None, f"decode_batch declined: {gpu.last_error()}"
+    assert len(out) == nstr * plane
+    for i, want in enumerate(plains):
+        got = bytes(out[i * plane:(i + 1) * plane])
+        assert got == want, f"stream {i} differs from plaintext in shared table decode"
+
+
 # Byte-value distributions the one benchmark workload never contained. Built
 # by translating uniform random bytes, which is a C-speed way to get an exact
 # shape -- a per-byte Python loop over a 32 KiB plane is not worth the seconds.
@@ -2321,7 +2517,7 @@ def test_gpu_refuses_a_device_that_disagrees_with_the_cpu():
         gpu._selftest = saved_test
         gpu._state, gpu._lib = "unloaded", None
         gpu.available()          # re-probe honestly for whatever runs next
-    assert gpu.backend().startswith("cuda:")
+    assert gpu.backend().startswith(("cuda:", "metal:"))
 
 
 def test_gpu_build_declines_hardware_it_cannot_target():

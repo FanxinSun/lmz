@@ -22,7 +22,7 @@ from math import log2
 from . import entropy, kernels
 from .format import (CODEC_BF16, CODEC_BF16C, CODEC_BLK, CODEC_DELTA,
                      CODEC_GBLK, CODEC_REF, CODEC_SPLIT, CODEC_STORED,
-                     CODEC_ZSTD, CorruptArchive)
+                     CODEC_ZSTD, FLAG_SHARED_TABLE, CorruptArchive)
 from .planner import (BLOCK_LAYOUTS, KIND_BF16, KIND_BLOCK, KIND_BYTES,
                       SUB_K4, SUBBLOCK_CTX)
 
@@ -913,7 +913,7 @@ def _decode_q80(payload, nblocks: int, out=None):
 
 def encode_chunk(data, esize: int, level: int = 1, checksum: bool = True,
                  method: int = -1, kind: int = KIND_BYTES, btype: int = -1,
-                 tally=None):
+                 tally=None, shared_freqs=None):
     """Encode one chunk.
 
     Returns (payload, codec, flags, crc). `payload` may be a list of buffers,
@@ -956,7 +956,7 @@ def encode_chunk(data, esize: int, level: int = 1, checksum: bool = True,
         nplanes, cid = 2, CODEC_BF16
         planes = kernels.split_bf16(data)
         nelem = n // 2
-        if nelem >= COND_MIN_ELEMS and kernels.have_rans():
+        if shared_freqs is None and nelem >= COND_MIN_ELEMS and kernels.have_rans():
             mv = memoryview(planes)
             sink = new_sink()
             cond = _encode_bf16_cond(mv[:nelem], mv[nelem:], nelem, level, method,
@@ -981,8 +981,16 @@ def encode_chunk(data, esize: int, level: int = 1, checksum: bool = True,
         any_compressed = False
         sink = new_sink()
         for k in range(nplanes):
-            used, payload = _encode_stream(mv[k * nelem:(k + 1) * nelem], level,
+            plane_bytes = mv[k * nelem:(k + 1) * nelem]
+            used, payload = _encode_stream(plane_bytes, level,
                                            method, plane=True, sink=sink)
+            if k == 0 and shared_freqs is not None and kernels.have_rans():
+                shared_payload = kernels.rans_encode_shared(plane_bytes, shared_freqs)
+                if shared_payload is not None:
+                    if used != entropy.METHOD_RANS or len(shared_payload) < len(payload):
+                        used = entropy.METHOD_RANS
+                        payload = shared_payload
+                        flags |= FLAG_SHARED_TABLE
             flags |= (used & 0x3) << (2 * k)
             lengths.append(len(payload))
             parts.append(payload)
@@ -1017,7 +1025,7 @@ _delta_hdr = struct.Struct("<QB")
 
 def encode_delta(data, base, esize: int, level: int = 1, checksum: bool = True,
                  kind: int = KIND_BYTES, btype: int = -1, src: int = 0,
-                 tally=None):
+                 tally=None, shared_freqs=None):
     """Code a chunk as its difference from an earlier output range.
 
     The checksum is of the original bytes, not the difference, so it verifies
@@ -1027,7 +1035,8 @@ def encode_delta(data, base, esize: int, level: int = 1, checksum: bool = True,
     crc = zlib.crc32(data) & 0xFFFFFFFF if checksum else 0
     diff = kernels.xor_bytes(data, base)
     parts, cid, flags, _ = encode_chunk(bytes(diff), esize, level, False,
-                                        kind=kind, btype=btype, tally=tally)
+                                        kind=kind, btype=btype, tally=tally,
+                                        shared_freqs=shared_freqs)
     return [_delta_hdr.pack(src, cid)] + list(parts), flags, crc
 
 
@@ -1043,14 +1052,14 @@ def delta_source(payload):
 
 
 def decode_delta(payload, esize: int, flags: int, rlen: int, base, crc: int = 0,
-                 verify: bool = True):
+                 verify: bool = True, shared_freqs=None):
     """Rebuild a delta chunk from its source bytes and its coded difference."""
     _src, inner, off = delta_source(payload)
     if len(base) != rlen:
         raise CorruptArchive(
             f"delta source resolved to {len(base)} bytes, expected {rlen}")
     diff = decode_chunk(memoryview(payload)[off:], inner, esize, flags, rlen,
-                        0, False)
+                        0, False, shared_freqs=shared_freqs)
     result = kernels.xor_bytes(base, diff)
     if verify and crc and (zlib.crc32(result) & 0xFFFFFFFF) != crc:
         raise CorruptArchive("chunk failed its checksum; the archive is corrupt")
@@ -1147,7 +1156,7 @@ def _decode_bf16c(payload, nelem: int, out=None):
 
 
 def decode_chunk(payload, codec: int, esize: int, flags: int, rlen: int,
-                 crc: int = 0, verify: bool = True, out=None):
+                 crc: int = 0, verify: bool = True, out=None, shared_freqs=None):
     """Decode one chunk back to its exact original bytes.
 
     `out` is an optional scratch buffer to decode into. Callers that hand one
@@ -1185,7 +1194,7 @@ def decode_chunk(payload, codec: int, esize: int, flags: int, rlen: int,
         # coded with zstd, a damaged payload, or no native build -- so error
         # reporting and the fallback backends are unchanged.
         fast = kernels.decode_planes(payload, nplanes, nelem, flags,
-                                     codec == CODEC_BF16, out)
+                                     codec == CODEC_BF16, out, shared_freqs=shared_freqs)
         if fast is not None:
             result = fast
             if verify and crc:
@@ -1209,6 +1218,14 @@ def decode_chunk(payload, codec: int, esize: int, flags: int, rlen: int,
                     raise ValueError(
                         f"plane {k} holds {ln} bytes, expected {nelem}")
                 planes.append((payload, pos))
+            elif k == 0 and (flags & FLAG_SHARED_TABLE):
+                if shared_freqs is None:
+                    raise CorruptArchive("chunk requires shared table but none in archive")
+                block = kernels.rans_decode_shared(mv[pos:pos + ln], nelem, shared_freqs)
+                if len(block) != nelem:
+                    raise CorruptArchive(
+                        f"plane {k} decoded to {len(block)} bytes, expected {nelem}")
+                planes.append((block, 0))
             else:
                 block = _decode_stream(mv[pos:pos + ln], m, f"plane {k}", nelem)
                 if len(block) != nelem:

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 import threading
 
 __all__ = ["available", "backend", "decode_batch", "grain", "header_bytes",
@@ -60,9 +61,13 @@ def _load():
             if not path:
                 _state = "unavailable"
                 if _build.find_compiler() is None:
-                    _why = "no nvcc (a CUDA toolkit is needed once, to build)"
+                    if sys.platform == "darwin":
+                        _why = "no clang (Xcode command line tools are needed once, to build)"
+                    else:
+                        _why = "no nvcc (a CUDA toolkit is needed once, to build)"
                 else:
-                    _why = "the CUDA decoder did not build"
+                    target_name = "Metal" if sys.platform == "darwin" else "CUDA"
+                    _why = f"the {target_name} decoder did not build"
                     if _build.last_error:
                         _why += f" ({_build.last_error})"
                 return None
@@ -70,7 +75,7 @@ def _load():
             v, c_int, c_uint = ctypes.c_void_p, ctypes.c_int, ctypes.c_uint
             lib.lmz_gpu_abi_version.restype = c_int
             if lib.lmz_gpu_abi_version() != ABI_VERSION:
-                _state, _why = "abi-mismatch", "the built CUDA decoder is from another source"
+                _state, _why = "abi-mismatch", "the built GPU decoder is from another source"
                 return None
             for name in ("lmz_gpu_grain", "lmz_gpu_header_bytes", "lmz_gpu_pad_bytes"):
                 getattr(lib, name).restype = c_int
@@ -89,16 +94,18 @@ def _load():
             if lib.lmz_gpu_device_name(name, 256) != OK:
                 # Built, but there is no device to run it on: a build host, or
                 # a container with the toolkit and no card passed through.
-                _state, _why = "unavailable", "nvcc is present but no CUDA device is"
+                dev_tool = "Metal" if sys.platform == "darwin" else "CUDA"
+                _state, _why = "unavailable", f"compiler is present but no {dev_tool} device is"
                 return None
             device = name.value.decode()
+            prefix = "metal:" if sys.platform == "darwin" or "Metal" in device else "cuda:"
             if not _selftest(lib):
                 _state = "unavailable"
-                _why = (f"the CUDA decoder did not reproduce the CPU decoder's "
+                _why = (f"the {prefix[:-1].upper()} decoder did not reproduce the CPU decoder's "
                         f"bytes on {device}; staying on the CPU")
                 return None
             _lib = lib
-            _state = "cuda:" + device
+            _state = prefix + device
             _why = ""
         except Exception as exc:
             _lib = None

@@ -24,9 +24,12 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SOURCE = os.path.join(HERE, "lmzgpu.cu")
+SOURCE_CUDA = os.path.join(HERE, "lmzgpu.cu")
+SOURCE_METAL = os.path.join(HERE, "lmzgpu_metal.m")
+SOURCE_SHADER = os.path.join(HERE, "lmz_rans.metal")
+SOURCE = SOURCE_CUDA
 
-_SUFFIX = ".dll" if os.name == "nt" else ".so"
+_SUFFIX = ".dylib" if sys.platform == "darwin" else (".dll" if os.name == "nt" else ".so")
 
 # Why the last build attempt failed, quoted by `lmz doctor`. A build that
 # never ran leaves this empty.
@@ -136,8 +139,18 @@ def find_compilers() -> list[str]:
     return sorted(cands, key=_nvcc_version, reverse=True)
 
 
+def find_c_compiler() -> str | None:
+    for name in filter(None, [os.environ.get("CC"), "clang", "cc", "gcc"]):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
 def find_compiler() -> str | None:
-    """The nvcc that would be tried first, or None if there is none."""
+    """The compiler that would be tried first, or None if there is none."""
+    if sys.platform == "darwin" and platform.machine() == "arm64":
+        return find_c_compiler()
     c = find_compilers()
     return c[0] if c else None
 
@@ -150,8 +163,19 @@ def _source_tag() -> str:
     installed package between two x86_64 boxes with different GPUs would reuse
     a library that cannot launch.
     """
+    if sys.platform == "darwin" and platform.machine() == "arm64":
+        try:
+            h = hashlib.sha256()
+            for path in (SOURCE_METAL, SOURCE_SHADER):
+                if os.path.exists(path):
+                    with open(path, "rb") as fh:
+                        h.update(fh.read())
+            digest = h.hexdigest()[:12]
+        except OSError:
+            digest = "nosrc"
+        return f"{platform.machine()}-metal-{digest}"
     try:
-        with open(SOURCE, "rb") as fh:
+        with open(SOURCE_CUDA, "rb") as fh:
             digest = hashlib.sha256(fh.read()).hexdigest()[:12]
     except OSError:
         digest = "nosrc"
@@ -163,30 +187,66 @@ def library_path() -> str:
 
 
 def build(force: bool = False, verbose: bool = False) -> str | None:
-    """Build the CUDA decoder if needed and return its path, or None.
+    """Build the GPU decoder if needed and return its path, or None.
 
-    Never raises: no nvcc, no device and a failed compile are all ordinary.
+    Never raises: no nvcc/clang, no device and a failed compile are all ordinary.
     """
     out = library_path()
     if os.path.exists(out) and not force:
         return out
-    if not os.path.exists(SOURCE):
-        return None
 
     global last_error
     # The card is checked before the compiler, because no toolkit rescues a
     # device this kernel cannot target and the answer should say so.
     cc = _device_cc()
+    if cc is not None and cc < _ARCH_FLOOR:
+        last_error = (f"compute capability {cc[0]}.{cc[1]} is below the "
+                      f"{_ARCH_FLOOR[0]}.{_ARCH_FLOOR[1]} this kernel needs")
+        if verbose:
+            print(f"lmz: {last_error}; the decoder stays on the CPU", file=sys.stderr)
+        return None
+
+    if sys.platform == "darwin" and platform.machine() == "arm64":
+        if not os.path.exists(SOURCE_METAL):
+            return None
+        c_comp = find_c_compiler()
+        if not c_comp:
+            last_error = "no clang/C compiler found for Metal"
+            if verbose:
+                print(f"lmz: {last_error}; the decoder stays on the CPU", file=sys.stderr)
+            return None
+        flags = ["-O3", "-fPIC", "-shared", "-framework", "Metal", "-framework", "Foundation"]
+        fd, tmp = tempfile.mkstemp(dir=HERE, suffix=_SUFFIX)
+        os.close(fd)
+        cmd = [c_comp, *flags, "-o", tmp, SOURCE_METAL]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if proc.returncode == 0:
+                os.replace(tmp, out)
+                last_error = ""
+                if verbose:
+                    print(f"lmz: built {os.path.basename(out)} with {c_comp}", file=sys.stderr)
+                return out
+            last_error = (proc.stderr.strip().splitlines() or ["clang failed"])[-1]
+            if verbose:
+                print(f"lmz: {c_comp} failed:\n{proc.stderr}", file=sys.stderr)
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if verbose:
+                print(f"lmz: {c_comp} failed: {exc}", file=sys.stderr)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return None
+
+    if not os.path.exists(SOURCE_CUDA):
+        return None
+
     if cc is None and shutil.which("nvidia-smi") is None:
         # nvcc without a driver is a build host. Say so before spending a
         # multi-architecture compile on a machine that has nothing to run it.
         last_error = "no NVIDIA driver found (nvidia-smi is not on PATH)"
-        if verbose:
-            print(f"lmz: {last_error}; the decoder stays on the CPU", file=sys.stderr)
-        return None
-    if cc is not None and cc < _ARCH_FLOOR:
-        last_error = (f"compute capability {cc[0]}.{cc[1]} is below the "
-                      f"{_ARCH_FLOOR[0]}.{_ARCH_FLOOR[1]} this kernel needs")
         if verbose:
             print(f"lmz: {last_error}; the decoder stays on the CPU", file=sys.stderr)
         return None

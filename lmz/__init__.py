@@ -29,12 +29,14 @@ __version__ = "1.1.0"
 from .api import (DEFAULT_CHUNK_SIZE, DEFAULT_LEVEL, Stats, backends, compress,
                   decompress, info, read_tensor, verify)
 from .api import MappedArchive, append, extract  # noqa: F401
+from .api import TensorBlocks, tensor_blocks  # noqa: F401
 from .format import FormatError
 from .lmzfs import LmzFS  # noqa: F401
 from .store import Store, mount  # noqa: F401
 
 __all__ = [
     "compress", "decompress", "verify", "info", "read_tensor", "backends",
+    "tensor_blocks", "TensorBlocks",
     "MappedArchive", "append", "extract", "Store", "mount", "LmzFS",
     "Stats", "FormatError", "DEFAULT_LEVEL", "DEFAULT_CHUNK_SIZE", "__version__",
 ]

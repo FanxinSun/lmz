@@ -34,10 +34,10 @@ TAIL = b"LMZTAIL\x01"
 # quantisation rather than one; v5 adds a field mode that codes a k-quant's
 # quants per sub-block class, described in the payload alongside the rest;
 # v6 adds delta chunks, which name an earlier output range the way a ref does
-# and carry the coded difference from it. Earlier archives contain none of the
-# newer codecs, so this build reads every version listed.
-FORMAT_VERSION = 6
-READABLE_VERSIONS = (1, 2, 3, 4, 5, 6)
+# and carry the coded difference from it; v7 adds shared frequency tables across chunks.
+# Earlier archives contain none of the newer codecs, so this build reads every version listed.
+FORMAT_VERSION = 7
+READABLE_VERSIONS = (1, 2, 3, 4, 5, 6, 7)
 
 HEADER = struct.Struct("<4sHHQQQ")  # magic, version, flags, original_size, 2x reserved
 HEADER_SIZE = 32
@@ -51,6 +51,9 @@ assert FOOTER.size == FOOTER_SIZE
 RECORD = struct.Struct("<QQIIIBBH")
 RECORD_SIZE = 32
 assert RECORD.size == RECORD_SIZE
+
+_DST_STRUCT = struct.Struct("<Q")
+_SPAN_STRUCT = struct.Struct("<QQII")
 
 CODEC_STORED = 0  # payload is the raw bytes
 CODEC_ZSTD = 1  # payload is one entropy-coded stream
@@ -68,6 +71,9 @@ CODEC_DELTA = 8  # payload names an earlier output range plus a coded difference
 # random access will be cheap before it starts.
 FLAG_PAGE_MAPPED = 1 << 0  # blocks are small enough to decode one at a time
 FLAG_ALIGNED = 1 << 1  # payloads start on PAGE_ALIGN boundaries
+
+# Chunk flags (RECORD.flags, uint16). Lower bits 0..7 are used for 2-bit plane methods.
+FLAG_SHARED_TABLE = 1 << 8  # plane 0 was encoded against the shared frequency table
 
 # What a page-mapped archive aligns to, when it aligns at all. Storage below
 # this is indivisible: filesystems allocate whole 4 KiB blocks and flash reads
@@ -98,6 +104,155 @@ class Chunk:
     def pack(self) -> bytes:
         return RECORD.pack(self.off, self.dst, self.clen, self.rlen, self.crc,
                            self.codec, self.esize, self.flags)
+
+
+class ChunkTable:
+    """The archive's chunk directory, kept as its raw 32-byte records.
+
+    A 70B model in 64 KiB blocks has 2.1 million chunks. Unpacking that into
+    Python `Chunk` instances and a parallel offset list costs ~305 bytes per
+    record (~0.6 GiB of heap) and ~11 seconds before the first byte is read.
+    Keeping the decompressed table buffer intact and binary-searching `dst`
+    in place makes opening an archive O(1) in chunk count and unpacks a
+    `Chunk` only for the blocks a read actually touches.
+    """
+
+    __slots__ = ("_buf", "_n", "_sorted_checked")
+
+    def __init__(self, buf: bytes | bytearray | memoryview = b""):
+        if len(buf) % RECORD_SIZE:
+            raise FormatError("chunk table has a partial record")
+        self._buf = bytes(buf)
+        self._n = len(self._buf) // RECORD_SIZE
+        self._sorted_checked = False
+
+    @classmethod
+    def from_chunks(cls, chunks) -> "ChunkTable":
+        if isinstance(chunks, ChunkTable):
+            return chunks
+        return cls(b"".join(c.pack() for c in chunks))
+
+    def to_bytes(self) -> bytes:
+        return self._buf
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __bool__(self) -> bool:
+        return self._n > 0
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            return [Chunk(*RECORD.unpack_from(self._buf, i * RECORD_SIZE))
+                    for i in range(*idx.indices(self._n))]
+        i = int(idx)
+        if i < 0:
+            i += self._n
+        if not 0 <= i < self._n:
+            raise IndexError("chunk index out of range")
+        return Chunk(*RECORD.unpack_from(self._buf, i * RECORD_SIZE))
+
+    def __iter__(self):
+        for rec in RECORD.iter_unpack(self._buf):
+            yield Chunk(*rec)
+
+    def __eq__(self, other):
+        if isinstance(other, ChunkTable):
+            return self._buf == other._buf
+        if isinstance(other, list):
+            return list(self) == other
+        return NotImplemented
+
+    def _ensure_sorted(self) -> None:
+        if self._sorted_checked:
+            return
+        n = self._n
+        buf = self._buf
+        if n > 1:
+            prev = -1
+            ordered = True
+            for i in range(n):
+                (d,) = _DST_STRUCT.unpack_from(buf, i * RECORD_SIZE + 8)
+                if d < prev:
+                    ordered = False
+                    break
+                prev = d
+            if not ordered:
+                mv = memoryview(buf)
+                recs = [bytes(mv[i * RECORD_SIZE:(i + 1) * RECORD_SIZE])
+                        for i in range(n)]
+                recs.sort(key=lambda r: _DST_STRUCT.unpack_from(r, 8)[0])
+                self._buf = b"".join(recs)
+        self._sorted_checked = True
+
+    def span_of(self, i: int) -> tuple[int, int]:
+        """(dst, rlen) of record `i`, without allocating a Chunk."""
+        if i < 0:
+            i += self._n
+        if not 0 <= i < self._n:
+            raise IndexError("chunk index out of range")
+        _, dst, _, rlen = _SPAN_STRUCT.unpack_from(self._buf, i * RECORD_SIZE)
+        return dst, rlen
+
+    def locate(self, pos: int) -> int:
+        """Index of the chunk covering output byte `pos`."""
+        lo, hi = 0, self._n
+        buf = self._buf
+        while lo < hi:
+            mid = (lo + hi) >> 1
+            (d,) = _DST_STRUCT.unpack_from(buf, mid * RECORD_SIZE + 8)
+            if d <= pos:
+                lo = mid + 1
+            else:
+                hi = mid
+        i = lo - 1
+        if 0 <= i < self._n:
+            _, dst, _, rlen = _SPAN_STRUCT.unpack_from(buf, i * RECORD_SIZE)
+            if dst <= pos < dst + rlen:
+                return i
+        if not self._sorted_checked:
+            self._ensure_sorted()
+            return self.locate(pos)
+        raise CorruptArchive(f"byte {pos} is not covered by any chunk")
+
+    def range_indices(self, start: int, end: int) -> tuple[int, int]:
+        """Half-open chunk index range `[lo, hi)` covering `[start, end)`."""
+        if start >= end or self._n == 0:
+            return 0, 0
+        first = self.locate(start)
+        last = first if end - 1 < sum(self.span_of(first)) else self.locate(end - 1)
+        return first, last + 1
+
+    def max_rlen(self) -> int:
+        return max((rec[3] for rec in RECORD.iter_unpack(self._buf)), default=0)
+
+    def total_rlen(self) -> int:
+        return sum(rec[3] for rec in RECORD.iter_unpack(self._buf))
+
+    def payload_bytes(self) -> int:
+        return sum(rec[2] for rec in RECORD.iter_unpack(self._buf))
+
+    def min_off(self, default: int = 0) -> int:
+        return min((rec[0] for rec in RECORD.iter_unpack(self._buf)), default=default)
+
+    def coded_ranges(self) -> list[tuple[int, int]]:
+        """Output `(start, end)` spans of ref and delta chunks."""
+        return [(dst, dst + rlen)
+                for _, dst, _, rlen, _, codec, _, _ in RECORD.iter_unpack(self._buf)
+                if codec in (CODEC_DELTA, CODEC_REF)]
+
+    def check_coverage(self, total: int) -> None:
+        """Confirm the chunks tile `[0, total)` with no gap or overlap."""
+        self._ensure_sorted()
+        pos = 0
+        for _, dst, _, rlen, _, _, _, _ in RECORD.iter_unpack(self._buf):
+            if dst != pos:
+                raise FormatError(
+                    f"archive does not cover its output: gap or overlap at byte {pos}")
+            pos += rlen
+        if pos != total:
+            raise FormatError(
+                f"archive covers {pos} bytes but declares {total}")
 
 
 @dataclass(slots=True)
@@ -142,7 +297,7 @@ class ArchiveWriter:
     """Streams chunk payloads out, then writes the table, manifest and footer."""
 
     def __init__(self, fileobj, manifest: dict, flags: int = 0, align: int = 0,
-                 resume_at: int | None = None, chunks: list | None = None):
+                 resume_at: int | None = None, chunks=None):
         """Start a new archive, or carry on writing an existing one.
 
         `resume_at` is where the old chunk table began: everything from there
@@ -152,7 +307,12 @@ class ArchiveWriter:
         """
         self.f = fileobj
         self.manifest = manifest
-        self.chunks: list[Chunk] = list(chunks or ())
+        if chunks is None:
+            self._table = bytearray()
+        elif isinstance(chunks, ChunkTable):
+            self._table = bytearray(chunks.to_bytes())
+        else:
+            self._table = bytearray(b"".join(c.pack() for c in chunks))
         self.flags = flags
         self.align = align
         self.padding = 0
@@ -162,6 +322,10 @@ class ArchiveWriter:
         else:
             self.offset = resume_at
             self.f.seek(resume_at)
+
+    @property
+    def chunks(self) -> ChunkTable:
+        return ChunkTable(self._table)
 
     def append(self, parts, dst: int, rlen: int, crc: int,
                codec: int, esize: int, flags: int) -> None:
@@ -179,18 +343,18 @@ class ArchiveWriter:
         for part in parts:
             self.f.write(part)
             clen += len(part)
-        self.chunks.append(Chunk(self.offset, dst, clen, rlen, crc,
-                                 codec, esize, flags))
+        self._table += RECORD.pack(self.offset, dst, clen, rlen, crc,
+                                   codec, esize, flags)
         self.offset += clen
 
     def close(self, original_size: int) -> None:
-        table = b"".join(c.pack() for c in self.chunks)
+        table = bytes(self._table)
         table_c = _zstd_compress(table, 3)
         table_off = self.offset
         self.f.write(table_c)
         self.offset += len(table_c)
 
-        self.manifest["chunks"] = len(self.chunks)
+        self.manifest["chunks"] = len(table) // RECORD_SIZE
         self.manifest["table_raw_len"] = len(table)
         man = json.dumps(self.manifest, separators=(",", ":")).encode()
         man_c = _zstd_compress(man, 3)
@@ -248,16 +412,14 @@ class ArchiveReader:
         self.manifest = json.loads(_zstd_decompress(self.f.read(man_clen)))
         self.f.seek(table_off)
         table = _zstd_decompress(self.f.read(table_clen))
-        if len(table) % RECORD_SIZE:
-            raise FormatError("chunk table has a partial record")
-        self.chunks = [Chunk(*rec) for rec in RECORD.iter_unpack(table)]
+        self.chunks = ChunkTable(table)
 
         self.members = [Member.from_json(m) for m in self.manifest.get("members", [])]
 
     @property
     def payload_end(self) -> int:
         """First byte after the chunk payloads."""
-        return min((c.off for c in self.chunks), default=self.file_size)
+        return self.chunks.min_off(default=self.file_size)
 
     @property
     def page_mapped(self) -> bool:
@@ -267,3 +429,22 @@ class ArchiveReader:
     @property
     def aligned(self) -> bool:
         return bool(self.flags & FLAG_ALIGNED)
+
+    @property
+    def shared_table(self) -> bytes | None:
+        """The 516-byte shared frequency header, or None."""
+        val = self.manifest.get("shared_table")
+        if not val:
+            return None
+        b = bytes.fromhex(val)
+        if len(b) != 516 or b[:2] != b"R1":
+            raise FormatError("invalid shared_table in manifest")
+        return b
+
+    @property
+    def shared_freqs(self) -> list[int] | None:
+        """The 256 uint16 frequencies of the shared table, or None."""
+        tbl = self.shared_table
+        if tbl is None:
+            return None
+        return list(struct.unpack("<256H", tbl[4:]))

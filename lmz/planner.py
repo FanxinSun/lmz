@@ -617,6 +617,7 @@ def chunkify(layout: Layout, size: int, chunk_size: int, refs=None,
         sourced = r.kind in (KIND_REF, KIND_DELTA)
         joins = (prev is not None and prev.end == r.start and prev.kind == r.kind
                  and prev.btype == r.btype and prev.ikind == r.ikind
+                 and prev.length < chunk_size and r.length < chunk_size
                  and (prev.src + prev.length == r.src if sourced else True)
                  and (prev.esize == r.esize or r.kind == KIND_REF))
         if joins:

@@ -48,7 +48,7 @@ def _load_native():
                 return None
             lib = ctypes.CDLL(path)
             lib.lmz_abi_version.restype = ctypes.c_int
-            if lib.lmz_abi_version() != 11:
+            if lib.lmz_abi_version() != 12:
                 _state = "abi-mismatch"
                 return None
             lib.lmz_isa.restype = ctypes.c_char_p
@@ -86,7 +86,7 @@ def _load_native():
             lib.lmz_decode_planes.restype = ctypes.c_int
             lib.lmz_decode_planes.argtypes = [
                 v, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
-                ctypes.c_uint32, ctypes.c_int, v, v, ctypes.c_size_t]
+                ctypes.c_uint32, ctypes.c_int, v, v, ctypes.c_size_t, v]
             lib.lmz_xor.restype = ctypes.c_int
             lib.lmz_xor.argtypes = [v, v, ctypes.c_size_t, v]
             lib.lmz_k4_scales.restype = ctypes.c_int
@@ -107,8 +107,22 @@ def _load_native():
             lib.lmz_rans_encode_portable.restype = ctypes.c_long
             lib.lmz_rans_encode_portable.argtypes = [v, ctypes.c_size_t, v,
                                                      ctypes.c_size_t, v]
+            lib.lmz_rans_encode_shared.restype = ctypes.c_long
+            lib.lmz_rans_encode_shared.argtypes = [v, ctypes.c_size_t, v,
+                                                   ctypes.c_size_t, v]
             lib.lmz_rans_decode.restype = ctypes.c_int
             lib.lmz_rans_decode.argtypes = [v, ctypes.c_size_t, v, ctypes.c_size_t]
+            lib.lmz_rans_decode_shared.restype = ctypes.c_int
+            lib.lmz_rans_decode_shared.argtypes = [v, ctypes.c_size_t, v,
+                                                   ctypes.c_size_t, v]
+            lib.lmz_rans_decode_many4.restype = ctypes.c_int
+            lib.lmz_rans_decode_many4.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
             _lib = lib
             _state = "native:" + lib.lmz_isa().decode()
         except Exception:
@@ -161,6 +175,22 @@ def _counts_arg(hist):
     if len(hist) != 256:
         raise ValueError(f"a histogram has 256 entries, not {len(hist)}")
     return (ctypes.c_uint64 * 256)(*hist)
+
+
+def _freqs_arg(freqs):
+    """A `const uint16_t *` for a 256-entry frequency table, or NULL for None."""
+    if freqs is None:
+        return None
+    if isinstance(freqs, (bytes, bytearray, memoryview)):
+        b = bytes(freqs)
+        if len(b) == 516 and b[:2] == b"R1":
+            b = b[4:]
+        if len(b) != 512:
+            raise ValueError(f"frequencies buffer must be 512 or 516 bytes, not {len(b)}")
+        return (ctypes.c_uint16 * 256).from_buffer_copy(b)
+    if len(freqs) != 256:
+        raise ValueError(f"a frequency table has 256 entries, not {len(freqs)}")
+    return (ctypes.c_uint16 * 256)(*freqs)
 
 
 # Element sizes above 2 need a working area as large as the chunk. Reusing it
@@ -573,7 +603,7 @@ def _planes_buf(nbytes: int):
 
 
 def decode_planes(payload, nplanes: int, nelem: int, methods: int,
-                  bf16: bool, out=None):
+                  bf16: bool, out=None, shared_freqs=None):
     """Decode and merge every plane of a split chunk in one native call.
 
     Returns a memoryview of the merged bytes, or None when the kernel will not
@@ -596,8 +626,10 @@ def decode_planes(payload, nplanes: int, nelem: int, methods: int,
     pa, _a = _ptr(payload)
     da, _b = _ptr(dst)
     sa, _c = _ptr(scr)
+    fa = _freqs_arg(shared_freqs)
+    fa_ptr = ctypes.byref(fa) if fa is not None else None
     rc = lib.lmz_decode_planes(pa, len(payload), nplanes, nelem, methods,
-                               1 if bf16 else 0, da, sa, need)
+                               1 if bf16 else 0, da, sa, need, fa_ptr)
     return memoryview(dst)[:n] if rc == 0 else None
 
 
@@ -867,6 +899,111 @@ def rans_decode(payload, n: int, out=None):
     if lib.lmz_rans_decode(src_addr, len(payload), dst_addr, n) != 0:
         raise ValueError("malformed rANS stream")
     return memoryview(dst)[:n]
+
+
+def rans_shared_header(freqs) -> bytes:
+    """Build the 516-byte shared header from a 256-entry frequency table."""
+    if isinstance(freqs, (bytes, bytearray, memoryview)):
+        b = bytes(freqs)
+        if len(b) == 516 and b[:2] == b"R1":
+            return b
+        if len(b) == 512:
+            return b"R1\x00\x00" + b
+    if len(freqs) != 256:
+        raise ValueError(f"a frequency table has 256 entries, not {len(freqs)}")
+    import struct
+    return b"R1\x00\x00" + struct.pack("<256H", *freqs)
+
+
+def rans_encode_shared(src, freqs) -> bytes | None:
+    """Order-0 rANS encode with a shared frequency table (no 516-byte header)."""
+    lib = _load_native()
+    if lib is None or len(src) == 0:
+        return None
+    n = len(src)
+    cap = lib.lmz_rans_bound(n)
+    buf = getattr(_rans_scratch, "buf", None)
+    if buf is None or len(buf) < cap:
+        buf = _rans_scratch.buf = bytearray(cap)
+    src_addr, _a = _ptr(src)
+    dst_addr, _b = _ptr(buf)
+    fa = _freqs_arg(freqs)
+    if fa is None:
+        return None
+    written = lib.lmz_rans_encode_shared(src_addr, n, dst_addr, cap, ctypes.byref(fa))
+    if written < 0:
+        return None
+    return bytes(memoryview(buf)[:written])
+
+
+def rans_decode_shared(payload, n: int, freqs, out=None):
+    """Decode a shared-table rANS stream (states directly followed by coded bytes)."""
+    lib = _load_native()
+    if lib is None:
+        raise RuntimeError(
+            "this archive uses lmz's rANS coder, which needs the native kernel; "
+            "a C compiler (cc/gcc/clang) is required to build it")
+    dst = out if (out is not None and len(out) >= n) else bytearray(n)
+    if n == 0:
+        return memoryview(dst)[:0]
+    src_addr, _a = _ptr(payload)
+    dst_addr, _b = _ptr(dst)
+    fa = _freqs_arg(freqs)
+    if fa is None:
+        raise ValueError("shared frequency table required")
+    if lib.lmz_rans_decode_shared(src_addr, len(payload), dst_addr, n, ctypes.byref(fa)) != 0:
+        raise ValueError("malformed rANS stream")
+    return memoryview(dst)[:n]
+
+
+def rans_decode_many4(payloads, n: int, freqs=None, outs=None):
+    """Decode four independent rANS streams in parallel.
+
+    Uses NEON 4-way vector kernel on ARM64 when available.
+    """
+    if len(payloads) != 4:
+        raise ValueError("rans_decode_many4 requires exactly 4 payloads")
+    lib = _load_native()
+    if lib is None or not hasattr(lib, "lmz_rans_decode_many4"):
+        if freqs is not None:
+            return [rans_decode_shared(payloads[m], n, freqs[m], None if outs is None else outs[m]) for m in range(4)]
+        return [rans_decode(payloads[m], n, None if outs is None else outs[m]) for m in range(4)]
+
+    dsts = [
+        outs[m] if (outs is not None and len(outs[m]) >= n) else bytearray(n)
+        for m in range(4)
+    ]
+    if n == 0:
+        return [memoryview(d)[:0] for d in dsts]
+
+    src_addrs = (ctypes.c_void_p * 4)()
+    slens = (ctypes.c_size_t * 4)()
+    dst_addrs = (ctypes.c_void_p * 4)()
+    keeps = []
+
+    for m in range(4):
+        s_addr, k1 = _ptr(payloads[m])
+        d_addr, k2 = _ptr(dsts[m])
+        src_addrs[m] = ctypes.cast(s_addr, ctypes.c_void_p).value
+        slens[m] = len(payloads[m])
+        dst_addrs[m] = ctypes.cast(d_addr, ctypes.c_void_p).value
+        keeps.extend([k1, k2])
+
+    freq_ptrs = None
+    if freqs is not None:
+        f_arr = (ctypes.c_void_p * 4)()
+        for m in range(4):
+            if freqs[m] is not None:
+                fa = _freqs_arg(freqs[m])
+                f_arr[m] = ctypes.cast(ctypes.byref(fa), ctypes.c_void_p).value
+                keeps.append(fa)
+            else:
+                f_arr[m] = None
+        freq_ptrs = f_arr
+
+    if lib.lmz_rans_decode_many4(src_addrs, slens, dst_addrs, n, freq_ptrs) != 0:
+        raise ValueError("malformed rANS stream in rans_decode_many4")
+    return [memoryview(d)[:n] for d in dsts]
 
 
 def histogram(buf) -> list[int]:

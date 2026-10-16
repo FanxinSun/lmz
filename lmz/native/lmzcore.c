@@ -51,6 +51,7 @@
 #if LMZ_NEON && (defined(__aarch64__) || defined(LMZ_FORCE_NEON)) \
     && !defined(__ARM_BIG_ENDIAN)
 #define LMZ_NEON_ENC 1
+#define LMZ_NEON_DEC 1
 #endif
 
 #define LMZ_API __attribute__((visibility("default")))
@@ -219,7 +220,7 @@ LMZ_API const char *lmz_isa(void)
 #endif
 }
 
-LMZ_API int lmz_abi_version(void) { return 11; }
+LMZ_API int lmz_abi_version(void) { return 12; }
 
 /*
  * out = a ^ b, the whole of a delta chunk's arithmetic.
@@ -1316,33 +1317,34 @@ static uint8_t *rans_enc_body_neon(const uint8_t *src, size_t n, uint8_t *end,
  * actually takes -- a stale slice, the wrong segment -- so they are rejected
  * and the histogram is taken here instead.
  */
-static long rans_encode_impl(const uint8_t *src, size_t n, uint8_t *dst,
-                             size_t cap, const uint64_t *counts, int allow_simd)
+static long rans_encode_core(const uint8_t *src, size_t n, uint8_t *dst,
+                             size_t cap, const uint16_t *freqs,
+                             int allow_simd, int write_header)
 {
     if (n == 0) return -1;
-    if (cap < lmz_rans_bound(n)) return -1;
+    size_t needed_cap = 2 * n + 4 * RANS_STREAMS + 64;
+    if (write_header) needed_cap += RANS_HEADER;
+    if (cap < needed_cap) return -1;
 
-    uint64_t own[256];
-    if (counts) {
-        uint64_t total = 0;
-        for (int s = 0; s < 256; s++) total += counts[s];
-        if (total != n) counts = NULL;
-    }
-    if (!counts) {
-        lmz_hist(src, n, own);
-        counts = own;
-    }
-    uint16_t freqs[256];
-    if (rans_normalize(counts, freqs) != 0) return -1;
-
+    uint32_t sum = 0, start = 0, maxf = 0;
     RansEncSym syms[256];
-    uint32_t start = 0, maxf = 0;
     for (int s = 0; s < 256; s++) {
-        if (freqs[s]) {
-            rans_enc_sym_init(&syms[s], start, freqs[s]);
-            if (freqs[s] > maxf) maxf = freqs[s];
-            start += freqs[s];
+        uint32_t f = freqs[s];
+        sum += f;
+        if (f) {
+            rans_enc_sym_init(&syms[s], start, f);
+            if (f > maxf) maxf = f;
+            start += f;
+        } else {
+            syms[s].freq = 0;
+            syms[s].bias = 0;
+            syms[s].cmpl_freq = 0;
         }
+    }
+    if (sum != RANS_PROB_SCALE) return -1;
+
+    for (size_t i = 0; i < n; i++) {
+        if (!syms[src[i]].freq) return -1;
     }
 
     /* rANS is last-in-first-out, so encoding runs backwards from the end of
@@ -1367,19 +1369,46 @@ static long rans_encode_impl(const uint8_t *src, size_t n, uint8_t *dst,
     }
 
     size_t coded = (size_t)(end - ptr);
-    size_t total = RANS_HEADER + coded;
-    if (total > cap) return -1;
-
-    dst[0] = RANS_MAGIC0;
-    dst[1] = RANS_MAGIC1;
-    dst[2] = 0;
-    dst[3] = 0;
-    for (int s = 0; s < 256; s++) {
-        dst[4 + 2 * s] = (uint8_t)(freqs[s] & 0xff);
-        dst[5 + 2 * s] = (uint8_t)(freqs[s] >> 8);
+    if (write_header) {
+        size_t total = RANS_HEADER + coded;
+        if (total > cap) return -1;
+        dst[0] = RANS_MAGIC0;
+        dst[1] = RANS_MAGIC1;
+        dst[2] = 0;
+        dst[3] = 0;
+        for (int s = 0; s < 256; s++) {
+            dst[4 + 2 * s] = (uint8_t)(freqs[s] & 0xff);
+            dst[5 + 2 * s] = (uint8_t)(freqs[s] >> 8);
+        }
+        memmove(dst + RANS_HEADER, ptr, coded);
+        return (long)total;
+    } else {
+        if (coded > cap) return -1;
+        memmove(dst, ptr, coded);
+        return (long)coded;
     }
-    memmove(dst + RANS_HEADER, ptr, coded);
-    return (long)total;
+}
+
+static long rans_encode_impl(const uint8_t *src, size_t n, uint8_t *dst,
+                             size_t cap, const uint64_t *counts, int allow_simd)
+{
+    if (n == 0) return -1;
+    if (cap < lmz_rans_bound(n)) return -1;
+
+    uint64_t own[256];
+    if (counts) {
+        uint64_t total = 0;
+        for (int s = 0; s < 256; s++) total += counts[s];
+        if (total != n) counts = NULL;
+    }
+    if (!counts) {
+        lmz_hist(src, n, own);
+        counts = own;
+    }
+    uint16_t freqs[256];
+    if (rans_normalize(counts, freqs) != 0) return -1;
+
+    return rans_encode_core(src, n, dst, cap, freqs, allow_simd, 1);
 }
 
 LMZ_API long lmz_rans_encode_h(const uint8_t *src, size_t n, uint8_t *dst,
@@ -1405,20 +1434,36 @@ LMZ_API long lmz_rans_encode(const uint8_t *src, size_t n, uint8_t *dst, size_t 
     return rans_encode_impl(src, n, dst, cap, NULL, 1);
 }
 
-/* Decode exactly `n` bytes. Returns 0 on success, -1 on malformed input. */
-LMZ_API int lmz_rans_decode(const uint8_t *src, size_t src_len, uint8_t *dst, size_t n)
+/* Encode with a caller-supplied frequency table, omitting the 516-byte header.
+ * Writes [32 B initial states][coded bytes] into dst and returns its length, or -1. */
+LMZ_API long lmz_rans_encode_shared(const uint8_t *src, size_t n, uint8_t *dst,
+                                    size_t cap, const uint16_t *freqs)
+{
+    return rans_encode_core(src, n, dst, cap, freqs, 1, 0);
+}
+
+static int rans_build_dec_lut(const uint16_t *freqs, uint32_t *lut)
+{
+    uint32_t sum = 0;
+    for (int s = 0; s < 256; s++) sum += freqs[s];
+    if (sum != RANS_PROB_SCALE) return -1;
+
+    uint32_t start = 0;
+    for (int s = 0; s < 256; s++) {
+        uint32_t f = freqs[s];
+        if (!f) continue;
+        uint32_t packed = ((f - 1) << 20) | (start << 8) | (uint32_t)s;
+        for (uint32_t j = 0; j < f; j++) lut[start + j] = packed;
+        start += f;
+    }
+    return (start == RANS_PROB_SCALE) ? 0 : -1;
+}
+
+static int rans_decode_body(const uint8_t *src, size_t src_len, uint8_t *dst,
+                            size_t n, const uint16_t *freqs)
 {
     if (n == 0) return src_len == 0 ? 0 : -1;
-    if (src_len < RANS_HEADER + 4 * RANS_STREAMS) return -1;
-    if (src[0] != RANS_MAGIC0 || src[1] != RANS_MAGIC1) return -1;
-
-    uint16_t freqs[256];
-    uint32_t sum = 0;
-    for (int s = 0; s < 256; s++) {
-        freqs[s] = (uint16_t)(src[4 + 2 * s] | ((uint16_t)src[5 + 2 * s] << 8));
-        sum += freqs[s];
-    }
-    if (sum != RANS_PROB_SCALE) return -1;
+    if (src_len < 4 * RANS_STREAMS) return -1;
 
     /* One 32-bit entry per probability slot: frequency, cumulative start and
      * symbol together, so a decode step is a single dependent load. 16 KiB,
@@ -1430,17 +1475,9 @@ LMZ_API int lmz_rans_decode(const uint8_t *src, size_t src_len, uint8_t *dst, si
      * otherwise overflow its 12-bit field and decode as frequency zero.
      */
     uint32_t lut[RANS_PROB_SCALE];
-    uint32_t start = 0;
-    for (int s = 0; s < 256; s++) {
-        uint32_t f = freqs[s];
-        if (!f) continue;
-        uint32_t packed = ((f - 1) << 20) | (start << 8) | (uint32_t)s;
-        for (uint32_t j = 0; j < f; j++) lut[start + j] = packed;
-        start += f;
-    }
-    if (start != RANS_PROB_SCALE) return -1;
+    if (rans_build_dec_lut(freqs, lut) != 0) return -1;
 
-    const uint8_t *ptr = src + RANS_HEADER;
+    const uint8_t *ptr = src;
     const uint8_t *limit = src + src_len;
     uint32_t state[RANS_STREAMS];
     for (int k = 0; k < RANS_STREAMS; k++) rans_dec_init(&state[k], &ptr);
@@ -1464,35 +1501,6 @@ LMZ_API int lmz_rans_decode(const uint8_t *src, size_t src_len, uint8_t *dst, si
         for (int k = 0; k < RANS_STREAMS; k++)
             dst[i + k] = (uint8_t)(e[k] & 0xff);
 
-        /*
-         * The refills go two ways, and which is faster is a property of the
-         * machine rather than of the code. Both are branchless: the refill
-         * word is always loaded, because whether a symbol needs one is close
-         * to a coin flip on a near-uniform plane and mispredicts about half
-         * the time as a branch. They differ in what they do about the cursor.
-         *
-         * Written one lane at a time, a lane cannot compute its own address
-         * until the lane before it has decided whether it consumed a word, so
-         * the eight loads run one behind another. But whether a lane refills
-         * depends on how many bits its own symbol consumed and on nothing
-         * else, so all eight decisions can be made first and the cursor
-         * becomes a prefix sum of small integers, leaving the loads
-         * independent. That trades a chain of loads for two dozen more
-         * arithmetic operations.
-         *
-         * Measured per plane, decoding: +11% on Zen 5, +4% on a Neoverse
-         * runner, -12% on Apple silicon, where the serial version is the
-         * fastest of the three machines outright and both planes decode at
-         * the same rate whatever their refill rate -- that core hides the
-         * chain completely, so the extra arithmetic is pure loss. arm64
-         * cannot tell those two parts apart at build time (a VM reports no
-         * implementer at all), so it takes the shape that does not cost 12%
-         * on the hardware people run models on.
-         *
-         * Either way the loads read up to two bytes past their own offset,
-         * the furthest fifteen bytes beyond the cursor, which the loop guard
-         * has established is readable.
-         */
         uint32_t x[RANS_STREAMS], need[RANS_STREAMS];
         for (int k = 0; k < RANS_STREAMS; k++)
             x[k] = ((e[k] >> 20) + 1) * (state[k] >> RANS_PROB_BITS)
@@ -1529,6 +1537,237 @@ LMZ_API int lmz_rans_decode(const uint8_t *src, size_t src_len, uint8_t *dst, si
     return 0;
 }
 
+/* Decode a shared-table rANS stream (states directly followed by coded bytes). */
+LMZ_API int lmz_rans_decode_shared(const uint8_t *src, size_t src_len, uint8_t *dst,
+                                   size_t n, const uint16_t *freqs)
+{
+    return rans_decode_body(src, src_len, dst, n, freqs);
+}
+
+/* Decode exactly `n` bytes. Returns 0 on success, -1 on malformed input. */
+LMZ_API int lmz_rans_decode(const uint8_t *src, size_t src_len, uint8_t *dst, size_t n)
+{
+    if (n == 0) return src_len == 0 ? 0 : -1;
+    if (src_len < RANS_HEADER + 4 * RANS_STREAMS) return -1;
+    if (src[0] != RANS_MAGIC0 || src[1] != RANS_MAGIC1) return -1;
+
+    uint16_t freqs[256];
+    for (int s = 0; s < 256; s++) {
+        freqs[s] = (uint16_t)(src[4 + 2 * s] | ((uint16_t)src[5 + 2 * s] << 8));
+    }
+    return rans_decode_body(src + RANS_HEADER, src_len - RANS_HEADER, dst, n, freqs);
+}
+
+#if LMZ_NEON_DEC
+static uint8_t rans_expand_table[256][16];
+static void rans_init_expand(void)
+{
+    static int inited = 0;
+    if (inited) return;
+    inited = 1;
+    for (int mask = 0; mask < 256; mask++) {
+        int count = 0;
+        for (int k = 0; k < 8; k++) {
+            if (mask & (1 << k)) {
+                rans_expand_table[mask][2 * k] = (uint8_t)(2 * count);
+                rans_expand_table[mask][2 * k + 1] = (uint8_t)(2 * count + 1);
+                count++;
+            } else {
+                rans_expand_table[mask][2 * k] = 0x80;
+                rans_expand_table[mask][2 * k + 1] = 0x80;
+            }
+        }
+    }
+}
+
+static int rans_decode_many4_neon(const uint8_t *const *src, const size_t *slen,
+                                  const uint32_t *const *luts, uint8_t *const *dst,
+                                  size_t n)
+{
+    rans_init_expand();
+    const uint8_t *ptr[4], *end[4];
+    uint32x4_t xa[4], xb[4];
+    for (int m = 0; m < 4; m++) {
+        if (slen[m] < 32) return -1;
+        ptr[m] = src[m];
+        end[m] = src[m] + slen[m];
+        xa[m] = vld1q_u32((const uint32_t *)ptr[m]);
+        xb[m] = vld1q_u32((const uint32_t *)(ptr[m] + 16));
+        ptr[m] += 32;
+    }
+    const uint32x4_t m12 = vdupq_n_u32(0xFFF);
+    const uint32x4_t rans_l = vdupq_n_u32(RANS_L);
+    const uint16x8_t wt = (uint16x8_t){
+        256 + 1, 256 + 2, 256 + 4, 256 + 8,
+        256 + 16, 256 + 32, 256 + 64, 256 + 128
+    };
+
+    size_t i = 0;
+    for (;;) {
+        if (i + 8 > n) break;
+        int room = 1;
+        for (int m = 0; m < 4; m++) if (ptr[m] + 16 > end[m]) room = 0;
+        if (!room) break;
+
+        for (int m = 0; m < 4; m++) {
+            const uint32_t *lut = luts[m];
+            uint32_t s0 = vgetq_lane_u32(xa[m], 0) & 0xFFF;
+            uint32_t s1 = vgetq_lane_u32(xa[m], 1) & 0xFFF;
+            uint32_t s2 = vgetq_lane_u32(xa[m], 2) & 0xFFF;
+            uint32_t s3 = vgetq_lane_u32(xa[m], 3) & 0xFFF;
+            uint32_t s4 = vgetq_lane_u32(xb[m], 0) & 0xFFF;
+            uint32_t s5 = vgetq_lane_u32(xb[m], 1) & 0xFFF;
+            uint32_t s6 = vgetq_lane_u32(xb[m], 2) & 0xFFF;
+            uint32_t s7 = vgetq_lane_u32(xb[m], 3) & 0xFFF;
+
+            uint32_t e0 = lut[s0], e1 = lut[s1], e2 = lut[s2], e3 = lut[s3];
+            uint32_t e4 = lut[s4], e5 = lut[s5], e6 = lut[s6], e7 = lut[s7];
+
+            uint64_t syms = ((uint64_t)(e0 & 0xFF))
+                          | (((uint64_t)(e1 & 0xFF)) << 8)
+                          | (((uint64_t)(e2 & 0xFF)) << 16)
+                          | (((uint64_t)(e3 & 0xFF)) << 24)
+                          | (((uint64_t)(e4 & 0xFF)) << 32)
+                          | (((uint64_t)(e5 & 0xFF)) << 40)
+                          | (((uint64_t)(e6 & 0xFF)) << 48)
+                          | (((uint64_t)(e7 & 0xFF)) << 56);
+            memcpy(dst[m] + i, &syms, 8);
+
+            uint32x4_t ea = (uint32x4_t){ e0, e1, e2, e3 };
+            uint32x4_t eb = (uint32x4_t){ e4, e5, e6, e7 };
+
+            uint32x4_t fqa = vaddq_u32(vshrq_n_u32(ea, 20), vdupq_n_u32(1));
+            uint32x4_t fqb = vaddq_u32(vshrq_n_u32(eb, 20), vdupq_n_u32(1));
+            uint32x4_t sva = vandq_u32(vshrq_n_u32(ea, 8), m12);
+            uint32x4_t svb = vandq_u32(vshrq_n_u32(eb, 8), m12);
+
+            uint32x4_t xa_low = vandq_u32(xa[m], m12);
+            uint32x4_t xb_low = vandq_u32(xb[m], m12);
+            uint32x4_t xa_high = vshrq_n_u32(xa[m], 12);
+            uint32x4_t xb_high = vshrq_n_u32(xb[m], 12);
+
+            xa[m] = vmlaq_u32(vsubq_u32(xa_low, sva), fqa, xa_high);
+            xb[m] = vmlaq_u32(vsubq_u32(xb_low, svb), fqb, xb_high);
+
+            uint32x4_t na = vcltq_u32(xa[m], rans_l);
+            uint32x4_t nb = vcltq_u32(xb[m], rans_l);
+
+            uint16x8_t nm = vuzp1q_u16(vreinterpretq_u16_u32(na),
+                                       vreinterpretq_u16_u32(nb));
+            unsigned sum = vaddvq_u16(vandq_u16(nm, wt));
+
+            uint8x16_t in_bytes = vld1q_u8(ptr[m]);
+            uint8x16_t refill_words = vqtbl1q_u8(in_bytes,
+                vld1q_u8(rans_expand_table[sum & 0xFF]));
+            ptr[m] += 2 * (sum >> 8);
+
+            uint32x4_t wa = vmovl_u16(vget_low_u16(vreinterpretq_u16_u8(refill_words)));
+            uint32x4_t wb = vmovl_u16(vget_high_u16(vreinterpretq_u16_u8(refill_words)));
+
+            xa[m] = vbslq_u32(na, vorrq_u32(vshlq_n_u32(xa[m], 16), wa), xa[m]);
+            xb[m] = vbslq_u32(nb, vorrq_u32(vshlq_n_u32(xb[m], 16), wb), xb[m]);
+        }
+        i += 8;
+    }
+    for (int m = 0; m < 4; m++) {
+        const uint32_t *lut = luts[m];
+        uint8_t *d = dst[m];
+        const uint8_t *p = ptr[m];
+        const uint8_t *lim = end[m];
+        uint32_t st_tail[8];
+        vst1q_u32(st_tail, xa[m]);
+        vst1q_u32(st_tail + 4, xb[m]);
+        for (size_t j = i; j < n; j++) {
+            uint32_t k = (uint32_t)(j & 7);
+            uint32_t e = lut[st_tail[k] & (RANS_PROB_SCALE - 1)];
+            d[j] = (uint8_t)(e & 0xFF);
+            uint32_t x = st_tail[k];
+            uint32_t st2 = (e >> 8) & 0xFFF;
+            uint32_t fq = (e >> 20) + 1;
+            x = fq * (x >> RANS_PROB_BITS) + (x & (RANS_PROB_SCALE - 1)) - st2;
+            if (x < RANS_L) {
+                if (p + 2 > lim) return -1;
+                x = (x << 16) | (uint32_t)p[0] | ((uint32_t)p[1] << 8);
+                p += 2;
+            }
+            st_tail[k] = x;
+        }
+    }
+    return 0;
+}
+#endif
+
+/* Decode four independent rANS streams together. Returns 0 on success, -1 on malformed input. */
+LMZ_API int lmz_rans_decode_many4(const uint8_t *const *src, const size_t *slen,
+                                  uint8_t *const *dst, size_t n,
+                                  const uint16_t *const *freqs)
+{
+    if (n == 0) return 0;
+    const uint8_t *bodies[4];
+    size_t blens[4];
+    uint32_t luts[4][RANS_PROB_SCALE];
+    const uint32_t *lut_ptrs[4];
+
+    for (int m = 0; m < 4; m++) {
+        lut_ptrs[m] = luts[m];
+        if (freqs && freqs[m]) {
+            bodies[m] = src[m];
+            blens[m] = slen[m];
+            if (rans_build_dec_lut(freqs[m], luts[m]) != 0) return -1;
+        } else {
+            if (slen[m] < RANS_HEADER + 4 * RANS_STREAMS) return -1;
+            if (src[m][0] != RANS_MAGIC0 || src[m][1] != RANS_MAGIC1) return -1;
+            uint16_t f[256];
+            for (int s = 0; s < 256; s++) {
+                f[s] = (uint16_t)(src[m][4 + 2 * s] | ((uint16_t)src[m][5 + 2 * s] << 8));
+            }
+            bodies[m] = src[m] + RANS_HEADER;
+            blens[m] = slen[m] - RANS_HEADER;
+            if (rans_build_dec_lut(f, luts[m]) != 0) return -1;
+        }
+    }
+
+#if LMZ_NEON_DEC
+    return rans_decode_many4_neon(bodies, blens, lut_ptrs, dst, n);
+#else
+    for (int m = 0; m < 4; m++) {
+        const uint8_t *ptr = bodies[m];
+        const uint8_t *limit = bodies[m] + blens[m];
+        uint32_t state[RANS_STREAMS];
+        for (int k = 0; k < RANS_STREAMS; k++) rans_dec_init(&state[k], &ptr);
+        size_t i = 0;
+        for (; i + RANS_STREAMS <= n && ptr + 2 * RANS_STREAMS <= limit;
+             i += RANS_STREAMS) {
+            uint32_t e[RANS_STREAMS];
+            for (int k = 0; k < RANS_STREAMS; k++)
+                e[k] = luts[m][state[k] & (RANS_PROB_SCALE - 1)];
+            for (int k = 0; k < RANS_STREAMS; k++)
+                dst[m][i + k] = (uint8_t)(e[k] & 0xff);
+            uint32_t x[RANS_STREAMS], need[RANS_STREAMS];
+            for (int k = 0; k < RANS_STREAMS; k++)
+                x[k] = ((e[k] >> 20) + 1) * (state[k] >> RANS_PROB_BITS)
+                     + (state[k] & (RANS_PROB_SCALE - 1)) - ((e[k] >> 8) & 0xfff);
+            for (int k = 0; k < RANS_STREAMS; k++) need[k] = (x[k] < RANS_L);
+            for (int k = 0; k < RANS_STREAMS; k++) {
+                const uint8_t *p = ptr;
+                uint32_t word = (uint32_t)p[0] | ((uint32_t)p[1] << 8);
+                state[k] = need[k] ? ((x[k] << 16) | word) : x[k];
+                ptr = p + (need[k] << 1);
+            }
+        }
+        for (; i < n; i++) {
+            uint32_t k = (uint32_t)(i & (RANS_STREAMS - 1));
+            uint32_t e = luts[m][state[k] & (RANS_PROB_SCALE - 1)];
+            dst[m][i] = (uint8_t)(e & 0xff);
+            if (rans_dec_advance_safe(&state[k], &ptr, limit,
+                                      (e >> 8) & 0xfff, (e >> 20) + 1) != 0)
+                return -1;
+        }
+    }
+    return 0;
+#endif
+}
+
 /* ------------------------------------------------- whole-chunk plane decode */
 
 /*
@@ -1543,9 +1782,10 @@ LMZ_API int lmz_rans_decode(const uint8_t *src, size_t src_len, uint8_t *dst, si
  * block leaves the GIL released from start to finish.
  *
  * `methods` packs two bits per plane, matching the chunk record's flags: 0 is
- * stored, 3 is rANS. A plane coded any other way returns -2 so the caller can
- * fall back; a malformed payload returns -1 and the caller falls back too, so
- * the Python path stays the one place that decides what a bad chunk means.
+ * stored, 3 is rANS. Bit 8 (1 << 8) indicates plane 0 uses the shared frequency table.
+ * A plane coded any other way returns -2 so the caller can fall back; a
+ * malformed payload returns -1 and the caller falls back too, so the Python
+ * path stays the one place that decides what a bad chunk means.
  *
  * `scratch` holds the decoded planes followed by whatever lmz_merge_planes
  * needs, so nothing is allocated here.
@@ -1553,7 +1793,7 @@ LMZ_API int lmz_rans_decode(const uint8_t *src, size_t src_len, uint8_t *dst, si
 LMZ_API int lmz_decode_planes(const uint8_t *payload, size_t plen,
                               size_t nplanes, size_t nelem, uint32_t methods,
                               int bf16, uint8_t *dst, uint8_t *scratch,
-                              size_t scratch_len)
+                              size_t scratch_len, const uint16_t *shared_freqs)
 {
     if (nplanes == 0 || nplanes > 16 || nelem == 0) return -1;
     if (bf16 && nplanes != 2) return -1;
@@ -1574,19 +1814,44 @@ LMZ_API int lmz_decode_planes(const uint8_t *payload, size_t plen,
 
     const uint8_t *p = payload + hdr;
     const uint8_t *planes[16];
-    for (size_t k = 0; k < nplanes; k++) {
-        const uint32_t m = (methods >> (2 * k)) & 3u;
-        if (m == 0) {                              /* stored */
-            if (lens[k] != nelem) return -1;
-            planes[k] = p;
-        } else if (m == 3) {                       /* rANS */
-            uint8_t *d = scratch + k * nelem;
-            if (lmz_rans_decode(p, lens[k], d, nelem) != 0) return -1;
-            planes[k] = d;
-        } else {
-            return -2;                             /* zstd/deflate: not here */
+    if (nplanes == 4 && (methods & 0xFF) == 0xFF) {
+        const uint8_t *src_planes[4];
+        size_t src_lens[4];
+        uint8_t *dst_planes[4];
+        const uint16_t *f_ptrs[4] = {NULL, NULL, NULL, NULL};
+        if (methods & (1u << 8)) {
+            if (!shared_freqs) return -2;
+            f_ptrs[0] = shared_freqs;
         }
-        p += lens[k];
+        for (size_t k = 0; k < 4; k++) {
+            src_planes[k] = p;
+            src_lens[k] = lens[k];
+            dst_planes[k] = scratch + k * nelem;
+            planes[k] = dst_planes[k];
+            p += lens[k];
+        }
+        if (lmz_rans_decode_many4(src_planes, src_lens, dst_planes, nelem, f_ptrs) != 0)
+            return -1;
+    } else {
+        for (size_t k = 0; k < nplanes; k++) {
+            const uint32_t m = (methods >> (2 * k)) & 3u;
+            if (m == 0) {                              /* stored */
+                if (lens[k] != nelem) return -1;
+                planes[k] = p;
+            } else if (m == 3) {                       /* rANS */
+                uint8_t *d = scratch + k * nelem;
+                if (k == 0 && (methods & (1u << 8))) {
+                    if (!shared_freqs) return -2;
+                    if (lmz_rans_decode_shared(p, lens[k], d, nelem, shared_freqs) != 0) return -1;
+                } else {
+                    if (lmz_rans_decode(p, lens[k], d, nelem) != 0) return -1;
+                }
+                planes[k] = d;
+            } else {
+                return -2;                             /* zstd/deflate: not here */
+            }
+            p += lens[k];
+        }
     }
 
     if (bf16) return lmz_merge_bf16(planes[0], planes[1], dst, nelem);

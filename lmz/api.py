@@ -24,11 +24,13 @@ from dataclasses import dataclass, field
 from . import codec as _codec
 from . import entropy, kernels
 from .format import (CODEC_DELTA, CODEC_REF, FLAG_ALIGNED, FLAG_PAGE_MAPPED,
-                     HEADER_SIZE, PAGE_ALIGN, ArchiveReader, ArchiveWriter,
-                     CorruptArchive, FormatError, Member)
+                     HEADER_SIZE, PAGE_ALIGN, RECORD, ArchiveReader,
+                     ArchiveWriter, ChunkTable, CorruptArchive, FormatError,
+                     Member)
 from .parallel import (default_workers, gil_enabled, ordered_map,
                         unordered_map)
-from .planner import KIND_DELTA, KIND_REF, chunkify, probe
+from .planner import (KIND_BF16, KIND_BYTES, KIND_DELTA, KIND_REF,
+                      chunkify, probe)
 
 DEFAULT_CHUNK_SIZE = 8 << 20
 DEFAULT_LEVEL = 1
@@ -88,6 +90,51 @@ class Stats:
     def throughput(self) -> float:
         """Input bytes per second."""
         return self.input_bytes / self.seconds if self.seconds > 0 else 0.0
+
+
+@dataclass(slots=True)
+class TensorBlocks:
+    """Where a tensor sits in the archive's chunk table, without decoding it.
+
+    `offset` and `size` are the tensor's byte range in the virtual output
+    space (`[offset, offset + size)`). `blocks` is the half-open
+    `(first_block, end_block)` index range in the chunk table, `chunks` is
+    the slice of `Chunk` records covering the tensor, and `block_offset` is
+    the byte offset inside `chunks[0]` where the tensor begins (zero when
+    the tensor starts on a block boundary, which every tensor at or above
+    the block size does).
+    """
+
+    name: str
+    member: str
+    dtype: str
+    shape: list[int]
+    offset: int
+    size: int
+    blocks: tuple[int, int]
+    block_offset: int
+    chunks: list
+
+    @property
+    def num_blocks(self) -> int:
+        return self.blocks[1] - self.blocks[0]
+
+    @property
+    def block_aligned(self) -> bool:
+        """Whether `chunks` cover this tensor and nothing else."""
+        return self.block_offset == 0 and (
+            sum(c.rlen for c in self.chunks) == self.size)
+
+
+def _annotate_tensor_blocks(members: list[Member], chunks: ChunkTable) -> None:
+    """Record the `[first_block, end_block)` range covering each tensor."""
+    for m in members:
+        if not m.tensors:
+            continue
+        for meta in m.tensors.values():
+            s, e = meta["offsets"]
+            lo, hi = chunks.range_indices(m.dst + s, m.dst + e)
+            meta["blocks"] = [lo, hi]
 
 
 class _FdPool:
@@ -397,6 +444,7 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
         stats = Stats(input_bytes=total_new, files=len(members),
                       chunks=len(plan),
                       detail={"delta_bytes": delta_bytes, "appended": True})
+        shared_freqs = reader.shared_freqs
 
         def work(task):
             idx, start, end, esize, kind, src_off, btype, ikind = task
@@ -407,12 +455,13 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
                 base_bytes = arc.read(src_off, end - start)
                 parts, flags, crc = _codec.encode_delta(
                     data, base_bytes, esize, level, checksum, kind=ikind,
-                    btype=btype, src=src_off, tally=tally)
+                    btype=btype, src=src_off, tally=tally,
+                    shared_freqs=shared_freqs)
                 return (members[idx].dst + start, end - start, parts,
                         CODEC_DELTA, esize, flags, crc)
             parts, cid, flags, crc = _codec.encode_chunk(
                 data, esize, level, checksum, kind=kind, btype=btype,
-                tally=tally)
+                tally=tally, shared_freqs=shared_freqs)
             return (members[idx].dst + start, end - start, parts, cid, esize,
                     flags, crc)
 
@@ -445,6 +494,8 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
                                           tally.to_json())
             if merged:
                 manifest["methods"] = merged
+            _annotate_tensor_blocks(old_members + members, writer.chunks)
+            manifest["members"] = [m.to_json() for m in old_members + members]
             writer.close(base)
             # An append can leave a shorter tail than the one it replaced.
             out.truncate(writer.end)
@@ -453,6 +504,7 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
         arc.close()
 
     stats.detail["methods"] = tally.to_json()   # this append's share, not the whole
+    stats.detail["shared_table"] = bool(shared_freqs)
     stats.output_bytes = os.path.getsize(archive)
     stats.seconds = time.perf_counter() - started
     return stats
@@ -471,8 +523,7 @@ def _find_append_deltas(paths, members, layouts, old_members, arc, level):
     # only base, and the difference grows with the gap: measured 12.9 points
     # at a 1000-step distance against 11.6 at 2000. Later checkpoints
     # therefore gain a little less than a fresh archive would give them.
-    coded = [(c.dst, c.dst + c.rlen) for c in arc._chunks
-             if c.codec in (CODEC_DELTA, CODEC_REF)]
+    coded = arc._chunks.coded_ranges()
 
     def is_plain(lo, hi):
         return not any(cs < hi and lo < ce for cs, ce in coded)
@@ -651,7 +702,8 @@ def _locate_output(members, off: int):
 def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
              workers: int | None = None, chunk_size: int | None = None,
              checksum: bool = True, dedup: bool = True, delta: bool = True,
-             mapped: bool = False, align: bool = False, progress=None) -> Stats:
+             mapped: bool = False, align: bool = False, progress=None,
+             shared_table: bool = False) -> Stats:
     """Compress a file or directory into the archive at `dst`.
 
     `mapped` cuts the archive into small blocks so any byte range can be
@@ -735,6 +787,30 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
 
     pool = _FdPool(paths, os.O_RDONLY)
     done = 0
+    shared_freqs = None
+    if shared_table and kernels.have_rans():
+        counts = [1] * 256
+        has_bf16 = False
+        for task in plan:
+            idx, start, end, esize, kind, ref_src, btype, ikind = task
+            if kind == KIND_BF16 and esize == 2 and (end - start) % 2 == 0:
+                n = end - start
+                take = min(n, 1 << 20)
+                take -= take % 2
+                if take > 0:
+                    raw = os.pread(pool.get(idx), take, start)
+                    planes = kernels.split_bf16(raw)
+                    exp = planes[:take // 2]
+                    for s, c in enumerate(kernels.histogram(exp)):
+                        counts[s] += c
+                    has_bf16 = True
+        if has_bf16:
+            freqs = kernels.rans_freqs(counts)
+            if freqs:
+                shared_hdr = kernels.rans_shared_header(freqs)
+                manifest["shared_table"] = shared_hdr.hex()
+                shared_freqs = freqs
+
     # Which coder actually earned the bytes. The chunk table records the codec
     # that framed each chunk, never the coder that compressed the planes inside
     # it, so a split chunk says nothing about whether rANS or zstd did the work.
@@ -761,12 +837,13 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
                 raise IOError(f"short read on {members[midx].path} at {moff}")
             parts, flags, crc = _codec.encode_delta(
                 data, base, esize, level, checksum, kind=ikind, btype=btype,
-                src=ref_src, tally=tally)
+                src=ref_src, tally=tally, shared_freqs=shared_freqs)
             return (members[idx].dst + start, end - start, parts, CODEC_DELTA,
                     esize, flags, crc)
         parts, cid, flags, crc = _codec.encode_chunk(data, esize, level, checksum,
                                                      kind=kind, btype=btype,
-                                                     tally=tally)
+                                                     tally=tally,
+                                                     shared_freqs=shared_freqs)
         return members[idx].dst + start, end - start, parts, cid, esize, flags, crc
 
     def work_batch(batch):
@@ -797,6 +874,8 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
             methods = tally.to_json()
             if methods:
                 manifest["methods"] = methods
+            _annotate_tensor_blocks(members, writer.chunks)
+            manifest["members"] = [m.to_json() for m in members]
             writer.close(total_in)
         os.replace(tmp, dst)
     except BaseException:
@@ -810,6 +889,7 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
 
     stats.detail["padding_bytes"] = writer.padding
     stats.detail["methods"] = methods
+    stats.detail["shared_table"] = bool(shared_freqs)
     stats.output_bytes = os.path.getsize(dst)
     stats.seconds = time.perf_counter() - started
     return stats
@@ -818,7 +898,7 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
 # ---------------------------------------------------------------- decompress
 
 
-def _range_resolver(chunks, payload_of, verify_checksums: bool):
+def _range_resolver(chunks, payload_of, verify_checksums: bool, shared_freqs=None):
     """A function that materialises the bytes at any earlier output range.
 
     Source chunks are decoded straight from the archive rather than read back
@@ -827,22 +907,25 @@ def _range_resolver(chunks, payload_of, verify_checksums: bool):
     may not itself be a ref or a delta, which keeps resolution a single hop
     instead of a chain of unknown depth.
     """
-    ordered = sorted(chunks, key=lambda c: c.dst)
-    starts = [c.dst for c in ordered]
+    table = ChunkTable.from_chunks(chunks)
 
     def resolve(src: int, rlen: int) -> bytearray:
         out = bytearray(rlen)
         pos, end = src, src + rlen
-        i = bisect_right(starts, pos) - 1
+        try:
+            i = table.locate(pos)
+        except CorruptArchive:
+            raise CorruptArchive(f"source at byte {pos} is not covered")
         while pos < end:
-            c = ordered[i] if 0 <= i < len(ordered) else None
+            c = table[i] if 0 <= i < len(table) else None
             if c is None or not (c.dst <= pos < c.dst + c.rlen):
                 raise CorruptArchive(f"source at byte {pos} is not covered")
             if c.codec in (CODEC_REF, CODEC_DELTA):
                 raise CorruptArchive(
                     "a ref or delta chunk points at another one")
             data = _codec.decode_chunk(payload_of(c), c.codec, c.esize, c.flags,
-                                       c.rlen, c.crc, verify_checksums)
+                                       c.rlen, c.crc, verify_checksums,
+                                       shared_freqs=shared_freqs)
             a = pos - c.dst
             b = min(end - c.dst, c.rlen)
             out[pos - src:pos - src + (b - a)] = data[a:b]
@@ -853,9 +936,10 @@ def _range_resolver(chunks, payload_of, verify_checksums: bool):
     return resolve
 
 
-def _chunk_decoder(chunks, payload_of, verify_checksums: bool):
+def _chunk_decoder(chunks, payload_of, verify_checksums: bool, shared_freqs=None):
     """Decode any chunk, resolving ref and delta sources as needed."""
-    resolve = _range_resolver(chunks, payload_of, verify_checksums)
+    resolve = _range_resolver(chunks, payload_of, verify_checksums,
+                              shared_freqs=shared_freqs)
 
     def decode(chunk, payload, out=None):
         if chunk.codec == CODEC_REF:
@@ -867,10 +951,12 @@ def _chunk_decoder(chunks, payload_of, verify_checksums: bool):
             src, _inner, _off = _codec.delta_source(payload)
             return _codec.decode_delta(payload, chunk.esize, chunk.flags,
                                        chunk.rlen, resolve(src, chunk.rlen),
-                                       chunk.crc, verify_checksums)
+                                       chunk.crc, verify_checksums,
+                                       shared_freqs=shared_freqs)
         return _codec.decode_chunk(payload, chunk.codec, chunk.esize,
                                    chunk.flags, chunk.rlen, chunk.crc,
-                                   verify_checksums, out=out)
+                                   verify_checksums, out=out,
+                                   shared_freqs=shared_freqs)
 
     return decode
 
@@ -891,6 +977,7 @@ def decompress(src: str, dst: str, *, workers: int | None = None,
         members = reader.members
         chunks = reader.chunks
         manifest = reader.manifest
+        shared_freqs = reader.shared_freqs
 
     single = len(members) == 1 and "/" not in members[0].path
     if single and not os.path.isdir(dst):
@@ -926,7 +1013,8 @@ def decompress(src: str, dst: str, *, workers: int | None = None,
             raise FormatError("archive is truncated")
         return payload
 
-    decode = _chunk_decoder(chunks, payload_of, verify_checksums)
+    decode = _chunk_decoder(chunks, payload_of, verify_checksums,
+                            shared_freqs=shared_freqs)
 
     def work(batch):
         done_bytes = 0
@@ -1007,6 +1095,12 @@ def _worker_cap(sizes, workers: int) -> int:
 
 
 def _decode_workers(chunks, workers: int) -> int:
+    if isinstance(chunks, ChunkTable):
+        if not chunks or workers <= GIL_DECODE_WORKERS or not gil_enabled():
+            return workers
+        if chunks.total_rlen() / len(chunks) >= THREADS_SCALE_ABOVE:
+            return workers
+        return GIL_DECODE_WORKERS
     return _worker_cap([c.rlen for c in chunks], workers)
 
 
@@ -1026,15 +1120,7 @@ def _batches(items, size_of, target: int = DECODE_BATCH):
 
 def _check_coverage(chunks, total: int) -> None:
     """Confirm the chunks tile the output exactly, with no gap or overlap."""
-    pos = 0
-    for c in sorted(chunks, key=lambda c: c.dst):
-        if c.dst != pos:
-            raise FormatError(
-                f"archive does not cover its output: gap or overlap at byte {pos}")
-        pos += c.rlen
-    if pos != total:
-        raise FormatError(
-            f"archive covers {pos} bytes but declares {total}")
+    ChunkTable.from_chunks(chunks).check_coverage(total)
 
 
 # -------------------------------------------------------------------- verify
@@ -1049,14 +1135,14 @@ def verify(src: str, *, workers: int | None = None, progress=None) -> Stats:
         reader = ArchiveReader(fh)
         chunks = reader.chunks
         members = reader.members
+        shared_freqs = reader.shared_freqs
 
     total = sum(m.size for m in members)
     _check_coverage(chunks, total)
     pool = _FdPool([src], os.O_RDONLY)
     done = 0
 
-    ordered = sorted(chunks, key=lambda c: c.dst)
-    ordered_starts = [c.dst for c in ordered]
+    table = ChunkTable.from_chunks(chunks)
 
     def check_source(src: int, rlen: int, what: str):
         """The whole source range must lie on plain chunks.
@@ -1065,9 +1151,12 @@ def verify(src: str, *, workers: int | None = None, progress=None) -> Stats:
         this same pass, so decoding them again here would only repeat work.
         """
         pos, end = src, src + rlen
-        i = bisect_right(ordered_starts, pos) - 1
+        try:
+            i = table.locate(pos)
+        except CorruptArchive:
+            raise CorruptArchive(f"{what} at byte {pos} is not covered")
         while pos < end:
-            c = ordered[i] if 0 <= i < len(ordered) else None
+            c = table[i] if 0 <= i < len(table) else None
             if c is None or not (c.dst <= pos < c.dst + c.rlen):
                 raise CorruptArchive(f"{what} at byte {pos} is not covered")
             if c.codec in (CODEC_REF, CODEC_DELTA):
@@ -1081,7 +1170,7 @@ def verify(src: str, *, workers: int | None = None, progress=None) -> Stats:
             raise FormatError("archive is truncated")
         return payload
 
-    resolve = _range_resolver(chunks, payload_of, True)
+    resolve = _range_resolver(chunks, payload_of, True, shared_freqs=shared_freqs)
 
     def work(batch):
         done_bytes = 0
@@ -1100,11 +1189,12 @@ def verify(src: str, *, workers: int | None = None, progress=None) -> Stats:
                 check_source(src, chunk.rlen, "delta source")
                 _codec.decode_delta(payload, chunk.esize, chunk.flags,
                                     chunk.rlen, resolve(src, chunk.rlen),
-                                    chunk.crc, True)
+                                    chunk.crc, True, shared_freqs=shared_freqs)
             else:
                 _codec.decode_chunk(payload, chunk.codec, chunk.esize,
                                     chunk.flags, chunk.rlen, chunk.crc, True,
-                                    out=_scratch(chunk.rlen))
+                                    out=_scratch(chunk.rlen),
+                                    shared_freqs=shared_freqs)
             done_bytes += chunk.rlen
         return done_bytes
 
@@ -1131,14 +1221,17 @@ def info(src: str) -> dict:
     with open(src, "rb") as fh:
         reader = ArchiveReader(fh)
         by_codec: dict[str, list[int]] = {}
-        for c in reader.chunks:
+        payload_bytes = 0
+        for _off, _dst, clen, rlen, _crc, codec, _esize, _flags in RECORD.iter_unpack(
+                reader.chunks.to_bytes()):
             name = {0: "stored", 1: "entropy", 2: "split", 3: "bf16-split",
                     4: "ref", 5: "bf16-cond", 6: "q8-block",
-                    7: "blk-split", 8: "delta"}.get(c.codec, "?")
+                    7: "blk-split", 8: "delta"}.get(codec, "?")
             slot = by_codec.setdefault(name, [0, 0, 0])
             slot[0] += 1
-            slot[1] += c.rlen
-            slot[2] += c.clen
+            slot[1] += rlen
+            slot[2] += clen
+            payload_bytes += clen
         return {
             "path": src,
             "archive_size": reader.file_size,
@@ -1151,7 +1244,7 @@ def info(src: str) -> dict:
             # the chunk table cannot show because it names only the framing
             # codec. Absent from archives written before this was tracked.
             "methods": reader.manifest.get("methods") or {},
-            "payload_bytes": sum(c.clen for c in reader.chunks),
+            "payload_bytes": payload_bytes,
         }
 
 
@@ -1198,9 +1291,9 @@ class MappedArchive:
         except BaseException:
             self._fh.close()
             raise
-        self._chunks = sorted(self._reader.chunks, key=lambda c: c.dst)
-        self._starts = [c.dst for c in self._chunks]
-        self._decode = _chunk_decoder(self._chunks, self._payload_of, verify)
+        self._chunks = self._reader.chunks
+        self._decode = _chunk_decoder(self._chunks, self._payload_of, verify,
+                                      shared_freqs=self._reader.shared_freqs)
         self._cache: "OrderedDict[int, bytes]" = OrderedDict()
         self._cap = max(1, cache_blocks)
         self._lock = threading.Lock()
@@ -1231,9 +1324,19 @@ class MappedArchive:
         return self._reader.aligned
 
     @property
+    def shared_table(self) -> bytes | None:
+        """The 516-byte shared frequency header, or None."""
+        return self._reader.shared_table
+
+    @property
+    def shared_freqs(self) -> list[int] | None:
+        """The 256 uint16 frequencies of the shared table, or None."""
+        return self._reader.shared_freqs
+
+    @property
     def block_bytes(self) -> int:
         """Largest block in the archive: what a one-byte read can cost."""
-        return max((c.rlen for c in self._chunks), default=0)
+        return self._chunks.max_rlen()
 
     # -- reading ----------------------------------------------------------
     def _payload_of(self, c):
@@ -1392,13 +1495,7 @@ class MappedArchive:
         return [d if d is not None else done[i] for i, d in zip(idx, got)]
 
     def _locate(self, pos: int) -> int:
-        i = bisect_right(self._starts, pos) - 1
-        if not 0 <= i < len(self._chunks):
-            raise CorruptArchive(f"byte {pos} is not covered by any chunk")
-        c = self._chunks[i]
-        if not (c.dst <= pos < c.dst + c.rlen):
-            raise CorruptArchive(f"byte {pos} is not covered by any chunk")
-        return i
+        return self._chunks.locate(pos)
 
     def read(self, offset: int, length: int) -> bytes:
         """Bytes [offset, offset+length) of the restored output."""
@@ -1409,27 +1506,27 @@ class MappedArchive:
             return b""
 
         first = self._locate(offset)
-        c = self._chunks[first]
+        dst0, rlen0 = self._chunks.span_of(first)
         # The common case by count -- a small read inside one block -- takes
         # nothing but a slice. Assembling a buffer for it copied every byte
         # twice over for no reason.
-        if end <= c.dst + c.rlen:
-            a = offset - c.dst
+        if end <= dst0 + rlen0:
+            a = offset - dst0
             return bytes(self._block(first)[a:a + (end - offset)])
 
         idx, pos = [], offset
-        i = first
         while pos < end:
             i = self._locate(pos)
             idx.append(i)
-            pos = self._chunks[i].dst + self._chunks[i].rlen
+            cdst, crlen = self._chunks.span_of(i)
+            pos = cdst + crlen
 
         out = bytearray(end - offset)
         for i, data in zip(idx, self._blocks(idx)):
-            c = self._chunks[i]
-            a = max(offset, c.dst) - c.dst
-            b = min(end, c.dst + c.rlen) - c.dst
-            out[c.dst + a - offset:c.dst + b - offset] = data[a:b]
+            cdst, crlen = self._chunks.span_of(i)
+            a = max(offset, cdst) - cdst
+            b = min(end, cdst + crlen) - cdst
+            out[cdst + a - offset:cdst + b - offset] = data[a:b]
         return bytes(out)
 
     def prefetch(self, offset: int, length: int) -> int:
@@ -1449,7 +1546,8 @@ class MappedArchive:
         while pos < end:
             i = self._locate(pos)
             idx.append(i)
-            pos = self._chunks[i].dst + self._chunks[i].rlen
+            cdst, crlen = self._chunks.span_of(i)
+            pos = cdst + crlen
         if not idx:
             return 0
         missing = [i for i, got in zip(idx, self._lookup(idx)) if got is None]
@@ -1464,6 +1562,54 @@ class MappedArchive:
                 n = m.size - offset if length is None else length
                 return self.read(m.dst + offset, max(0, min(n, m.size - offset)))
         raise KeyError(f"no member named {member!r}")
+
+    def _build_tensor_blocks(self, m: Member, name: str,
+                             meta: dict) -> TensorBlocks:
+        start, end = meta["offsets"]
+        offset = m.dst + start
+        size = end - start
+        recorded = meta.get("blocks")
+        if recorded is not None and len(recorded) == 2:
+            lo, hi = int(recorded[0]), int(recorded[1])
+        else:
+            lo, hi = self._chunks.range_indices(offset, offset + size)
+        chunks = self._chunks[lo:hi]
+        block_offset = (offset - chunks[0].dst) if chunks else 0
+        return TensorBlocks(
+            name=name,
+            member=m.path,
+            dtype=meta.get("dtype", ""),
+            shape=list(meta.get("shape", [])),
+            offset=offset,
+            size=size,
+            blocks=(lo, hi),
+            block_offset=block_offset,
+            chunks=chunks,
+        )
+
+    def tensor_blocks(self, name: str,
+                      member: str | None = None) -> TensorBlocks:
+        """Block range and `Chunk` descriptors covering `name`, without decoding."""
+        for m in self._reader.members:
+            if member is not None and m.path != member:
+                continue
+            if m.tensors and name in m.tensors:
+                return self._build_tensor_blocks(m, name, m.tensors[name])
+        where = f" in {member}" if member else ""
+        raise KeyError(f"no tensor named {name!r}{where}")
+
+    def tensors(self, member: str | None = None) -> list[TensorBlocks]:
+        """All tensors in the archive (or in `member`), with their block ranges."""
+        out: list[TensorBlocks] = []
+        for m in self._reader.members:
+            if member is not None and m.path != member:
+                continue
+            for name, meta in (m.tensors or {}).items():
+                out.append(self._build_tensor_blocks(m, name, meta))
+        if member is not None and not any(m.path == member
+                                          for m in self._reader.members):
+            raise KeyError(f"no member named {member!r}")
+        return out
 
     def tensor(self, name: str, member: str | None = None):
         """One tensor as (dtype, shape, raw little-endian bytes)."""
@@ -1499,6 +1645,13 @@ def read_tensor(src: str, name: str, member: str | None = None) -> tuple[str, li
     """
     with MappedArchive(src, cache_blocks=4) as arc:
         return arc.tensor(name, member)
+
+
+def tensor_blocks(src: str, name: str,
+                  member: str | None = None) -> TensorBlocks:
+    """Locate the blocks covering one tensor without decoding any of them."""
+    with MappedArchive(src, cache_blocks=1) as arc:
+        return arc.tensor_blocks(name, member)
 
 
 def _version() -> str:
