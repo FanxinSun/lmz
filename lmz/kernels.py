@@ -137,6 +137,10 @@ def _load_native():
                     ctypes.c_size_t,
                     ctypes.POINTER(ctypes.c_void_p),
                 ]
+            if hasattr(lib, "lmz_has_arm64_crc32") and hasattr(lib, "lmz_crc32"):
+                lib.lmz_has_arm64_crc32.restype = ctypes.c_int
+                lib.lmz_crc32.restype = ctypes.c_uint32
+                lib.lmz_crc32.argtypes = [v, ctypes.c_size_t, ctypes.c_uint32]
             _lib = lib
             _state = "native:" + lib.lmz_isa().decode()
         except Exception:
@@ -176,6 +180,24 @@ def _ptr(obj):
         b = bytes(obj)  # read-only memoryview or other exporter
         p = ctypes.c_char_p(b)
         return ctypes.cast(p, ctypes.c_void_p).value, (p, b)
+
+
+def crc32(data, init: int = 0) -> int:
+    """CRC32 checksum of data."""
+    import zlib
+    return zlib.crc32(data, init) & 0xFFFFFFFF
+
+
+def crc32_arm64(data, init: int = 0) -> int | None:
+    """Direct hardware-accelerated ARM64 CRC32 using __crc32d intrinsics."""
+    lib = _load_native()
+    if lib is not None and hasattr(lib, "lmz_has_arm64_crc32") and lib.lmz_has_arm64_crc32():
+        n = len(data)
+        if n == 0:
+            return init
+        ptr, _ref = _ptr(data)
+        return int(lib.lmz_crc32(ptr, n, init))
+    return None
 
 
 def _counts_arg(hist):

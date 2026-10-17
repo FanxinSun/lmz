@@ -245,6 +245,71 @@ LMZ_API int lmz_xor(const uint8_t *a, const uint8_t *b, size_t n, uint8_t *out)
     return 0;
 }
 
+/* ------------------------------------------------------------- CRC32 */
+
+#if (defined(__aarch64__) || defined(__ARM_FEATURE_CRC32)) && !defined(LMZ_FORCE_NEON)
+#if defined(__has_include)
+#if __has_include(<arm_acle.h>)
+#include <arm_acle.h>
+#define LMZ_ARM64_CRC32 1
+#endif
+#endif
+#endif
+
+LMZ_API int lmz_has_arm64_crc32(void)
+{
+#if defined(LMZ_ARM64_CRC32)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+LMZ_API uint32_t lmz_crc32(const uint8_t *data, size_t len, uint32_t init)
+{
+#if defined(LMZ_ARM64_CRC32)
+    uint32_t crc = ~init;
+    while (((uintptr_t)data & 7) && len > 0) {
+        crc = __crc32b(crc, *data++);
+        len--;
+    }
+    while (len >= 64) {
+        crc = __crc32d(crc, *(const uint64_t *)(data + 0));
+        crc = __crc32d(crc, *(const uint64_t *)(data + 8));
+        crc = __crc32d(crc, *(const uint64_t *)(data + 16));
+        crc = __crc32d(crc, *(const uint64_t *)(data + 24));
+        crc = __crc32d(crc, *(const uint64_t *)(data + 32));
+        crc = __crc32d(crc, *(const uint64_t *)(data + 40));
+        crc = __crc32d(crc, *(const uint64_t *)(data + 48));
+        crc = __crc32d(crc, *(const uint64_t *)(data + 56));
+        data += 64;
+        len -= 64;
+    }
+    while (len >= 8) {
+        crc = __crc32d(crc, *(const uint64_t *)data);
+        data += 8;
+        len -= 8;
+    }
+    if (len >= 4) {
+        crc = __crc32w(crc, *(const uint32_t *)data);
+        data += 4;
+        len -= 4;
+    }
+    if (len >= 2) {
+        crc = __crc32h(crc, *(const uint16_t *)data);
+        data += 2;
+        len -= 2;
+    }
+    if (len >= 1) {
+        crc = __crc32b(crc, *data);
+    }
+    return ~crc;
+#else
+    (void)data; (void)len; (void)init;
+    return 0;
+#endif
+}
+
 /* ------------------------------------------------------- recursive split */
 
 /*

@@ -4564,5 +4564,30 @@ def test_append_with_dest_mapping_and_cli():
         assert open(os.path.join(out, "cli_member.safetensors"), "rb").read() == open(p1, "rb").read()
 
 
+def test_crc32_arm64_matches_zlib():
+    """Verify hardware ARM64 CRC32 instruction results against zlib across buffer lengths."""
+    import zlib
+    from lmz import kernels
+
+    if kernels.crc32_arm64(b"test") is None:
+        raise Skip("ARM64 CRC32 not available on this platform")
+
+    # Edge cases and varied lengths
+    test_lengths = [0, 1, 2, 3, 4, 7, 8, 9, 15, 16, 31, 32, 63, 64, 65, 127, 128, 255, 1024, 65536]
+    for n in test_lengths:
+        data = rand(n, seed=n + 42) if n > 0 else b""
+        expected = zlib.crc32(data) & 0xFFFFFFFF
+        actual = kernels.crc32_arm64(data)
+        assert actual == expected, f"Mismatch at length {n}: {hex(actual)} != {hex(expected)}"
+
+        # Test chained initial values
+        if n > 0:
+            init = 0x12345678
+            expected_init = zlib.crc32(data, init) & 0xFFFFFFFF
+            actual_init = kernels.crc32_arm64(data, init)
+            assert actual_init == expected_init, f"Init mismatch at length {n}"
+
+
 if __name__ == "__main__":
     sys.exit(main())
+
