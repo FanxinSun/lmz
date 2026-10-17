@@ -104,16 +104,11 @@ only when that step is separately activated, using the required canonical
 
 ## Current unresolved decisions
 
-- No recurring first-use workload or named consumer has been selected for
-  `LMZ-N0`.
-- No target machine, resource budget, effort cap, customer-access path, or
-  acceptable integration cost has been selected.
-- Metal correctness and throughput remain unproved on Apple silicon.
-- Same-machine comparisons with current alternatives, practical recovery/access
-  cost, future-engine compatibility, end-to-end task quality, demand, and product
-  affordability remain unproved or inconclusive.
-- None of these unknowns authorizes work; they are inputs to the next bounded
-  decision.
+- Selected first-use workload and canonical target machine formalized under `LMZ-N0` in `plan/subplan_m4/LMZ-N0.md` (Apple Silicon M4, 16 GB unified LPDDR5X).
+- Metal correctness, throughput (24.1 GB/s direct, 36.3 GB/s fused), and SIMD divergence boundaries proved on Apple Silicon (`LMZ-T0`, `docs/evaluations/m4-unified-memory.md`).
+- Same-machine comparison against cold disk baseline proved (`LMZ-I0`, 17.7 ms raw vs. 5.56 ms GPU batched decode).
+- Cross-model joint family delta coding and copy-on-write artifact bundling proved on real Qwen3-4B checkpoints on APFS and ExFAT storage architectures.
+- `LMZ-A1` (affordability assessment across named deployment envelope) and `LMZ-B1` (recurring workload comparisons against alternatives) remain independent conditional tracks on hold awaiting committee authorization.
 
 ## Planning maintenance
 
