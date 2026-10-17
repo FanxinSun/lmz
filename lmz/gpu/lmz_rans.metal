@@ -292,3 +292,51 @@ kernel void lmz_decode_bf16(
         simdgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
+
+// ------------------------------------------------------------- dequant & projection
+kernel void lmz_dequant_q8_0_to_fp16(
+    device const uchar *q8_blocks [[buffer(0)]],
+    device half *out_fp16         [[buffer(1)]],
+    constant uint &nblocks        [[buffer(2)]],
+    uint bid                      [[thread_position_in_grid]])
+{
+    if (bid >= nblocks) return;
+    device const uchar *b = q8_blocks + bid * 34;
+    half d = *(device const half *)b;
+    device const char *qs = (device const char *)(b + 2);
+    device half *out = out_fp16 + bid * 32;
+    for (uint i = 0; i < 32; i++) {
+        out[i] = d * (half)qs[i];
+    }
+}
+
+kernel void lmz_project_fp8_e4m3_to_bf16(
+    device const uchar *fp8_in    [[buffer(0)]],
+    device ushort *bf16_out       [[buffer(1)]],
+    constant uint &nelem          [[buffer(2)]],
+    uint gid                      [[thread_position_in_grid]])
+{
+    if (gid >= nelem) return;
+    uchar v = fp8_in[gid];
+    uint sign = (v >> 7) & 1u;
+    uint exp = (v >> 3) & 0x0Fu;
+    uint mant = v & 0x07u;
+    ushort res;
+    if (exp == 0) {
+        if (mant == 0) {
+            res = (ushort)(sign << 15);
+        } else {
+            uint shift = clz((ushort)mant) - 13;
+            uint new_exp = 127 - 7 + 1 - shift;
+            uint new_mant = (mant << (shift + 4)) & 0x7F;
+            res = (ushort)((sign << 15) | (new_exp << 7) | new_mant);
+        }
+    } else if (exp == 15 && mant == 7) {
+        res = (ushort)((sign << 15) | (0xFF << 7) | 0x40);
+    } else {
+        uint new_exp = exp + 120;
+        uint new_mant = mant << 4;
+        res = (ushort)((sign << 15) | (new_exp << 7) | new_mant);
+    }
+    bf16_out[gid] = res;
+}

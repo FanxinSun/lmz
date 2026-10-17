@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -497,10 +498,14 @@ def mount(point: str, store: Store | None = None, *, names=None,
           cache_blocks: int = 512, verify: bool = False,
           readahead: int | None = None):
     """Build a server for the store. The caller runs `serve()`."""
-    from .fuse import FuseServer
-
     fs = ModelFS(store or Store(), names, cache_blocks=cache_blocks,
                  verify=verify, readahead=readahead)
+
+    if sys.platform == "darwin":
+        from .mount_macos import MacMountServer
+        return MacMountServer(fs, point)
+
+    from .fuse import FuseServer
 
     class StoreServer(FuseServer):
         def read_file(self, node, offset, size, active=1):

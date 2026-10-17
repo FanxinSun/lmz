@@ -1165,7 +1165,30 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
         raise ValueError("align only makes sense for a page-mapped archive")
     started = time.perf_counter()
 
-    if os.path.isdir(src):
+    if isinstance(src, (list, tuple)):
+        entries = []
+        for item in src:
+            if isinstance(item, tuple) and len(item) == 2:
+                pfx, s_path = item
+            elif isinstance(item, str) and "=" in item and not os.path.exists(item):
+                pfx, s_path = item.split("=", 1)
+            else:
+                s_path = item
+                pfx = os.path.basename(os.path.abspath(s_path)) if len(src) > 1 else ""
+            pfx = pfx.replace("\\", "/").strip("/")
+            if os.path.isdir(s_path):
+                for rel, full in _iter_files(s_path):
+                    entry_rel = f"{pfx}/{rel}" if pfx else rel
+                    entries.append((entry_rel, full))
+            elif os.path.isfile(s_path):
+                base_fn = os.path.basename(s_path)
+                entry_rel = f"{pfx}/{base_fn}" if pfx else base_fn
+                entries.append((entry_rel, s_path))
+            else:
+                raise FileNotFoundError(s_path)
+        if not entries:
+            raise ValueError("no regular files found across input sources")
+    elif os.path.isdir(src):
         entries = list(_iter_files(src))
         if not entries:
             raise ValueError(f"{src} contains no regular files")
@@ -2250,6 +2273,72 @@ class MappedArchive:
                 return meta.get("dtype", ""), meta.get("shape", []), raw
         where = f" in {member}" if member else ""
         raise KeyError(f"no tensor named {name!r}{where}")
+
+    def as_torch_tensor(self, name: str, member: str | None = None):
+        """Construct a torch.Tensor sharing underlying memory without byte copying."""
+        try:
+            import torch
+        except ImportError as exc:
+            raise ImportError("PyTorch (torch) is required for as_torch_tensor()") from exc
+        dtype_str, shape, raw = self.tensor(name, member=member)
+        mapping = {
+            "BF16": torch.bfloat16, "BFLOAT16": torch.bfloat16,
+            "F16": torch.float16, "FLOAT16": torch.float16,
+            "F32": torch.float32, "FLOAT32": torch.float32, "FLOAT": torch.float32,
+            "F64": torch.float64, "FLOAT64": torch.float64, "DOUBLE": torch.float64,
+            "I8": torch.int8, "INT8": torch.int8,
+            "I16": torch.int16, "INT16": torch.int16,
+            "I32": torch.int32, "INT32": torch.int32, "INT": torch.int32,
+            "I64": torch.int64, "INT64": torch.int64, "LONG": torch.int64,
+            "U8": torch.uint8, "UINT8": torch.uint8,
+            "BOOL": torch.bool,
+        }
+        tdt = mapping.get(dtype_str.upper())
+        if tdt is None:
+            raise ValueError(f"unsupported dtype for torch tensor: {dtype_str}")
+        t = torch.frombuffer(raw, dtype=tdt)
+        if shape:
+            t = t.reshape(shape)
+        return t
+
+    def as_mlx_array(self, name: str, member: str | None = None):
+        """Construct an mlx.core.array sharing underlying memory without byte copying."""
+        try:
+            import mlx.core as mx
+        except ImportError as exc:
+            raise ImportError("MLX (mlx.core) is required for as_mlx_array()") from exc
+        dtype_str, shape, raw = self.tensor(name, member=member)
+        mapping = {
+            "BF16": mx.bfloat16, "BFLOAT16": mx.bfloat16,
+            "F16": mx.float16, "FLOAT16": mx.float16,
+            "F32": mx.float32, "FLOAT32": mx.float32, "FLOAT": mx.float32,
+            "I8": mx.int8, "INT8": mx.int8,
+            "I16": mx.int16, "INT16": mx.int16,
+            "I32": mx.int32, "INT32": mx.int32,
+            "I64": mx.int64, "INT64": mx.int64,
+            "U8": mx.uint8, "UINT8": mx.uint8,
+            "U16": mx.uint16, "UINT16": mx.uint16,
+            "U32": mx.uint32, "UINT32": mx.uint32,
+            "U64": mx.uint64, "UINT64": mx.uint64,
+            "BOOL": mx.bool_,
+        }
+        mdt = mapping.get(dtype_str.upper())
+        arr = mx.array(memoryview(raw), dtype=mdt)
+        if shape:
+            arr = arr.reshape(shape)
+        return arr
+
+    def tensor_mtl_buffer(self, name: str, member: str | None = None):
+        """Extract tensor and attach to an Apple Silicon unified MTLBuffer.
+        Returns (buf_ptr, offset, size, dtype, shape) or None if Metal is not supported.
+        """
+        from . import gpu
+        dtype_str, shape, raw = self.tensor(name, member=member)
+        res = gpu.make_mtl_buffer(raw)
+        if res is None:
+            return None
+        buf_ptr, offset, length = res
+        return buf_ptr, offset, length, dtype_str, shape
 
     def _build_tensor_blocks(self, m: Member, name: str,
                              meta: dict) -> TensorBlocks:

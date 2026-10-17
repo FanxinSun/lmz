@@ -186,6 +186,9 @@ def _mount(point: str, options: str) -> int:
 
 def unmount(point: str) -> None:
     """Detach a mount. Safe to call when nothing is mounted there."""
+    if sys.platform == "darwin":
+        subprocess.run(["umount", point], check=False, stderr=subprocess.DEVNULL)
+        return
     subprocess.run(["fusermount3", "-u", "-z", "--", point],
                    check=False, stderr=subprocess.DEVNULL)
 
@@ -652,8 +655,13 @@ class FuseServer:
 
 def available() -> tuple[bool, str]:
     """Whether this machine can mount, and why not when it cannot."""
+    if sys.platform == "darwin":
+        from shutil import which
+        if which("mount_webdav") is None:
+            return False, "mount_webdav not found on macOS"
+        return True, "ok"
     if not sys.platform.startswith("linux"):
-        return False, "FUSE mounts are Linux-only in this build"
+        return False, "mounts are Linux and macOS only"
     if not os.path.exists("/dev/fuse"):
         return False, "/dev/fuse is missing (no FUSE support in this kernel)"
     if not os.access("/dev/fuse", os.R_OK | os.W_OK):

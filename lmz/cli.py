@@ -70,8 +70,34 @@ class Progress:
 
 
 def cmd_compress(args) -> int:
-    src = args.input
-    dst = args.output or (src.rstrip("/\\") + ".lmz")
+    if getattr(args, "sources", None):
+        src = args.sources
+        dst = args.output
+        if not dst:
+            if hasattr(args, "inputs") and len(args.inputs) == 1 and args.inputs[0].endswith(".lmz"):
+                dst = args.inputs[0]
+            else:
+                dst = "joint_zoo.lmz"
+    elif hasattr(args, "inputs") and len(args.inputs) > 1:
+        if args.output:
+            dst = args.output
+            src = args.inputs
+        else:
+            if args.inputs[-1].endswith(".lmz") or getattr(args, "joint", False):
+                dst = args.inputs[-1]
+                src = args.inputs[:-1]
+                if len(src) == 1:
+                    src = src[0]
+            else:
+                src = args.inputs[0]
+                dst = args.inputs[1]
+    elif hasattr(args, "inputs"):
+        src = args.inputs[0]
+        dst = args.output or (src.rstrip("/\\") + ".lmz")
+    else:
+        src = args.input
+        dst = args.output or (src.rstrip("/\\") + ".lmz")
+
     if os.path.exists(dst) and not args.force:
         print(f"lmz: {dst} exists (use -f to overwrite)", file=sys.stderr)
         return 1
@@ -83,7 +109,8 @@ def cmd_compress(args) -> int:
                          shared_tables=args.shared_tables)
     bar.done()
     if not args.quiet:
-        print(f"{src} -> {dst}")
+        src_label = src if isinstance(src, str) else f"{len(src)} source(s)"
+        print(f"{src_label} -> {dst}")
         print(f"  {human(stats.input_bytes)} -> {human(stats.output_bytes)}  "
               f"{stats.ratio:.3f}x  ({stats.saved * 100:.1f}% smaller)")
         print(f"  {stats.seconds:.2f}s  {rate(stats.throughput)}  "
@@ -678,9 +705,15 @@ def build_parser() -> argparse.ArgumentParser:
                             help=f"worker threads (default: {default_workers()})")
         sp.add_argument("-q", "--quiet", action="store_true")
 
-    c = sub.add_parser("compress", aliases=["c"], help="compress a file or directory")
-    c.add_argument("input")
-    c.add_argument("output", nargs="?", help="archive path (default: <input>.lmz)")
+    c = sub.add_parser("compress", aliases=["c"], help="compress a file, directory, or multiple model sources jointly")
+    c.add_argument("inputs", nargs="+",
+                   help="input file(s)/directory(ies) or prefix=path, optionally ending in destination .lmz")
+    c.add_argument("-o", "--output", default=None,
+                   help="destination archive path (default: <input>.lmz)")
+    c.add_argument("--sources", nargs="+", default=None,
+                   help="explicit list of input source trees with optional prefixes (e.g. base=/path/base instruct=/path/instruct)")
+    c.add_argument("--joint", action="store_true",
+                   help="compress multiple input sources jointly into a single zoo archive")
     c.add_argument("-l", "--level", type=int, default=api.DEFAULT_LEVEL,
                    help="entropy coder level (default: 1, the fastest and, on "
                         "weight data, usually the smallest too)")

@@ -97,6 +97,8 @@ static id<MTLDevice> g_dev = nil;
 static id<MTLCommandQueue> g_queue = nil;
 static id<MTLComputePipelineState> g_pso_shared = nil;
 static id<MTLComputePipelineState> g_pso_perstream = nil;
+static id<MTLComputePipelineState> g_pso_dequant_q8 = nil;
+static id<MTLComputePipelineState> g_pso_project_fp8 = nil;
 static int g_init_rc = LMZ_GPU_OK;
 static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 
@@ -166,6 +168,15 @@ static void init_metal_once(void)
             g_init_rc = LMZ_GPU_ECUDA;
             return;
         }
+
+        id<MTLFunction> fn_dequant = [lib newFunctionWithName:@"lmz_dequant_q8_0_to_fp16"];
+        if (fn_dequant) {
+            g_pso_dequant_q8 = [g_dev newComputePipelineStateWithFunction:fn_dequant error:nil];
+        }
+        id<MTLFunction> fn_fp8 = [lib newFunctionWithName:@"lmz_project_fp8_e4m3_to_bf16"];
+        if (fn_fp8) {
+            g_pso_project_fp8 = [g_dev newComputePipelineStateWithFunction:fn_fp8 error:nil];
+        }
         g_init_rc = LMZ_GPU_OK;
     }
 }
@@ -197,6 +208,25 @@ static id<MTLBuffer> make_buffer_for_ptr(id<MTLDevice> dev, const void *ptr, siz
     }
     *out_offset = 0;
     return [dev newBufferWithBytes:ptr length:(length > 1 ? length : 1) options:MTLResourceStorageModeShared];
+}
+
+LMZ_GPU_API void *lmz_gpu_make_mtl_buffer(const void *ptr, size_t length, size_t *out_offset)
+{
+    int init_rc = ensure_init();
+    if (init_rc != LMZ_GPU_OK) return NULL;
+    @autoreleasepool {
+        id<MTLBuffer> buf = make_buffer_for_ptr(g_dev, ptr, length, out_offset);
+        if (!buf) return NULL;
+        return (__bridge_retained void *)buf;
+    }
+}
+
+LMZ_GPU_API void lmz_gpu_release_mtl_buffer(void *buf_handle)
+{
+    if (buf_handle) {
+        id<MTLBuffer> buf = (__bridge_transfer id<MTLBuffer>)buf_handle;
+        (void)buf;
+    }
 }
 
 LMZ_GPU_API int lmz_gpu_decode_batch_dev(const void *d_hdr, const void *d_streams,
@@ -352,3 +382,86 @@ LMZ_GPU_API int lmz_gpu_decode_batch(const void *hdr, const void *streams, size_
         return LMZ_GPU_OK;
     }
 }
+
+LMZ_GPU_API int lmz_gpu_dequant_q8_0_to_fp16(const void *blocks, void *out, unsigned nblocks)
+{
+    if (nblocks == 0) return LMZ_GPU_OK;
+    int init_rc = ensure_init();
+    if (init_rc != LMZ_GPU_OK) return init_rc;
+    if (!g_pso_dequant_q8) return fail_msg(LMZ_GPU_EUNSUPPORTED, "dequant pipeline not available");
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        if (!cb) return fail_msg(LMZ_GPU_ECUDA, "failed to allocate command buffer");
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!enc) return fail_msg(LMZ_GPU_ECUDA, "failed to allocate compute encoder");
+
+        size_t off_b = 0, off_o = 0;
+        id<MTLBuffer> b_in = make_buffer_for_ptr(g_dev, blocks, (size_t)nblocks * 34, &off_b);
+        id<MTLBuffer> b_out = make_buffer_for_ptr(g_dev, out, (size_t)nblocks * 32 * sizeof(uint16_t), &off_o);
+
+        [enc setComputePipelineState:g_pso_dequant_q8];
+        [enc setBuffer:b_in offset:off_b atIndex:0];
+        [enc setBuffer:b_out offset:off_o atIndex:1];
+        [enc setBytes:&nblocks length:sizeof(nblocks) atIndex:2];
+
+        uint32_t tg_size = 128;
+        uint32_t tgs = (nblocks + tg_size - 1) / tg_size;
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if ([cb error]) {
+            snprintf(g_err, sizeof(g_err), "Metal dequant execution error: %s",
+                     [[[cb error] localizedDescription] UTF8String]);
+            return LMZ_GPU_ECUDA;
+        }
+        if ([b_out contents] != out) {
+            memcpy(out, (const uint8_t *)[b_out contents] + off_o, (size_t)nblocks * 32 * sizeof(uint16_t));
+        }
+        return LMZ_GPU_OK;
+    }
+}
+
+LMZ_GPU_API int lmz_gpu_project_fp8_to_bf16(const void *in, void *out, unsigned nelem)
+{
+    if (nelem == 0) return LMZ_GPU_OK;
+    int init_rc = ensure_init();
+    if (init_rc != LMZ_GPU_OK) return init_rc;
+    if (!g_pso_project_fp8) return fail_msg(LMZ_GPU_EUNSUPPORTED, "project fp8 pipeline not available");
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        if (!cb) return fail_msg(LMZ_GPU_ECUDA, "failed to allocate command buffer");
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (!enc) return fail_msg(LMZ_GPU_ECUDA, "failed to allocate compute encoder");
+
+        size_t off_i = 0, off_o = 0;
+        id<MTLBuffer> b_in = make_buffer_for_ptr(g_dev, in, (size_t)nelem, &off_i);
+        id<MTLBuffer> b_out = make_buffer_for_ptr(g_dev, out, (size_t)nelem * sizeof(uint16_t), &off_o);
+
+        [enc setComputePipelineState:g_pso_project_fp8];
+        [enc setBuffer:b_in offset:off_i atIndex:0];
+        [enc setBuffer:b_out offset:off_o atIndex:1];
+        [enc setBytes:&nelem length:sizeof(nelem) atIndex:2];
+
+        uint32_t tg_size = 256;
+        uint32_t tgs = (nelem + tg_size - 1) / tg_size;
+        [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if ([cb error]) {
+            snprintf(g_err, sizeof(g_err), "Metal project fp8 execution error: %s",
+                     [[[cb error] localizedDescription] UTF8String]);
+            return LMZ_GPU_ECUDA;
+        }
+        if ([b_out contents] != out) {
+            memcpy(out, (const uint8_t *)[b_out contents] + off_o, (size_t)nelem * sizeof(uint16_t));
+        }
+        return LMZ_GPU_OK;
+    }
+}
+

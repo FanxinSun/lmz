@@ -706,6 +706,47 @@ LMZ_API int lmz_bucket_unpartition(const uint8_t *ctx,
     return 0;
 }
 
+/* Fused unpartition and merge directly to BF16 16-bit words.
+ * Fuses reading exp and streams[b], avoiding intermediate mantissa buffer allocation. */
+LMZ_API int lmz_unpartition_merge_bf16(const uint8_t *exp,
+                                       const uint8_t *const *streams,
+                                       const uint8_t *lut,
+                                       size_t k,
+                                       uint8_t *dst,
+                                       size_t nelem)
+{
+    if (k == 0 || k > LMZ_MAX_BUCKETS) return -1;
+    const uint8_t *cur[LMZ_MAX_BUCKETS];
+    for (size_t b = 0; b < k; b++) cur[b] = streams[b];
+    size_t i = 0;
+    for (; i + 4 <= nelem; i += 4) {
+        unsigned b0 = lut[exp[i]], b1 = lut[exp[i + 1]];
+        unsigned b2 = lut[exp[i + 2]], b3 = lut[exp[i + 3]];
+        const uint8_t *p0 = cur[b0];
+        const uint8_t *p1 = cur[b1] + (b0 == b1);
+        const uint8_t *p2 = cur[b2] + (b0 == b2) + (b1 == b2);
+        const uint8_t *p3 = cur[b3] + (b0 == b3) + (b1 == b3) + (b2 == b3);
+        uint64_t sm0 = *p0, sm1 = *p1, sm2 = *p2, sm3 = *p3;
+        uint64_t e0 = exp[i], e1 = exp[i + 1], e2 = exp[i + 2], e3 = exp[i + 3];
+        uint64_t w0 = ((sm0 & 0x80) << 8) | (e0 << 7) | (sm0 & 0x7F);
+        uint64_t w1 = ((sm1 & 0x80) << 8) | (e1 << 7) | (sm1 & 0x7F);
+        uint64_t w2 = ((sm2 & 0x80) << 8) | (e2 << 7) | (sm2 & 0x7F);
+        uint64_t w3 = ((sm3 & 0x80) << 8) | (e3 << 7) | (sm3 & 0x7F);
+        *(uint64_t *)(dst + 2 * i) = w0 | (w1 << 16) | (w2 << 32) | (w3 << 48);
+        cur[b0] = p0 + 1;
+        cur[b1] = p1 + 1;
+        cur[b2] = p2 + 1;
+        cur[b3] = p3 + 1;
+    }
+    for (; i < nelem; i++) {
+        uint32_t sm = *cur[lut[exp[i]]]++;
+        uint32_t e = exp[i];
+        uint32_t w = ((sm & 0x80) << 8) | (e << 7) | (sm & 0x7F);
+        *(uint16_t *)(dst + 2 * i) = (uint16_t)w;
+    }
+    return 0;
+}
+
 /* ------------------------------------------------- k-quant sub-block work */
 
 /*

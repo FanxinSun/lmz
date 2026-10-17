@@ -1246,9 +1246,8 @@ def _decode_bf16c(payload, nelem: int, out=None):
             streams.append((block, 0))
         pos += ln
 
-    sm = kernels.bucket_unpartition(exp, streams, lut, k)
     buf = out if (out is not None and len(out) >= nelem * 2) else bytearray(nelem * 2)
-    return kernels.merge_bf16([(exp, 0), (sm, 0)], nelem, buf)
+    return kernels.unpartition_merge_bf16(exp, streams, lut, k, buf)
 
 
 def decode_chunk(payload, codec: int, esize: int, flags: int, rlen: int,

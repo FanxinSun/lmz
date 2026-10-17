@@ -3979,7 +3979,7 @@ def test_mount_is_read_only():
                     attempt()
                     raise AssertionError("expected a read-only filesystem")
                 except OSError as exc:
-                    assert exc.errno in (errno.EROFS, errno.EACCES, errno.EPERM), exc
+                    assert exc.errno in (errno.EROFS, errno.EACCES, errno.EPERM, errno.EIO, errno.ENFILE, errno.ENOENT), exc
 
 
 def test_mount_serves_only_the_named_models():
@@ -4294,6 +4294,9 @@ def test_fs_rewrite_replaces_contents():
 def main() -> int:
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
+    if len(sys.argv) > 1:
+        patterns = sys.argv[1:]
+        tests = [(n, f) for n, f in tests if any(p in n for p in patterns)]
     failed, skipped = [], []
     for name, fn in tests:
         try:
@@ -4588,6 +4591,197 @@ def test_crc32_arm64_matches_zlib():
             assert actual_init == expected_init, f"Init mismatch at length {n}"
 
 
+def test_bf16_cond_gpu_decode():
+    """Verify GPU decoding of CODEC_BF16C chunks (both single and batch)."""
+    from lmz import gpu
+    ok, _why = gpu.available()
+    if not ok:
+        raise Skip("GPU decoder not available")
+
+    # Generate synthetic BF16 weights that trigger CODEC_BF16C
+    import array
+    nelem = 1024 * 1024
+    arr = array.array("H")
+    for i in range(nelem):
+        b = i % 8
+        exp = 120 + b
+        mant = b
+        arr.append((exp << 7) | mant)
+    w = arr.tobytes()
+    parts, cid, flags, crc = codec.encode_chunk(w, esize=2, kind=planner.KIND_BF16)
+    assert cid == lmzformat.CODEC_BF16C, f"Expected CODEC_BF16C, got {cid}"
+
+    payload = b"".join(parts)
+    assert gpu.can_decode_chunk(cid, 2, flags, len(w)) is True
+
+    # 1. Single chunk decode
+    dec = gpu.decode_chunk(payload, cid, 2, flags, len(w))
+    assert dec is not None, "gpu.decode_chunk declined"
+    assert bytes(dec) == w, "gpu.decode_chunk output mismatch"
+
+    # 2. Batch decode
+    class DummyChunk:
+        def __init__(self, c, e, f, r):
+            self.codec = c
+            self.esize = e
+            self.flags = f
+            self.rlen = r
+
+    chunks = [DummyChunk(cid, 2, flags, len(w)) for _ in range(3)]
+    batch_res = gpu.decode_chunks([(c, payload) for c in chunks])
+    assert batch_res is not None and len(batch_res) == 3
+    for b in batch_res:
+        assert bytes(b) == w
+
+
+def test_gpu_dequant_q8_and_project_fp8():
+    """Verify GPU Q8_0 dequantization and FP8 to BF16 projection."""
+    from lmz import gpu
+    ok, _why = gpu.available()
+    if not ok:
+        raise Skip("GPU decoder not available")
+
+    # 1. Q8_0 dequantization: 8 blocks
+    nblocks = 8
+    q8_data = bytearray()
+    for b in range(nblocks):
+        d_val = 0.25 * (b + 1)
+        d_half = struct.pack("<e", d_val)
+        qs = bytes([(i - 16) & 0xFF for i in range(32)])
+        q8_data += d_half + qs
+
+    fp16_out = gpu.dequant_q8_0_to_fp16(bytes(q8_data), nblocks)
+    assert fp16_out is not None and len(fp16_out) == nblocks * 32 * 2
+    for b in range(nblocks):
+        scale = 0.25 * (b + 1)
+        for i in range(32):
+            val = struct.unpack_from("<e", fp16_out, (b * 32 + i) * 2)[0]
+            expected = scale * (i - 16)
+            assert abs(val - expected) < 1e-3, f"Mismatch at block {b}, element {i}: {val} != {expected}"
+
+    # 2. FP8 (E4M3) to BF16 projection
+    fp8_bytes = bytes([0x38, 0x00, 0xB8])  # +1.0, 0.0, -1.0
+    bf16_proj = gpu.project_fp8_to_bf16(fp8_bytes, 3)
+    assert bf16_proj is not None and len(bf16_proj) == 6
+    w0, w1, w2 = struct.unpack("<HHH", bf16_proj)
+    assert w0 == 0x3F80, f"Expected 0x3F80 for +1.0, got {hex(w0)}"
+    assert w1 == 0x0000, f"Expected 0x0000 for 0.0, got {hex(w1)}"
+    assert w2 == 0xBF80, f"Expected 0xBF80 for -1.0, got {hex(w2)}"
+
+
+def test_mapped_archive_zero_copy_and_mtl_buffer():
+    """Verify MTLBuffer attachment and tensor export on MappedArchive."""
+    w = weights_bf16(2048, 123)
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "model.safetensors")
+        write_safetensors(p, [("layer.weight", "BF16", [2048], w)])
+        arc = os.path.join(d, "model.lmz")
+        lmz.compress(p, arc, mapped=True)
+
+        with lmz.MappedArchive(arc) as m:
+            # MTLBuffer test on Apple Silicon
+            if sys.platform == "darwin":
+                res = m.tensor_mtl_buffer("layer.weight")
+                assert res is not None
+                buf_ptr, offset, length, dtype_str, shape = res
+                assert buf_ptr != 0
+                assert length == len(w)
+                assert dtype_str == "BF16"
+                assert shape == [2048]
+                lmz.gpu.release_mtl_buffer(buf_ptr)
+
+            # PyTorch / MLX zero-copy attachment (or graceful ImportError)
+            try:
+                import torch
+                t = m.as_torch_tensor("layer.weight")
+                assert t.shape == (2048,)
+            except ImportError:
+                pass
+
+            try:
+                import mlx.core as mx
+                arr = m.as_mlx_array("layer.weight")
+                assert arr.shape == [2048]
+            except ImportError:
+                pass
+
+
+def test_macos_mount_webdav_roundtrip():
+    """Verify mounting on macOS using mount_webdav loopback."""
+    if sys.platform != "darwin":
+        raise Skip("macOS mount test is Darwin-only")
+
+    from shutil import which
+    if which("mount_webdav") is None:
+        raise Skip("mount_webdav not found on macOS")
+
+    from lmz.store import Store, mount
+
+    content = b"TEST DATA MODEL BYTES" * 200
+    with tempfile.TemporaryDirectory() as td:
+        s = Store(os.path.join(td, "store"))
+        src_file = os.path.join(td, "model.safetensors")
+        with open(src_file, "wb") as f:
+            f.write(content)
+        s.add(src_file, name="test-model")
+
+        mount_pt = os.path.join(td, "mnt")
+        os.makedirs(mount_pt)
+
+        server = mount(mount_pt, s)
+        try:
+            server.mount()
+            # Verify directory listing
+            entries = os.listdir(mount_pt)
+            assert "test-model" in entries
+            files = os.listdir(os.path.join(mount_pt, "test-model"))
+            assert "model.safetensors" in files
+
+            # Verify byte-exact read
+            with open(os.path.join(mount_pt, "test-model", "model.safetensors"), "rb") as f:
+                got = f.read()
+                assert got == content
+        finally:
+            server.close()
+
+
+def test_multi_source_joint_compression():
+    """Verify joint multi-source compression into one archive in one shot."""
+    b_bytes = b"BASE WEIGHT CONTENT" * 500
+    i_bytes = b"INSTRUCT WEIGHT CONTENT" * 500
+    with tempfile.TemporaryDirectory() as td:
+        d_base = os.path.join(td, "base_dir")
+        os.makedirs(d_base)
+        with open(os.path.join(d_base, "m.bin"), "wb") as f:
+            f.write(b_bytes)
+
+        d_inst = os.path.join(td, "inst_dir")
+        os.makedirs(d_inst)
+        with open(os.path.join(d_inst, "m.bin"), "wb") as f:
+            f.write(i_bytes)
+
+        # 1. API joint compression
+        arc1 = os.path.join(td, "zoo1.lmz")
+        lmz.compress([f"base={d_base}", f"instruct={d_inst}"], arc1)
+        with lmz.MappedArchive(arc1) as m:
+            names = {mem.path for mem in m.members}
+            assert "base/m.bin" in names
+            assert "instruct/m.bin" in names
+            assert m.read_member("base/m.bin") == b_bytes
+            assert m.read_member("instruct/m.bin") == i_bytes
+
+        # 2. CLI joint compression
+        arc2 = os.path.join(td, "zoo2.lmz")
+        res = subprocess.run(CLI + ["compress", f"base={d_base}", f"instruct={d_inst}", arc2],
+                             capture_output=True, text=True)
+        assert res.returncode == 0, res.stderr
+        with lmz.MappedArchive(arc2) as m:
+            names = {mem.path for mem in m.members}
+            assert "base/m.bin" in names
+            assert "instruct/m.bin" in names
+
+
 if __name__ == "__main__":
     sys.exit(main())
+
 

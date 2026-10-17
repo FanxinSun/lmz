@@ -89,6 +89,11 @@ def _load_native():
             lib.lmz_bucket_unpartition.argtypes = [v, ctypes.POINTER(ctypes.c_void_p),
                                                    ctypes.c_size_t, v,
                                                    ctypes.c_size_t, v]
+            if hasattr(lib, "lmz_unpartition_merge_bf16"):
+                lib.lmz_unpartition_merge_bf16.restype = ctypes.c_int
+                lib.lmz_unpartition_merge_bf16.argtypes = [
+                    v, ctypes.POINTER(ctypes.c_void_p), v,
+                    ctypes.c_size_t, v, ctypes.c_size_t]
             lib.lmz_decode_planes.restype = ctypes.c_int
             lib.lmz_decode_planes.argtypes = [
                 v, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
@@ -624,6 +629,29 @@ def bucket_unpartition(ctx, streams, lut: bytes, k: int, out=None):
         dst[i] = views[b][cur[b]]
         cur[b] += 1
     return memoryview(dst)[:n]
+
+
+def unpartition_merge_bf16(exp, streams, lut: bytes, k: int, out=None):
+    """Fused unpartition and merge of exponent and bucket streams directly to BF16 words."""
+    n = len(exp)
+    dst = out if (out is not None and len(out) >= 2 * n) else bytearray(2 * n)
+    if n == 0:
+        return memoryview(dst)[:0]
+    lib = _load_native()
+    if lib is not None and hasattr(lib, "lmz_unpartition_merge_bf16"):
+        keep = []
+        addrs = (ctypes.c_void_p * k)()
+        for b, (obj, off) in enumerate(streams):
+            addr, ref = _ptr(obj)
+            keep.append(ref)
+            addrs[b] = (addr + off) if addr else 0
+        ea, _a = _ptr(exp)
+        la, _b = _ptr(lut)
+        da, _c = _ptr(dst)
+        if lib.lmz_unpartition_merge_bf16(ea, addrs, la, k, da, n) == 0:
+            return memoryview(dst)[:2 * n]
+    sm = bucket_unpartition(exp, streams, lut, k)
+    return merge_bf16([(exp, 0), (sm, 0)], n, dst)
 
 
 # Working area for whole-chunk decodes: the planes, then whatever the merge

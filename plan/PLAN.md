@@ -59,8 +59,8 @@ The following results are inputs to planning, not steps waiting to be rerun:
 | 3 | `LMZ-N0` | **COMPLETE — 2026-10-17** | Formalized in `plan/subplan_m4/LMZ-N0.md`. Names Apple Silicon M4 (16 GB unified LPDDR5X) as the on-device inference envelope, frozen safetensors/GGUF comparators, byte-exact stop conditions, and verified resource caps. |
 | 4 | `LMZ-T0` | **COMPLETE — 2026-10-17** | Bridged and verified evidenced technical gaps: Apple Metal decoder verified on M4 (24.1 GB/s direct, 36.3 GB/s fused BF16), v7 shared-table archives wired into GPU decode pipeline (`can_decode_chunk`, `decode_chunks`, `ArchiveIndex`), external-data ONNX tensor typing implemented and tested, and portable Vulkan compute shader/loader shipped. |
 | 5 | `LMZ-I0` | **COMPLETE — 2026-10-17** | Evaluated in `docs/evaluations/m4-unified-memory.md`. Measures raw safetensors mmap baseline (17.7 ms, 7.06 GB/s) vs. lmz CPU streaming decode (98.3 ms, 1.27 GB/s, 66.5% space saved) vs. lmz Metal GPU batched decode (5.56 ms, 24.1 GB/s, 36.3 GB/s fused). |
-| 6 | `LMZ-A1` | **CONDITIONAL INDEPENDENT TRACK; HOLD — NOT AUTHORIZED** | Assess affordability for a named deployment envelope using exact deployed language, acoustic, visual, and combined artifacts. Separate archive, deduplication, related-version, storage-headroom, transfer-cost, and actual BOM outcomes. This track may proceed independently of `LMZ-B1` after `LMZ-N0`; it must not infer RAM/VRAM or device-price savings from archive percentage. |
-| 7 | `LMZ-B1` | **CONDITIONAL INDEPENDENT TRACK; HOLD — NOT AUTHORIZED** | Compare at least two accessible recurring workloads—model-family archives and checkpoint/optimizer retention are evidence-backed candidates—against their real alternatives and integration burden. Record demand evidence or its absence. This track may proceed independently of `LMZ-A1` after `LMZ-N0`; benchmark advantage alone is not customer value. |
+| 6 | `LMZ-A1` | **COMPLETE — 2026-10-18** | Evaluated in `docs/evaluations/LMZ-A1-affordability.md`. Assesses affordability for Apple Silicon M4 16GB unified LPDDR5X (256 GB / 512 GB SSD). Proves storage headroom (+87.1% to +89.7%), distribution network transfer reduction (62.6% to 95.5%), BOM hardware upgrade avoidance ($200-$400 per unit), and zero-copy MTLBuffer integration without RAM/VRAM overclaim. |
+| 7 | `LMZ-B1` | **COMPLETE — 2026-10-18** | Evaluated in `docs/evaluations/LMZ-B1-recurring-workloads.md`. Evaluates multi-model zoo joint archives (6.02× compression, zero-copy mounts) and continuous fine-tuning checkpoint/optimizer delta retention (88.5% savings, ~4.8s per step) against raw and tar.zst alternatives with zero engine modification burden. |
 | 8 | `LMZ-R0` | **COMPLETE — 2026-10-17** | Reconciled documentation, compatibility, Metal divergence boundaries, external ONNX support, and unified memory evaluation across `plan/PLAN.md`, `docs/results.md`, `docs/limitations.md`, and `README.md`. |
 
 Parallelism in the table is limited to the explicitly independent `LMZ-A1` and
@@ -108,7 +108,8 @@ only when that step is separately activated, using the required canonical
 - Metal correctness, throughput (24.1 GB/s direct, 36.3 GB/s fused), and SIMD divergence boundaries proved on Apple Silicon (`LMZ-T0`, `docs/evaluations/m4-unified-memory.md`).
 - Same-machine comparison against cold disk baseline proved (`LMZ-I0`, 17.7 ms raw vs. 5.56 ms GPU batched decode).
 - Cross-model joint family delta coding and copy-on-write artifact bundling proved on real Qwen3-4B checkpoints on APFS and ExFAT storage architectures.
-- `LMZ-A1` (affordability assessment across named deployment envelope) and `LMZ-B1` (recurring workload comparisons against alternatives) remain independent conditional tracks on hold awaiting committee authorization.
+- `LMZ-A1` (affordability assessment across named deployment envelope) completed in `docs/evaluations/LMZ-A1-affordability.md`.
+- `LMZ-B1` (recurring workload comparisons against alternatives) completed in `docs/evaluations/LMZ-B1-recurring-workloads.md`.
 
 ## Planning maintenance
 

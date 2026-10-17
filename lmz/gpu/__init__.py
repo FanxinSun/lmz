@@ -28,8 +28,9 @@ from . import vulkan
 
 __all__ = ["available", "backend", "can_decode_chunk", "cost_model",
            "decode_batch", "decode_batch_dev", "decode_chunk", "decode_chunks",
-           "grain", "header_bytes", "last_error", "pad_bytes", "state", "verify",
-           "vulkan"]
+           "dequant_q8_0_to_fp16", "grain", "header_bytes", "last_error",
+           "make_mtl_buffer", "pad_bytes", "project_fp8_to_bf16",
+           "release_mtl_buffer", "state", "verify", "vulkan"]
 
 # Kept in step with ABI_VERSION in lmzgpu.cu. A library built from an older
 # source is ignored rather than called with the wrong argument list.
@@ -165,6 +166,18 @@ def _load():
             lib.lmz_gpu_decode_batch_dev.restype = c_int
             lib.lmz_gpu_decode_batch_dev.argtypes = [v, v, v, c_uint, c_uint, v,
                                                      v, c_uint]
+            if hasattr(lib, "lmz_gpu_dequant_q8_0_to_fp16"):
+                lib.lmz_gpu_dequant_q8_0_to_fp16.restype = c_int
+                lib.lmz_gpu_dequant_q8_0_to_fp16.argtypes = [v, v, c_uint]
+            if hasattr(lib, "lmz_gpu_project_fp8_to_bf16"):
+                lib.lmz_gpu_project_fp8_to_bf16.restype = c_int
+                lib.lmz_gpu_project_fp8_to_bf16.argtypes = [v, v, c_uint]
+            if hasattr(lib, "lmz_gpu_make_mtl_buffer"):
+                lib.lmz_gpu_make_mtl_buffer.restype = v
+                lib.lmz_gpu_make_mtl_buffer.argtypes = [v, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+            if hasattr(lib, "lmz_gpu_release_mtl_buffer"):
+                lib.lmz_gpu_release_mtl_buffer.restype = None
+                lib.lmz_gpu_release_mtl_buffer.argtypes = [v]
             device = _probed
             prefix = "metal:" if sys.platform == "darwin" or "Metal" in device else "cuda:"
             if not _selftest(lib):
@@ -793,40 +806,166 @@ def decode_batch_dev(streams, offsets, nstr: int, plane: int, out,
         ctypes.c_void_p(stream or 0), tpb)
 
 
+def dequant_q8_0_to_fp16(blocks, nblocks: int, out=None):
+    """GPU in-kernel dequantization of Q8_0 blocks to FP16 half-precision words."""
+    lib = _load()
+    if lib is None or not hasattr(lib, "lmz_gpu_dequant_q8_0_to_fp16"):
+        return None
+    need = nblocks * 32 * 2
+    dst = out if (out is not None and len(out) >= need) else bytearray(need)
+    b_addr, _a = _ptr(blocks)
+    d_addr, _b = _ptr(dst)
+    rc = lib.lmz_gpu_dequant_q8_0_to_fp16(b_addr, d_addr, nblocks)
+    if rc == OK:
+        return memoryview(dst)[:need]
+    return None
+
+
+def project_fp8_to_bf16(fp8_data, nelem: int, out=None):
+    """GPU in-kernel projection of FP8 (E4M3) elements to BF16 words."""
+    lib = _load()
+    if lib is None or not hasattr(lib, "lmz_gpu_project_fp8_to_bf16"):
+        return None
+    need = nelem * 2
+    dst = out if (out is not None and len(out) >= need) else bytearray(need)
+    s_addr, _a = _ptr(fp8_data)
+    d_addr, _b = _ptr(dst)
+    rc = lib.lmz_gpu_project_fp8_to_bf16(s_addr, d_addr, nelem)
+    if rc == OK:
+        return memoryview(dst)[:need]
+    return None
+
+
+def make_mtl_buffer(data):
+    """Wrap or share memoryview/bytes into an Apple Silicon MTLBuffer.
+    Returns (raw_ptr, offset, length) or None if Metal is unavailable.
+    """
+    lib = _load()
+    if lib is None or not hasattr(lib, "lmz_gpu_make_mtl_buffer"):
+        return None
+    ptr, ref = _ptr(data)
+    if ptr is None:
+        return None
+    length = len(data)
+    out_off = ctypes.c_size_t(0)
+    buf_ptr = lib.lmz_gpu_make_mtl_buffer(ptr, length, ctypes.byref(out_off))
+    if not buf_ptr:
+        return None
+    return buf_ptr, out_off.value, length
+
+
+def release_mtl_buffer(buf_ptr):
+    """Release an MTLBuffer handle returned by make_mtl_buffer."""
+    lib = _load()
+    if lib is not None and hasattr(lib, "lmz_gpu_release_mtl_buffer") and buf_ptr:
+        lib.lmz_gpu_release_mtl_buffer(buf_ptr)
+
+
 def can_decode_chunk(codec: int, esize: int, flags: int, rlen: int) -> bool:
     """Whether the GPU decoder can take this chunk."""
     lib = _load()
     if lib is None:
         return False
-    from ..format import CODEC_SPLIT, CODEC_BF16, CODEC_SPLIT_ST
-    if codec not in (CODEC_SPLIT, CODEC_BF16, CODEC_SPLIT_ST):
-        return False
-    if esize not in (2, 4, 8) or (rlen % esize) != 0:
-        return False
-    nplanes = 2 if codec == CODEC_BF16 else esize
-    nelem = rlen // nplanes
-    g = grain()
-    if nelem == 0 or (nelem % g) != 0:
-        return False
-    for k in range(nplanes):
-        m = (flags >> (2 * k)) & 0x3
-        if m not in (0, 3):  # 0 is stored, 3 is rANS
+    from ..format import CODEC_SPLIT, CODEC_BF16, CODEC_SPLIT_ST, CODEC_BF16C
+    if codec in (CODEC_SPLIT, CODEC_BF16, CODEC_SPLIT_ST):
+        if esize not in (2, 4, 8) or (rlen % esize) != 0:
             return False
-    return True
+        nplanes = 2 if codec == CODEC_BF16 else esize
+        nelem = rlen // nplanes
+        g = grain()
+        if nelem == 0 or (nelem % g) != 0:
+            return False
+        for k in range(nplanes):
+            m = (flags >> (2 * k)) & 0x3
+            if m not in (0, 3):  # 0 is stored, 3 is rANS
+                return False
+        return True
+    elif codec == CODEC_BF16C:
+        if esize != 2 or (rlen % 2) != 0:
+            return False
+        nelem = rlen // 2
+        g = grain()
+        if nelem == 0 or (nelem % g) != 0:
+            return False
+        return True
+    return False
 
 
 def decode_chunk(payload, codec: int, esize: int, flags: int, rlen: int,
                  tables=None, out=None):
-    """Decode one split or shared-table chunk using the GPU decoder.
+    """Decode one split, shared-table, or bf16-cond chunk using the GPU decoder.
 
-    Supports CODEC_SPLIT, CODEC_BF16, and CODEC_SPLIT_ST (v7 shared tables).
+    Supports CODEC_SPLIT, CODEC_BF16, CODEC_SPLIT_ST (v7 shared tables), and CODEC_BF16C.
     Returns a memoryview of the merged plaintext bytes, or None if the GPU
     decoder declines.
     """
     if not can_decode_chunk(codec, esize, flags, rlen):
         return None
-    from ..format import CODEC_SPLIT, CODEC_BF16, CODEC_SPLIT_ST
+    from ..format import CODEC_SPLIT, CODEC_BF16, CODEC_SPLIT_ST, CODEC_BF16C
     from .. import kernels
+
+    if codec == CODEC_BF16C:
+        from ..codec import _bf16c_hdr
+        if len(payload) < _bf16c_hdr.size:
+            return None
+        nelem = rlen // 2
+        k, exp_method, *rest = _bf16c_hdr.unpack_from(payload, 0)
+        sm_methods = rest[:k]
+        exp_len = rest[k]
+        seg_lens = rest[k + 1:]
+        pos = _bf16c_hdr.size
+        if pos + exp_len > len(payload):
+            return None
+        exp_payload = payload[pos:pos + exp_len]
+        pos += exp_len
+
+        if exp_method == 0:
+            if exp_len != nelem:
+                return None
+            exp = exp_payload
+        elif exp_method == 3:
+            off_bytes = struct.pack("<QQ", 0, exp_len)
+            exp = decode_batch(exp_payload, off_bytes, 1, nelem)
+            if exp is None:
+                exp = kernels.rans_decode(exp_payload, nelem)
+            if exp is None or len(exp) != nelem:
+                return None
+        else:
+            return None
+
+        ehist = kernels.histogram(exp)
+        lut = kernels.bucket_lut(ehist, k)
+        counts = kernels.bucket_counts(ehist, lut, k)
+
+        streams = []
+        mv = memoryview(payload)
+        for b in range(k):
+            ln = seg_lens[b]
+            want = counts[b]
+            if pos + ln > len(payload):
+                return None
+            m = sm_methods[b]
+            if want == 0:
+                if ln != 0:
+                    return None
+                streams.append((b"", 0))
+            elif m == 0:
+                if ln != want:
+                    return None
+                streams.append((payload, pos))
+            elif m == 3:
+                block = kernels.rans_decode(mv[pos:pos + ln], want)
+                if block is None or len(block) != want:
+                    return None
+                streams.append((block, 0))
+            else:
+                return None
+            pos += ln
+
+        need = nelem * 2
+        dst = out if (out is not None and len(out) >= need) else bytearray(need)
+        res = kernels.unpartition_merge_bf16(exp, streams, lut, k, dst)
+        return memoryview(res)[:need]
 
     nplanes = 2 if codec == CODEC_BF16 else esize
     nelem = rlen // nplanes
@@ -891,7 +1030,7 @@ def decode_chunks(chunks_and_payloads, tables=None):
     lib = _load()
     if lib is None:
         return None
-    from ..format import CODEC_SPLIT, CODEC_BF16, CODEC_SPLIT_ST
+    from ..format import CODEC_SPLIT, CODEC_BF16, CODEC_SPLIT_ST, CODEC_BF16C
     from .. import kernels
 
     for item in chunks_and_payloads:
@@ -922,6 +1061,83 @@ def decode_chunks(chunks_and_payloads, tables=None):
     codec = first_c.codec
     esize = first_c.esize
     rlen = first_c.rlen
+
+    if codec == CODEC_BF16C:
+        from ..codec import _bf16c_hdr
+        nelem = rlen // 2
+        hdr_size = _bf16c_hdr.size
+        parsed = []
+        for c, p in chunks_and_payloads:
+            if len(p) < hdr_size:
+                return None
+            k, exp_method, *rest = _bf16c_hdr.unpack_from(p, 0)
+            sm_methods = rest[:k]
+            exp_len = rest[k]
+            seg_lens = rest[k + 1:]
+            pos = hdr_size
+            if pos + exp_len > len(p):
+                return None
+            exp_payload = p[pos:pos + exp_len]
+            pos += exp_len
+            parsed.append((k, exp_method, sm_methods, exp_len, seg_lens, exp_payload, pos, p))
+
+        all_rans = all(item[1] == 3 for item in parsed)
+        if all_rans:
+            cat = bytearray()
+            offs = bytearray()
+            c_off = 0
+            for item in parsed:
+                s = item[5]
+                slen = len(s)
+                offs += struct.pack("<QQ", c_off, slen)
+                cat += s
+                c_off += slen
+            batch_exp = decode_batch(bytes(cat), bytes(offs), N, nelem)
+            if batch_exp is not None:
+                decoded_exps = [batch_exp[i * nelem:(i + 1) * nelem] for i in range(N)]
+            else:
+                decoded_exps = [kernels.rans_decode(item[5], nelem) for item in parsed]
+        else:
+            decoded_exps = []
+            for item in parsed:
+                if item[1] == 0:
+                    decoded_exps.append(item[5])
+                else:
+                    d = kernels.rans_decode(item[5], nelem)
+                    if d is None:
+                        return None
+                    decoded_exps.append(d)
+
+        for i in range(N):
+            exp = decoded_exps[i]
+            k, exp_method, sm_methods, exp_len, seg_lens, exp_payload, pos, p = parsed[i]
+            ehist = kernels.histogram(exp)
+            lut = kernels.bucket_lut(ehist, k)
+            counts = kernels.bucket_counts(ehist, lut, k)
+
+            streams = []
+            mv = memoryview(p)
+            for b in range(k):
+                ln = seg_lens[b]
+                want = counts[b]
+                m = sm_methods[b]
+                if want == 0:
+                    streams.append((b"", 0))
+                elif m == 0:
+                    streams.append((p, pos))
+                elif m == 3:
+                    block = kernels.rans_decode(mv[pos:pos + ln], want)
+                    if block is None:
+                        return None
+                    streams.append((block, 0))
+                else:
+                    return None
+                pos += ln
+
+            dst = bytearray(nelem * 2)
+            res = kernels.unpartition_merge_bf16(exp, streams, lut, k, dst)
+            results.append(memoryview(res))
+        return results
     nplanes = 2 if codec == CODEC_BF16 else esize
     nelem = rlen // nplanes
     hdr_size = nplanes * 4
