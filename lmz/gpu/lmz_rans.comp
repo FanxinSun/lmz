@@ -1,0 +1,124 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+// lmz portable rANS compute decoder for Vulkan.
+//
+// Complies with Vulkan 1.1+ compute with subgroup operations.
+// Maps 8 rANS states across 8 lanes of a subgroup, using subgroupBallot
+// and subgroupBallotExclusiveBitCount for parallel refills.
+
+#define PROB_BITS 12
+#define PROB_SCALE (1u << PROB_BITS)
+#define RANS_L (1u << 16)
+#define NST 8
+#define TG_SIZE 128
+#define GROUPS (TG_SIZE / NST)
+#define STAGE_ITERS 16
+#define GRAIN (NST * STAGE_ITERS)
+
+layout(local_size_x = TG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConsts {
+    uint nstr;
+    uint plane;
+} pc;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputStreams {
+    uint8_t streams[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer StreamOffsets {
+    uint64_t offsets[];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer OutputPlanes {
+    uint8_t out_planes[];
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer HeaderData {
+    uint8_t hdr_bytes[];
+};
+
+shared uint s_lut[PROB_SCALE];
+shared uint s_starts[256];
+shared uint8_t s_stage[GROUPS * GRAIN];
+
+void build_lut(uint tid) {
+    if (tid == 0) {
+        uint s = 0;
+        for (uint i = 0; i < 256; i++) {
+            s_starts[i] = s;
+            uint f = uint(hdr_bytes[4 + 2 * i]) | (uint(hdr_bytes[5 + 2 * i]) << 8);
+            s += f;
+        }
+    }
+    barrier();
+
+    for (uint i = tid; i < 256; i += TG_SIZE) {
+        uint f = uint(hdr_bytes[4 + 2 * i]) | (uint(hdr_bytes[5 + 2 * i]) << 8);
+        uint st = s_starts[i];
+        uint packed_val = ((f > 0u ? f - 1u : 0u) << 20) | (st << 8) | i;
+        for (uint j = 0; j < f; j++) {
+            s_lut[st + j] = packed_val;
+        }
+    }
+    barrier();
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    build_lut(tid);
+
+    uint k = tid % NST;
+    uint grp = tid / NST;
+    uint gid = gl_WorkGroupID.x * GROUPS + grp;
+
+    if (gid >= pc.nstr) {
+        return;
+    }
+
+    uint64_t stream_base = offsets[2 * gid];
+    uint64_t dst_base = uint64_t(gid) * uint64_t(pc.plane);
+
+    uint st = uint(streams[stream_base + 4 * k]) |
+              (uint(streams[stream_base + 4 * k + 1]) << 8) |
+              (uint(streams[stream_base + 4 * k + 2]) << 16) |
+              (uint(streams[stream_base + 4 * k + 3]) << 24);
+
+    uint64_t ptr = stream_base + 4 * NST;
+    uint consumed = 0;
+
+    for (uint base = 0; base < pc.plane; base += GRAIN) {
+        for (uint s = 0; s < STAGE_ITERS; s++) {
+            uint e = s_lut[st & (PROB_SCALE - 1)];
+            s_stage[grp * GRAIN + s * NST + k] = uint8_t(e & 0xff);
+
+            uint sv = (e >> 8) & 0xfff;
+            uint fq = (e >> 20) + 1;
+            uint x = fq * (st >> PROB_BITS) + (st & (PROB_SCALE - 1)) - sv;
+            bool need = (x < RANS_L);
+
+            uvec4 ball = subgroupBallot(need);
+            uint before = subgroupBallotExclusiveBitCount(ball);
+            uint64_t p = ptr + consumed + 2 * before;
+            uint w = uint(streams[p]) | (uint(streams[p + 1]) << 8);
+
+            st = need ? ((x << 16) | w) : x;
+            consumed += 2 * subgroupBallotBitCount(ball);
+        }
+
+        barrier();
+
+        // Write stage buffer to output plane
+        uint out_idx = base + k * 16;
+        if (out_idx < pc.plane) {
+            for (uint b = 0; b < 16 && (out_idx + b) < pc.plane; b++) {
+                out_planes[dst_base + out_idx + b] = s_stage[grp * GRAIN + k * 16 + b];
+            }
+        }
+
+        barrier();
+    }
+}

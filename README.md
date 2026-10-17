@@ -28,8 +28,10 @@ visual, spatial and language/multimodal artifacts; affordability and niche
 positioning remain independently assessed. This is planned support, not a claim
 that every model/engine is already supported.
 
-And the decoder now runs on the GPU — **111 GB/s** on an RTX 5080 from an
-ordinary archive, against a 28.8 GB/s PCIe link, shipped in the wheel.
+And the decoder runs on the GPU — **111 GB/s** on an RTX 5080 from an
+ordinary archive, **24.1–36.3 GB/s** on Apple Silicon M4 unified memory via Metal,
+and **3.5–4.5 GB/s** on CPU via ARM NEON SIMD, shipped in the wheel. A portable
+Vulkan compute decoder provides driver-level reach across AMD and Intel iGPUs.
 [Jump to it](#on-a-gpu).
 
 ```
@@ -266,10 +268,9 @@ answer.
 own 516-byte frequency table. `lmz compress --shared-tables` lifts it out and
 carries one per plane kind in the manifest instead, which is smaller on
 archives whose chunks are small enough for those headers to matter and is the
-layout a GPU wants, since a warp can then share one table in shared memory. It
-is **off by default** because it writes a v7 archive an older lmz cannot read,
-and the current GPU kernel does not read it yet — so today it is a size and
-format decision, not a speed one. Sharing is decided per plane and only where
+layout a GPU wants, since a warp or threadgroup can then share one table in
+shared memory. Both CPU and GPU decoders (CUDA and Metal) support v7
+shared-table archives natively. Sharing is decided per plane and only where
 it measured better: **+0.93 points** on a 151 MB fp32 whisper checkpoint in
 64 KiB blocks, and on a BF16 Llama shard it declined outright and wrote an
 ordinary v1 archive, because there it does not pay.

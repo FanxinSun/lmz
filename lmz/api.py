@@ -17,6 +17,7 @@ import struct
 import sys
 import threading
 import time
+import zlib
 from bisect import bisect_right
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -371,6 +372,26 @@ def _safe_member_path(base: str, rel: str) -> str:
 # ------------------------------------------------------------------ compress
 
 
+def _resolve_onnx_external_members(members: list[Member], layouts: list, sizes: list[int]):
+    """Link ONNX external_data references to their sidecar members in the archive."""
+    by_rel = {posixpath.normpath(m.path): idx for idx, m in enumerate(members)}
+    for idx, layout in enumerate(layouts):
+        if layout and getattr(layout, "external_tensors", None):
+            m_path = members[idx].path
+            base_dir = posixpath.dirname(m_path)
+            for loc, tlist in layout.external_tensors.items():
+                resolved = posixpath.normpath(posixpath.join(base_dir, loc)) if base_dir else posixpath.normpath(loc)
+                if resolved in by_rel:
+                    target_idx = by_rel[resolved]
+                    if layouts[target_idx].kind == "raw":
+                        from .planner import plan_external_sidecar
+                        sidecar_layout = plan_external_sidecar(sizes[target_idx], tlist)
+                        if sidecar_layout is not None:
+                            layouts[target_idx] = sidecar_layout
+                            members[target_idx].kind = sidecar_layout.kind
+                            members[target_idx].tensors = sidecar_layout.tensors
+
+
 def _find_duplicate_tensors(paths: list[str], members: list[Member],
                             layouts: list, workers: int):
     """Byte-identical tensors across (and within) members, found by hashing.
@@ -509,6 +530,7 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
         sizes.append(size)
         base += size
     total_new = base - base_total
+    _resolve_onnx_external_members(members, layouts, sizes)
 
     arc = MappedArchive(archive, verify=False, cache_blocks=8)
     try:
@@ -1147,6 +1169,7 @@ def compress(src: str, dst: str, *, level: int = DEFAULT_LEVEL,
         sizes.append(size)
         base += size
     total_in = base
+    _resolve_onnx_external_members(members, layouts, sizes)
 
     refs_by_member: dict[int, list] = {}
     dedup_bytes = 0
@@ -1344,7 +1367,7 @@ def _range_resolver(chunks, payload_of, verify_checksums: bool, tables=None):
     return resolve
 
 
-def _chunk_decoder(chunks, payload_of, verify_checksums: bool, tables=None):
+def _chunk_decoder(chunks, payload_of, verify_checksums: bool, tables=None, gpu: bool = False):
     """Decode any chunk, resolving ref and delta sources as needed."""
     resolve = _range_resolver(chunks, payload_of, verify_checksums, tables)
 
@@ -1359,6 +1382,18 @@ def _chunk_decoder(chunks, payload_of, verify_checksums: bool, tables=None):
             return _codec.decode_delta(payload, chunk.esize, chunk.flags,
                                        chunk.rlen, resolve(src, chunk.rlen),
                                        chunk.crc, verify_checksums)
+        if gpu:
+            from . import gpu as _gpu
+            gpu_res = _gpu.decode_chunk(payload, chunk.codec, chunk.esize,
+                                        chunk.flags, chunk.rlen, tables=tables,
+                                        out=out)
+            if gpu_res is not None:
+                if verify_checksums and chunk.crc:
+                    if (zlib.crc32(gpu_res) & 0xFFFFFFFF) != chunk.crc:
+                        raise CorruptArchive(
+                            "chunk failed its checksum; the archive is corrupt")
+                return gpu_res
+
         return _codec.decode_chunk(payload, chunk.codec, chunk.esize,
                                    chunk.flags, chunk.rlen, chunk.crc,
                                    verify_checksums, out=out, tables=tables)
@@ -1794,12 +1829,13 @@ class ArchiveIndex:
                 for i, c in enumerate(self._chunks)]
 
     def decode(self, ref: "ChunkRef", payload, *, verify: bool = True,
-               out=None):
+               out=None, prefer_gpu: bool = False):
         """Turn one chunk's coded bytes into its plaintext. No I/O, no threads.
 
         `payload` is the `clen` bytes at `ref.off`, however the caller got
         them. `verify` checks the chunk's CRC, which is on by default because
         a silently wrong weight is worse than a slow one.
+        If `prefer_gpu` is True, attempts to decode via the GPU decoder first.
         """
         chunk = self._chunks[ref.index]
         if len(payload) != chunk.clen:
@@ -1809,9 +1845,42 @@ class ArchiveIndex:
             raise self.NeedsSource(
                 f"chunk {ref.index} is coded against an earlier range; "
                 f"use decompress() or MappedArchive, which can fetch it")
+
+        if prefer_gpu:
+            from . import gpu
+            fast_gpu = gpu.decode_chunk(payload, chunk.codec, chunk.esize,
+                                        chunk.flags, chunk.rlen,
+                                        tables=self.tables, out=out)
+            if fast_gpu is not None:
+                if verify and chunk.crc:
+                    if (zlib.crc32(fast_gpu) & 0xFFFFFFFF) != chunk.crc:
+                        raise CorruptArchive(
+                            "chunk failed its checksum; the archive is corrupt")
+                return fast_gpu
+
         return _codec.decode_chunk(payload, chunk.codec, chunk.esize,
                                    chunk.flags, chunk.rlen, chunk.crc,
                                    verify, out=out, tables=self.tables)
+
+    def decode_batch_gpu(self, refs_and_payloads, *, verify: bool = True):
+        """Decode a sequence of (ChunkRef, payload) pairs using the GPU batch decoder.
+
+        Falls back to CPU decode for any chunk the GPU declines.
+        """
+        from . import gpu
+        chunks_and_payloads = [
+            (self._chunks[ref.index], payload) for ref, payload in refs_and_payloads
+        ]
+        results = gpu.decode_chunks(chunks_and_payloads, tables=self.tables)
+        if results is not None:
+            if verify:
+                for (ref, _p), dec in zip(refs_and_payloads, results):
+                    c = self._chunks[ref.index]
+                    if c.crc and (zlib.crc32(dec) & 0xFFFFFFFF) != c.crc:
+                        raise CorruptArchive("chunk failed its checksum")
+            return results
+        return [self.decode(ref, payload, verify=verify, prefer_gpu=True)
+                for ref, payload in refs_and_payloads]
 
 
 class MappedArchive:
@@ -1849,7 +1918,8 @@ class MappedArchive:
     PARALLEL_MIN_BLOCKS = 4
 
     def __init__(self, path: str, *, verify: bool = True,
-                 cache_blocks: int = 32, workers: int | None = None):
+                 cache_blocks: int = 32, workers: int | None = None,
+                 gpu: bool = False):
         self.path = path
         self._fh = open(path, "rb")
         try:
@@ -1863,7 +1933,8 @@ class MappedArchive:
         self._starts = [c.dst for c in self._chunks]
         self._decode = _chunk_decoder(
             self._chunks, self._payload_of, verify,
-            TableSet.from_json(self._reader.manifest.get("tables")))
+            TableSet.from_json(self._reader.manifest.get("tables")),
+            gpu=gpu)
         self._cache: "OrderedDict[int, bytes]" = OrderedDict()
         self._cap = max(1, cache_blocks)
         self._lock = threading.Lock()

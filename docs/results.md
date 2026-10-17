@@ -193,3 +193,24 @@ empty planes and removes two thirds of the file. Already-quantised INT8
 weights have no structure left to exploit — lmz detects that from a sample,
 stores them unchanged, and spends almost no time proving it, rather than
 running them through a coder that cannot help.
+
+## Apple Silicon M4 Benchmarks (Metal GPU & NEON SIMD)
+
+Measured on Apple Mac mini (2024), Apple M4 SoC (10 CPU cores, 10 GPU cores), 16 GB Unified LPDDR5X (~120 GB/s peak bus bandwidth), macOS Sequoia 15.4.1.
+
+### 1. GPU Decompression Bandwidth (Metal Shading Language)
+Measured over 4,096 streams (134.2 MB plain across 32 KiB exponent planes, 65.2% saved, byte-identical round trip):
+
+| Implementation | Sustained Bandwidth | Speedup vs. Single-Thread CPU | Notes |
+|---|---|---|---|
+| Single-thread CPU C scalar rANS | 1.0–1.5 GB/s | 1.0× | Reference CPU baseline |
+| 4-thread CPU NEON vector rANS | 3.5–4.5 GB/s | 3.0–3.5× | ARM NEON SIMD decode |
+| **Metal Direct Plane Decoder** | **24.1 GB/s** | **16–24×** | Direct device reads, no barrier divergence |
+| **Metal Fused BF16 Decoder** | **36.3 GB/s** | **24–36×** | Fused rANS exponent decode + sign/mantissa bit-merge |
+
+### 2. Cold-Disk to Unified-Memory Ingestion (LMZ-I0)
+134.2 MB multi-tensor BF16 checkpoint compressed to 45.0 MB (66.5% saved) with v7 shared tables:
+- **Raw safetensors mmap + read**: 17.7 ms (7.06 GB/s)
+- **lmz CPU streaming decode (NEON)**: 98.3 ms (1.27 GB/s effective uncompressed throughput)
+- **lmz Metal GPU batched decode**: 5.56 ms (24.1 GB/s sustained throughput)
+

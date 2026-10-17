@@ -19,13 +19,17 @@ from __future__ import annotations
 
 import ctypes
 import os
+import struct
 import subprocess
 import sys
 import threading
 
-__all__ = ["available", "backend", "cost_model", "decode_batch",
-           "decode_batch_dev", "grain", "header_bytes", "last_error",
-           "pad_bytes", "state", "verify"]
+from . import vulkan
+
+__all__ = ["available", "backend", "can_decode_chunk", "cost_model",
+           "decode_batch", "decode_batch_dev", "decode_chunk", "decode_chunks",
+           "grain", "header_bytes", "last_error", "pad_bytes", "state", "verify",
+           "vulkan"]
 
 # Kept in step with ABI_VERSION in lmzgpu.cu. A library built from an older
 # source is ignored rather than called with the wrong argument list.
@@ -787,3 +791,208 @@ def decode_batch_dev(streams, offsets, nstr: int, plane: int, out,
         ctypes.c_void_p(header or 0), ctypes.c_void_p(streams),
         ctypes.c_void_p(offsets), nstr, plane, ctypes.c_void_p(out),
         ctypes.c_void_p(stream or 0), tpb)
+
+
+def can_decode_chunk(codec: int, esize: int, flags: int, rlen: int) -> bool:
+    """Whether the GPU decoder can take this chunk."""
+    lib = _load()
+    if lib is None:
+        return False
+    from ..format import CODEC_SPLIT, CODEC_BF16, CODEC_SPLIT_ST
+    if codec not in (CODEC_SPLIT, CODEC_BF16, CODEC_SPLIT_ST):
+        return False
+    if esize not in (2, 4, 8) or (rlen % esize) != 0:
+        return False
+    nplanes = 2 if codec == CODEC_BF16 else esize
+    nelem = rlen // nplanes
+    g = grain()
+    if nelem == 0 or (nelem % g) != 0:
+        return False
+    for k in range(nplanes):
+        m = (flags >> (2 * k)) & 0x3
+        if m not in (0, 3):  # 0 is stored, 3 is rANS
+            return False
+    return True
+
+
+def decode_chunk(payload, codec: int, esize: int, flags: int, rlen: int,
+                 tables=None, out=None):
+    """Decode one split or shared-table chunk using the GPU decoder.
+
+    Supports CODEC_SPLIT, CODEC_BF16, and CODEC_SPLIT_ST (v7 shared tables).
+    Returns a memoryview of the merged plaintext bytes, or None if the GPU
+    decoder declines.
+    """
+    if not can_decode_chunk(codec, esize, flags, rlen):
+        return None
+    from ..format import CODEC_SPLIT, CODEC_BF16, CODEC_SPLIT_ST
+    from .. import kernels
+
+    nplanes = 2 if codec == CODEC_BF16 else esize
+    nelem = rlen // nplanes
+    hdr_size = nplanes * 4
+    if len(payload) < hdr_size:
+        return None
+    lengths = struct.unpack_from(f"<{nplanes}I", payload, 0)
+
+    pos = hdr_size
+    streams = []
+    plane_hdrs = []
+    plane_methods = []
+    for k in range(nplanes):
+        ln = lengths[k]
+        if pos + ln > len(payload):
+            return None
+        m = (flags >> (2 * k)) & 0x3
+        plane_methods.append(m)
+        streams.append(payload[pos:pos + ln])
+        pos += ln
+
+        hdr = None
+        if codec == CODEC_SPLIT_ST and tables is not None:
+            hdr = tables.get(CODEC_SPLIT, esize, k)
+        plane_hdrs.append(hdr)
+
+    decoded_planes = []
+    for k in range(nplanes):
+        m = plane_methods[k]
+        s_bytes = streams[k]
+        if m == 0:
+            if len(s_bytes) != nelem:
+                return None
+            decoded_planes.append(s_bytes)
+        elif m == 3:
+            off_bytes = struct.pack("<QQ", 0, len(s_bytes))
+            dec = decode_batch(s_bytes, off_bytes, 1, nelem, header=plane_hdrs[k])
+            if dec is None:
+                return None
+            decoded_planes.append(dec)
+        else:
+            return None
+
+    need = nplanes * nelem
+    dst = out if (out is not None and len(out) >= need) else bytearray(need)
+    pairs = [(p, 0) for p in decoded_planes]
+    if nplanes == 2 and codec == CODEC_BF16:
+        kernels.merge_bf16(pairs, nelem, dst)
+    else:
+        kernels.merge_planes(pairs, nplanes, nelem, dst)
+    return memoryview(dst)[:need]
+
+
+def decode_chunks(chunks_and_payloads, tables=None):
+    """Decode a batch of (chunk, payload) pairs using the GPU decoder.
+
+    Groups rANS streams across chunks by plane kind to maximize GPU parallel occupancy.
+    Returns a list of decoded memoryviews, or None if the batch cannot be decoded.
+    """
+    if not chunks_and_payloads:
+        return []
+    lib = _load()
+    if lib is None:
+        return None
+    from ..format import CODEC_SPLIT, CODEC_BF16, CODEC_SPLIT_ST
+    from .. import kernels
+
+    for item in chunks_and_payloads:
+        c = item[0]
+        codec = getattr(c, "codec", None)
+        esize = getattr(c, "esize", None)
+        flags = getattr(c, "flags", None)
+        rlen = getattr(c, "rlen", None)
+        if not can_decode_chunk(codec, esize, flags, rlen):
+            return None
+
+    results = []
+    first_c = chunks_and_payloads[0][0]
+    uniform = all(
+        item[0].codec == first_c.codec and item[0].esize == first_c.esize and item[0].rlen == first_c.rlen
+        for item in chunks_and_payloads
+    )
+
+    if not uniform or len(chunks_and_payloads) == 1:
+        for c, p in chunks_and_payloads:
+            dec = decode_chunk(p, c.codec, c.esize, c.flags, c.rlen, tables=tables)
+            if dec is None:
+                return None
+            results.append(dec)
+        return results
+
+    N = len(chunks_and_payloads)
+    codec = first_c.codec
+    esize = first_c.esize
+    rlen = first_c.rlen
+    nplanes = 2 if codec == CODEC_BF16 else esize
+    nelem = rlen // nplanes
+    hdr_size = nplanes * 4
+
+    chunk_streams = []
+    chunk_methods = []
+    for c, p in chunks_and_payloads:
+        if len(p) < hdr_size:
+            return None
+        lengths = struct.unpack_from(f"<{nplanes}I", p, 0)
+        pos = hdr_size
+        p_streams = []
+        p_methods = []
+        for k in range(nplanes):
+            ln = lengths[k]
+            if pos + ln > len(p):
+                return None
+            p_methods.append((c.flags >> (2 * k)) & 0x3)
+            p_streams.append(p[pos:pos + ln])
+            pos += ln
+        chunk_streams.append(p_streams)
+        chunk_methods.append(p_methods)
+
+    decoded_by_plane = []
+    for k in range(nplanes):
+        hdr = None
+        if codec == CODEC_SPLIT_ST and tables is not None:
+            hdr = tables.get(CODEC_SPLIT, esize, k)
+
+        methods_k = [chunk_methods[i][k] for i in range(N)]
+        if all(m == 0 for m in methods_k):
+            plane_k_decoded = [chunk_streams[i][k] for i in range(N)]
+            decoded_by_plane.append(plane_k_decoded)
+        elif all(m == 3 for m in methods_k):
+            cat_streams = bytearray()
+            offsets = bytearray()
+            off = 0
+            for i in range(N):
+                s = chunk_streams[i][k]
+                slen = len(s)
+                offsets += struct.pack("<QQ", off, slen)
+                cat_streams += s
+                off += slen
+            batch_dec = decode_batch(bytes(cat_streams), bytes(offsets), N, nelem, header=hdr)
+            if batch_dec is None:
+                return None
+            plane_k_decoded = [batch_dec[i * nelem:(i + 1) * nelem] for i in range(N)]
+            decoded_by_plane.append(plane_k_decoded)
+        else:
+            plane_k_decoded = []
+            for i in range(N):
+                m = methods_k[i]
+                s = chunk_streams[i][k]
+                if m == 0:
+                    plane_k_decoded.append(s)
+                else:
+                    off_bytes = struct.pack("<QQ", 0, len(s))
+                    d = decode_batch(s, off_bytes, 1, nelem, header=hdr)
+                    if d is None:
+                        return None
+                    plane_k_decoded.append(d)
+            decoded_by_plane.append(plane_k_decoded)
+
+    for i in range(N):
+        planes_i = [(decoded_by_plane[k][i], 0) for k in range(nplanes)]
+        dst = bytearray(rlen)
+        if nplanes == 2 and codec == CODEC_BF16:
+            kernels.merge_bf16(planes_i, nelem, dst)
+        else:
+            kernels.merge_planes(planes_i, nplanes, nelem, dst)
+        results.append(memoryview(dst))
+
+    return results
+

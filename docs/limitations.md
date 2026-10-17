@@ -130,18 +130,23 @@
 - GGUF block-quantised tensors are split on their ggml struct layout, which
   covers Q4_0 through Q8_1, every k-quant, the IQ types and the ternary ones.
   A layout this build does not recognise falls back to opaque bytes.
-- **ONNX is parsed only in its self-contained form.** The walk finds
-  `graph.initializer[]` and types each one from its `data_type` and
+- **ONNX is parsed in both self-contained and external-data forms.** The walk
+  finds `graph.initializer[]` and types each one from its `data_type` and
   `raw_data` range, which is worth **4.3 points** on a real fp16 detector
   against the same bytes as a blob — without the element width the
   byte-position planes cannot phase-align, so an fp16 exponent smears across
-  positions instead of collecting in one plane. The **external-data** form,
-  where initializers name a sidecar file and carry no `raw_data`, is not
-  typed: those sidecars are flat and lmz codes them as raw regions, and
-  typing them needs the sidecar's own name resolved against the model's
-  directory. A dtype this build does not know, or a payload that is not a
-  whole number of elements, falls back to untyped bytes for that tensor
-  alone.
+  positions instead of collecting in one plane. In **external-data** models,
+  where initializers name a sidecar file (e.g. `model.onnx.data`), `lmz` parses
+  the `external_data` key-value pairs (location, offset, length) and resolves
+  the sidecar relative to the graph, structuring the flat sidecar into typed
+  tensor regions and publishing addressable tensor metadata in the archive
+  manifest.
+- **Metal decoder on Apple Silicon.** On macOS, `lmz.gpu` compiles the native
+  Metal shader (`lmz_rans.metal`) via the system compiler. The direct device
+  read kernel (`lmz_decode_plane_direct`, 24.1 GB/s) and fused BF16 kernel
+  (36.3 GB/s) are canonical and verified byte-identical. The prefetch variant
+  is avoided on Apple Silicon because `simdgroup_barrier` inside divergent
+  refill loops causes lane divergence.
 - **CPython's bundled zstd is slow on macOS.** Measured on a GitHub
   `macos-latest` runner: 103 MiB/s compressing a 64 MiB BF16 sample through
   `compression.zstd`, against 767 MiB/s for the same work through the

@@ -14,6 +14,8 @@ no magic number, so its parser is offered every file the others declined.
 from __future__ import annotations
 
 import json
+import os
+import posixpath
 import struct
 from dataclasses import dataclass
 
@@ -197,6 +199,7 @@ class Layout:
     kind: str
     regions: list[Region]
     tensors: dict | None = None
+    external_tensors: dict[str, list[dict]] | None = None
 
 
 def parse_safetensors(f, size: int) -> Layout | None:
@@ -512,6 +515,10 @@ _PB_TENSOR_DIMS = 1        # TensorProto.dims
 _PB_TENSOR_DTYPE = 2       # TensorProto.data_type
 _PB_TENSOR_NAME = 8        # TensorProto.name
 _PB_TENSOR_RAW = 9         # TensorProto.raw_data
+_PB_TENSOR_EXTERNAL_DATA = 13  # TensorProto.external_data
+_PB_TENSOR_DATA_LOCATION = 14  # TensorProto.data_location
+_PB_ENTRY_KEY = 1          # StringStringEntry.key
+_PB_ENTRY_VALUE = 2        # StringStringEntry.value
 
 
 def _pb_varint(buf, i: int):
@@ -631,6 +638,7 @@ def parse_onnx(f, size: int) -> Layout | None:
 
     regions: list[Region] = []
     tensors: dict = {}
+    external_by_file: dict[str, list[dict]] = {}
     # Each initializer is walked against the file too. Its metadata -- name,
     # dtype, dims -- is small and comes before the weights, but `raw_data` is
     # the tensor itself, so it is located and skipped rather than read.
@@ -638,6 +646,8 @@ def parse_onnx(f, size: int) -> Layout | None:
         if field != _PB_GRAPH_INITIALIZER or wire != 2:
             continue
         name, dtype_id, dims, raw = "", 0, [], None
+        data_location = 0
+        external_entries: dict[str, str] = {}
         for tf, tw, ta, tb in _pb_scan_file(f, a, b):
             if tf == _PB_TENSOR_RAW and tw == 2:
                 raw = (ta, tb)          # located, never read
@@ -656,19 +666,119 @@ def parse_onnx(f, size: int) -> Layout | None:
                 while j < len(packed):
                     v, j = _pb_varint(packed, j)
                     dims.append(v)
-        if raw is None or raw[1] <= raw[0] or raw[1] > size:
-            continue
-        dtype, esize = ONNX_DTYPES.get(dtype_id, ("U8", 1))
-        if (raw[1] - raw[0]) % esize:
-            dtype, esize = "U8", 1
-        kind = KIND_BF16 if dtype == "BF16" else KIND_BYTES
-        regions.append(Region(raw[0], raw[1], esize, kind))
-        tensors[name or f"initializer_{len(tensors)}"] = {
-            "dtype": dtype, "shape": dims, "offsets": [raw[0], raw[1]]}
+            elif tf == _PB_TENSOR_DATA_LOCATION and tw == 0:
+                data_location = ta
+            elif tf == _PB_TENSOR_EXTERNAL_DATA and tw == 2:
+                ekey = evalue = None
+                for ef, ew, ea, eb in _pb_scan_file(f, ta, tb):
+                    if ef == _PB_ENTRY_KEY and ew == 2 and eb - ea <= MAX_NAME:
+                        f.seek(ea)
+                        ekey = f.read(eb - ea).decode("utf-8", "replace")
+                    elif ef == _PB_ENTRY_VALUE and ew == 2 and eb - ea <= MAX_NAME:
+                        f.seek(ea)
+                        evalue = f.read(eb - ea).decode("utf-8", "replace")
+                if ekey and evalue is not None:
+                    external_entries[ekey] = evalue
 
-    if not tensors:
+        if raw is not None:
+            if raw[1] <= raw[0] or raw[1] > size:
+                continue
+            dtype, esize = ONNX_DTYPES.get(dtype_id, ("U8", 1))
+            if (raw[1] - raw[0]) % esize:
+                dtype, esize = "U8", 1
+            kind = KIND_BF16 if dtype == "BF16" else KIND_BYTES
+            regions.append(Region(raw[0], raw[1], esize, kind))
+            tensors[name or f"initializer_{len(tensors)}"] = {
+                "dtype": dtype, "shape": dims, "offsets": [raw[0], raw[1]]}
+        elif data_location == 1 or external_entries:
+            loc = external_entries.get("location")
+            if loc:
+                offset_s = external_entries.get("offset", "0")
+                length_s = external_entries.get("length")
+                try:
+                    offset = int(offset_s, 10) if offset_s.isdigit() else 0
+                except (ValueError, TypeError):
+                    offset = 0
+                try:
+                    length = int(length_s, 10) if length_s and length_s.isdigit() else None
+                except (ValueError, TypeError):
+                    length = None
+                dtype, esize = ONNX_DTYPES.get(dtype_id, ("U8", 1))
+                if length is None:
+                    nelem = 1
+                    for d in dims:
+                        nelem *= d
+                    if nelem > 0:
+                        length = nelem * esize
+                kind = KIND_BF16 if dtype == "BF16" else KIND_BYTES
+                external_by_file.setdefault(loc, []).append({
+                    "name": name or f"external_{len(tensors)}",
+                    "dtype": dtype,
+                    "shape": dims,
+                    "offset": offset,
+                    "length": length,
+                    "esize": esize,
+                    "kind": kind,
+                })
+
+    if not tensors and not external_by_file:
         return None
-    return Layout("onnx", regions, tensors)
+    return Layout("onnx", regions, tensors if tensors else None,
+                  external_tensors=external_by_file if external_by_file else None)
+
+
+def plan_external_sidecar(size: int, tensors_info: list[dict]) -> Layout | None:
+    """Build a structured layout for an external tensor sidecar."""
+    valid = []
+    for t in tensors_info:
+        offset = t.get("offset", 0)
+        length = t.get("length")
+        if offset < 0 or offset >= size:
+            continue
+        if length is None:
+            length = size - offset
+        if length <= 0 or offset + length > size:
+            continue
+        esize = t.get("esize", 1)
+        if length % esize != 0:
+            esize = 1
+            kind = KIND_BYTES
+        else:
+            kind = t.get("kind", KIND_BYTES)
+        valid.append({
+            "name": t.get("name", ""),
+            "dtype": t.get("dtype", "U8"),
+            "shape": t.get("shape", []),
+            "offset": offset,
+            "length": length,
+            "esize": esize,
+            "kind": kind,
+        })
+    if not valid:
+        return None
+    valid.sort(key=lambda x: x["offset"])
+    regions: list[Region] = []
+    tensors: dict = {}
+    pos = 0
+    for t in valid:
+        start = t["offset"]
+        end = start + t["length"]
+        if start < pos:
+            # Overlap detected; decline to avoid corrupting split boundaries
+            return None
+        if start > pos:
+            regions.append(Region(pos, start, 1, KIND_BYTES))
+        regions.append(Region(start, end, t["esize"], t["kind"]))
+        tname = t["name"] or f"tensor_{len(tensors)}"
+        tensors[tname] = {
+            "dtype": t["dtype"],
+            "shape": t["shape"],
+            "offsets": [start, end],
+        }
+        pos = end
+    if pos < size:
+        regions.append(Region(pos, size, 1, KIND_BYTES))
+    return Layout("onnx_data", regions, tensors)
 
 
 def probe(f, size: int) -> Layout:
@@ -681,6 +791,25 @@ def probe(f, size: int) -> Layout:
             layout = None
         if layout is not None:
             return layout
+    filename = getattr(f, "name", None)
+    if filename and isinstance(filename, str) and os.path.exists(filename):
+        try:
+            dirname = os.path.dirname(os.path.abspath(filename))
+            basename = os.path.basename(filename)
+            for cand in os.listdir(dirname):
+                if cand.lower().endswith(".onnx"):
+                    onnx_path = os.path.join(dirname, cand)
+                    if os.path.isfile(onnx_path):
+                        with open(onnx_path, "rb") as ofh:
+                            olayout = parse_onnx(ofh, os.path.getsize(onnx_path))
+                        if olayout and olayout.external_tensors:
+                            for loc, tlist in olayout.external_tensors.items():
+                                if os.path.normpath(loc) == basename or loc == basename:
+                                    ext_layout = plan_external_sidecar(size, tlist)
+                                    if ext_layout is not None:
+                                        return ext_layout
+        except Exception:
+            pass
     return Layout("raw", [], None)
 
 

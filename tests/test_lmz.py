@@ -1646,6 +1646,18 @@ def _onnx_tensor(name: str, dtype_id: int, dims, raw: bytes) -> bytes:
             + _pb_len(9, raw))
 
 
+def _onnx_external_tensor(name: str, dtype_id: int, dims, location: str, offset: int, length: int) -> bytes:
+    def pair(k: str, v: str) -> bytes:
+        return _pb_len(1, k.encode()) + _pb_len(2, v.encode())
+    return (b"".join(_pb_int(1, d) for d in dims)
+            + _pb_int(2, dtype_id)
+            + _pb_len(8, name.encode())
+            + _pb_len(13, pair("location", location))
+            + _pb_len(13, pair("offset", str(offset)))
+            + _pb_len(13, pair("length", str(length)))
+            + _pb_int(14, 1))
+
+
 def _onnx_model(tensors) -> bytes:
     graph = b"".join(_pb_len(5, t) for t in tensors) + _pb_len(2, b"main")
     return _pb_int(1, 8) + _pb_len(7, graph) + _pb_len(8, b"test")
@@ -1783,6 +1795,74 @@ def test_onnx_round_trips_through_an_archive():
             planner.parse_onnx = real
         assert os.path.getsize(archive) < os.path.getsize(blob), (
             os.path.getsize(archive), os.path.getsize(blob))
+
+
+def test_onnx_external_data_typed_and_addressed():
+    """External-data ONNX sidecars must be structured and typed into regions.
+
+    Large perception models store initializers in a separate sidecar file
+    (e.g., model.onnx.data). The ONNX graph declares external references with
+    dtype, dims, offset, and length. Both direct file probing (via adjacent
+    ONNX graph discovery) and multi-file archive creation must structure the
+    raw sidecar into typed regions with addressable tensor entries.
+    """
+    f32 = rand(4096, 12)
+    bf16 = rand(2048, 14)
+    with tempfile.TemporaryDirectory() as d:
+        sidecar_name = "model.onnx.data"
+        sidecar_path = os.path.join(d, sidecar_name)
+        with open(sidecar_path, "wb") as fh:
+            fh.write(f32 + bf16)
+
+        onnx_model_bytes = _onnx_model([
+            _onnx_external_tensor("layer1.weight", 1, [16, 64], sidecar_name, 0, len(f32)),
+            _onnx_external_tensor("layer2.weight", 16, [16, 64], sidecar_name, len(f32), len(bf16)),
+        ])
+        onnx_path = os.path.join(d, "model.onnx")
+        with open(onnx_path, "wb") as fh:
+            fh.write(onnx_model_bytes)
+
+        # 1. Probing the sidecar file on disk directly
+        with open(sidecar_path, "rb") as fh:
+            layout = planner.probe(fh, os.path.getsize(sidecar_path))
+        assert layout.kind == "onnx_data", layout.kind
+        assert set(layout.tensors) == {"layer1.weight", "layer2.weight"}
+        assert layout.tensors["layer1.weight"]["dtype"] == "F32"
+        assert layout.tensors["layer1.weight"]["shape"] == [16, 64]
+        assert layout.tensors["layer2.weight"]["dtype"] == "BF16"
+        assert layout.tensors["layer2.weight"]["offsets"] == [4096, 6144]
+
+        # Verify typed regions
+        regions = layout.regions
+        assert len(regions) == 2
+        assert (regions[0].start, regions[0].end, regions[0].esize, regions[0].kind) == (0, 4096, 4, planner.KIND_BYTES)
+        assert (regions[1].start, regions[1].end, regions[1].esize, regions[1].kind) == (4096, 6144, 2, planner.KIND_BF16)
+
+        # 2. Archive round-trip and tensor addressing
+        archive = os.path.join(d, "model.lmz")
+        lmz.compress(d, archive)
+
+        # Inspect archive manifest
+        info = lmz.info(archive)
+        members = {m["path"]: m for m in info["members"]}
+        assert "model.onnx" in members
+        assert "model.onnx.data" in members
+        assert members["model.onnx.data"]["kind"] == "onnx_data"
+        assert set(members["model.onnx.data"]["tensors"]) == {"layer1.weight", "layer2.weight"}
+
+        # 3. Reading tensors via read_tensor and MappedArchive
+        dt1, sh1, raw1 = lmz.read_tensor(archive, "layer1.weight")
+        assert dt1 == "F32" and sh1 == [16, 64] and raw1 == f32
+        dt2, sh2, raw2 = lmz.read_tensor(archive, "layer2.weight")
+        assert dt2 == "BF16" and sh2 == [16, 64] and raw2 == bf16
+
+        # 4. Decompress and verify byte-for-byte exactness
+        out_dir = os.path.join(d, "out")
+        lmz.decompress(archive, out_dir)
+        with open(os.path.join(out_dir, sidecar_name), "rb") as fh:
+            assert fh.read() == f32 + bf16
+        with open(os.path.join(out_dir, "model.onnx"), "rb") as fh:
+            assert fh.read() == onnx_model_bytes
 
 
 def test_int8_weights_are_coded_with_rans_not_zstd():
@@ -3156,6 +3236,53 @@ def test_gpu_decode_shared_table():
         assert got == want, f"stream {i} differs from plaintext in shared table decode"
 
 
+def test_gpu_decode_archive_and_shared_tables():
+    """ArchiveIndex and MappedArchive decode v7 shared-table archives on GPU."""
+    from lmz import gpu
+    import random
+
+    ok, why = gpu.available()
+    if not ok:
+        raise Skip(f"no GPU decoder: {why}")
+    if not kernels.have_rans():
+        raise Skip("building the streams needs the native coder")
+
+    with tempfile.TemporaryDirectory() as d:
+        raw_path = os.path.join(d, "model.safetensors")
+        rng = random.Random(42)
+        floats = [rng.gauss(0, 1) for _ in range(128 * 1024)]
+        data = struct.pack(f"<{len(floats)}f", *floats)
+        write_safetensors(raw_path, [("weights", "F32", [128, 1024], data)])
+        with open(raw_path, "rb") as f:
+            full_raw = f.read()
+
+        arc_path = os.path.join(d, "test_st.lmz")
+        lmz.compress(raw_path, arc_path, mapped=True, shared_tables=True)
+
+        idx = lmz.ArchiveIndex(arc_path)
+        chunks = idx.chunks()
+        assert len(chunks) > 0
+
+        with open(arc_path, "rb") as fh:
+            batch_items = []
+            for ref in chunks:
+                fh.seek(ref.off)
+                payload = fh.read(ref.clen)
+                plain_cpu = idx.decode(ref, payload, prefer_gpu=False)
+                plain_gpu = idx.decode(ref, payload, prefer_gpu=True)
+                assert plain_cpu == plain_gpu, "CPU and GPU chunk decode disagree"
+                batch_items.append((ref, payload))
+
+            batch_res = idx.decode_batch_gpu(batch_items)
+            assert len(batch_res) == len(chunks)
+            for (ref, p), dec in zip(batch_items, batch_res):
+                assert bytes(dec) == idx.decode(ref, p)
+
+        with lmz.MappedArchive(arc_path, gpu=True) as ma:
+            read_back = ma.read_member("model.safetensors")
+            assert bytes(read_back) == full_raw
+
+
 # Byte-value distributions the one benchmark workload never contained. Built
 # by translating uniform random bytes, which is a C-speed way to get an exact
 # shape -- a per-byte Python loop over a 32 KiB plane is not worth the seconds.
@@ -3719,6 +3846,36 @@ def test_gpu_is_optional():
         cwd=ROOT, capture_output=True, text=True, env=env)
     assert out.stdout.startswith("False"), out.stdout
     assert "LMZ_NO_GPU" in out.stdout
+
+
+def test_gpu_vulkan_probe_and_shader_structure():
+    """Vulkan compute probe and GLSL shader structure must be self-contained.
+
+    Vulkan provides driver-level compute for AMD and Intel iGPUs on Linux and
+    Windows without requiring nvcc. When no Vulkan loader or ICD is present,
+    probing must gracefully return (False, reason) without crashing.
+    The compute shader lmz_rans.comp must be present and provide subgroup
+    ballot rANS recurrence.
+    """
+    from lmz.gpu import vulkan
+
+    # 1. Probing does not raise or segfault
+    ok, reason = vulkan.probe()
+    assert isinstance(ok, bool)
+    assert isinstance(reason, str)
+    if not ok:
+        assert "no Vulkan" in reason or "failed" in reason or "error" in reason
+
+    # 2. Shader presence and contents
+    gpu_dir = os.path.dirname(vulkan.__file__)
+    comp_path = os.path.join(gpu_dir, "lmz_rans.comp")
+    assert os.path.isfile(comp_path), "lmz_rans.comp is missing"
+    with open(comp_path, "r", encoding="utf-8") as fh:
+        shader_src = fh.read()
+    assert "#version 450" in shader_src
+    assert "GL_KHR_shader_subgroup_ballot" in shader_src
+    assert "subgroupBallot" in shader_src
+    assert "subgroupBallotExclusiveBitCount" in shader_src
 
 
 class Skip(Exception):
