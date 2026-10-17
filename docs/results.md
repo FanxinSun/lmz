@@ -214,3 +214,37 @@ Measured over 4,096 streams (134.2 MB plain across 32 KiB exponent planes, 65.2%
 - **lmz CPU streaming decode (NEON)**: 98.3 ms (1.27 GB/s effective uncompressed throughput)
 - **lmz Metal GPU batched decode**: 5.56 ms (24.1 GB/s sustained throughput)
 
+## Real Checkpoint & Storage Architecture Benchmarks (Qwen3-4B Family & Multimodal Qwen3.5-4B)
+
+Measured on Apple Silicon M4 (16 GB unified LPDDR5X) comparing local NVMe SSD (APFS) against an external USB drive (ExFAT, 1 MB cluster size).
+
+### 1. Cross-Model Joint Family Archiving (`lmz append --dest`)
+Evaluated across `Qwen3-4B` (Base) and `Qwen3-4B-Instruct-2507` (Instruction Fine-Tuned):
+
+| Stage | Input Size | Stored Size | Throughput (NVMe) | Throughput (ExFAT) | Savings | Delta Coded |
+|---|---|---|---|---|---|---|
+| Base Model (`Qwen3-4B`) | 8.06 GB | 5.31 GB | 1.53 GB/s (4.91s) | 0.23 GB/s (32.95s) | 34.1% | N/A |
+| Instruct Append (`--dest instruct`) | 8.06 GB | +4.61 GB | 0.44 GB/s (16.92s) | 0.15 GB/s (49.35s) | 42.9% | **8,044.5 MB** |
+| **Joint Family Archive** | **16.12 GB** | **9.92 GB** | — | — | **38.5%** | **700 MB extra saved** |
+
+- **Cross-Model Delta Coding**: Over 99.8% (8,044.5 MB) of the instruct model's weights were matched and coded as deltas against the base model.
+- **Incremental Footprint**: Adding the entire instruct model required only 4.61 GB of archive storage instead of 5.31 GB if stored separately, saving an additional 700 MB of disk space.
+- **Integrity**: Ground-truth tensor readback via `MappedArchive` confirmed 100% byte-exact matches for both base and instruct tensors.
+
+### 2. Complete Artifact Bundling (`lmz bundle create`)
+Evaluated on full model directory trees (weights, tokenizer, vocabulary, and configs):
+- **Copy-on-Write (COW) Staging**: On APFS (Darwin), `clonefile()` creates the staging directory snapshot instantaneously with 0 bytes of physical disk write amplification and 0 redundant NAND writes.
+- **Zero-Byte File Resilience**: Safely handles zero-byte files (such as Hugging Face `.lock` download markers or touchmarks) without triggering bogus chunk-coverage errors.
+- **Verification**: `validate_bundle` and `inventory_bundle` pass with full cryptographic SHA-256 validation.
+
+### 3. Multimodal Vision-Language Support (`Qwen3.5-4B`)
+Evaluated on `Qwen3.5-4B` multimodal checkpoint (5.33 GB shard 1, 3.99 GB shard 2):
+- **Compression**: 9.34 GB uncompressed → 6.15 GB compressed in 5.73s (1.52 GB/s, **34.2% saved**).
+- **Architecture**: Correctly structures and compresses 297 vision block attention tensors and 424 language model MLP/attention tensors, all verified byte-exact.
+
+### 4. MappedArchive Batched GPU Acceleration
+On page-mapped (`--mapped`, 64 KiB blocks) model archives:
+- Sequential single-block GPU dispatch previously incurred ~0.5 ms runtime launch latency per block (447.8 ms for a 760-block 47.5 MB tensor).
+- **Batched GPU Ingestion**: Grouping chunk payloads into a single batched GPU kernel execution reduced latency to **44.36 ms (1.05 GB/s)** — achieving an immediate **10.1× speedup**.
+
+

@@ -472,9 +472,10 @@ def _find_duplicate_tensors(paths: list[str], members: list[Member],
     return refs, saved
 
 
-def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
-           workers: int | None = None, checksum: bool = True,
-           dedup: bool = True, delta: bool = True, progress=None) -> Stats:
+def append(archive: str, src: str, *, dest: str | None = None,
+           level: int = DEFAULT_LEVEL, workers: int | None = None,
+           checksum: bool = True, dedup: bool = True, delta: bool = True,
+           progress=None) -> Stats:
     """Add files to an existing archive, coded against what is already in it.
 
     This is what makes the corpus-level savings reachable in practice. A
@@ -487,6 +488,9 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
 
     Only the tail is rewritten: payloads are appended where the old chunk
     table began, and the table, manifest and footer are rebuilt after them.
+
+    If ``dest`` is provided, it defines the target path for a single file, or
+    the directory prefix inside the archive for directory contents.
     """
     workers = workers or default_workers()
     started = time.perf_counter()
@@ -501,12 +505,29 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
     table_off = reader.table_off
     base_total = sum(m.size for m in old_members)
 
+    if dest is not None:
+        _safe_member_path("", dest)
+
     if os.path.isdir(src):
-        entries = list(_iter_files(src))
-        if not entries:
+        raw_entries = list(_iter_files(src))
+        if not raw_entries:
             raise ValueError(f"{src} contains no regular files")
+        if dest is not None:
+            prefix = dest.replace("\\", "/").strip("/")
+            entries = [(f"{prefix}/{rel}" if prefix else rel, full)
+                       for rel, full in raw_entries]
+        else:
+            entries = raw_entries
     elif os.path.isfile(src):
-        entries = [(os.path.basename(src), src)]
+        if dest is not None:
+            dest_norm = dest.replace("\\", "/").strip("/")
+            if dest.endswith("/") or dest.endswith("\\"):
+                entry_rel = f"{dest_norm}/{os.path.basename(src)}" if dest_norm else os.path.basename(src)
+            else:
+                entry_rel = dest_norm
+        else:
+            entry_rel = os.path.basename(src)
+        entries = [(entry_rel, src)]
     else:
         raise FileNotFoundError(src)
 
@@ -517,6 +538,7 @@ def append(archive: str, src: str, *, level: int = DEFAULT_LEVEL,
     sizes: list[int] = []
     base = base_total
     for rel, full in entries:
+        _safe_member_path("", rel)
         if rel in taken:
             raise ValueError(f"{rel} is already in {archive}")
         size = os.path.getsize(full)
@@ -1927,13 +1949,14 @@ class MappedArchive:
         except BaseException:
             self._fh.close()
             raise
-        # A mount resolves an arbitrary byte to a block on every read, so this
-        # is the one caller that genuinely wants every Chunk materialised.
+        self._gpu = gpu
+        self._verify = verify
+        self._tables = TableSet.from_json(self._reader.manifest.get("tables"))
         self._chunks = _by_dst(self._reader.chunks)
         self._starts = [c.dst for c in self._chunks]
         self._decode = _chunk_decoder(
             self._chunks, self._payload_of, verify,
-            TableSet.from_json(self._reader.manifest.get("tables")),
+            self._tables,
             gpu=gpu)
         self._cache: "OrderedDict[int, bytes]" = OrderedDict()
         self._cap = max(1, cache_blocks)
@@ -2082,8 +2105,24 @@ class MappedArchive:
         got: dict = {}
         try:
             chunks = [self._chunks[i] for i in mine]
-            for i, c, payload in zip(mine, chunks, self._payload_run(chunks)):
-                got[i] = bytes(self._decode(c, payload, out=_scratch(c.rlen)))
+            payloads = list(self._payload_run(chunks))
+            if self._gpu and len(chunks) > 1:
+                from . import gpu as _gpu
+                dec_batch = _gpu.decode_chunks(list(zip(chunks, payloads)),
+                                               tables=self._tables)
+                if dec_batch is not None:
+                    if self._verify:
+                        for c, d in zip(chunks, dec_batch):
+                            if c.crc and (zlib.crc32(d) & 0xFFFFFFFF) != c.crc:
+                                raise CorruptArchive("chunk failed its checksum; the archive is corrupt")
+                    for i, d in zip(mine, dec_batch):
+                        got[i] = bytes(d)
+                else:
+                    for i, c, payload in zip(mine, chunks, payloads):
+                        got[i] = bytes(self._decode(c, payload, out=_scratch(c.rlen)))
+            else:
+                for i, c, payload in zip(mine, chunks, payloads):
+                    got[i] = bytes(self._decode(c, payload, out=_scratch(c.rlen)))
             self._store(got.items())
         finally:
             # Released before waiting on anyone else's claims, so two threads

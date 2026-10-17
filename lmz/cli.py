@@ -217,7 +217,7 @@ def cmd_cat(args) -> int:
 
 def cmd_append(args) -> int:
     bar = Progress("appending", not args.quiet)
-    stats = api.append(args.archive, args.input, level=args.level,
+    stats = api.append(args.archive, args.input, dest=args.dest, level=args.level,
                        workers=args.threads, checksum=not args.no_checksum,
                        dedup=not args.no_dedup, delta=not args.no_delta,
                        progress=bar)
@@ -710,6 +710,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap_ = sub.add_parser("append", help="add files to an existing archive")
     ap_.add_argument("archive")
     ap_.add_argument("input")
+    ap_.add_argument("--dest", default=None,
+                     help="destination path or directory prefix inside the archive (default: preserve file/relative name)")
     ap_.add_argument("-l", "--level", type=int, default=api.DEFAULT_LEVEL)
     ap_.add_argument("--no-checksum", action="store_true")
     ap_.add_argument("--no-dedup", action="store_true",

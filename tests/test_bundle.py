@@ -477,6 +477,67 @@ def test_plain_small_artifact_is_not_claimed_as_a_saving():
         assert result["archive_accounting"]["materialized_bytes"] == 251
 
 
+def test_bundle_handles_zero_byte_files():
+    """Verify that empty 0-byte files (such as lockfiles or touchmarks) bundle safely."""
+    with tempfile.TemporaryDirectory() as d:
+        source = os.path.join(d, "source")
+        _write(os.path.join(source, "empty.lock"), b"")
+        _write(os.path.join(source, "data.bin"), b"hello-world")
+        archive = os.path.join(d, "empty.lmz")
+        result = lmz.create_bundle(source, archive, workers=1)
+        assert result["status"] == "verified"
+        assert len(result["entries"]) == 2
+        empty_entry = next(e for e in result["entries"] if e["path"] == "empty.lock")
+        assert empty_entry["size"] == 0
+        assert empty_entry["representation"]["stored_bytes"] == 0
+        assert empty_entry["representation"]["chunk_count"] == 0
+
+        # Validate and materialize
+        v = lmz.validate_bundle(archive)
+        assert v["status"] == "verified"
+        out = os.path.join(d, "out")
+        lmz.materialize_bundle(archive, out)
+        assert os.path.exists(os.path.join(out, "empty.lock"))
+        assert os.path.getsize(os.path.join(out, "empty.lock")) == 0
+        assert open(os.path.join(out, "data.bin"), "rb").read() == b"hello-world"
+
+
+
+def test_snapshot_clonefile_copy_on_write():
+    """Verify copy-on-write staging via _clone_file and safe fallback."""
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "original.bin")
+        payload = b"clonefile-verification-bytes" * 1024
+        _write(src, payload)
+        dst_clone = os.path.join(d, "cloned.bin")
+        before = os.stat(src)
+        
+        # Direct _clone_file check
+        cloned = bundle._clone_file(src, dst_clone)
+        if sys.platform == "darwin":
+            # On macOS APFS tempdir, clonefile should succeed
+            assert cloned is True
+            assert open(dst_clone, "rb").read() == payload
+            # Mutating src does not alter cloned file (COW property)
+            with open(src, "ab") as f:
+                f.write(b"MUTATION")
+            assert open(dst_clone, "rb").read() == payload
+
+        # Full _snapshot_file check with simulated clone failure fallback
+        orig_clone_fn = bundle._clone_file
+        try:
+            bundle._clone_file = lambda s, d: False  # Force fallback path
+            dst_fallback = os.path.join(d, "fallback.bin")
+            sz, digest = bundle._snapshot_file(dst_clone, dst_fallback,
+                                                os.stat(dst_clone), 0o644)
+            assert sz == len(payload)
+            assert digest == hashlib.sha256(payload).hexdigest()
+            assert open(dst_fallback, "rb").read() == payload
+        finally:
+            bundle._clone_file = orig_clone_fn
+
+
+
 def main():
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

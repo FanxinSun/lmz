@@ -227,6 +227,48 @@ def _walk_regular_files(root: str) -> Iterable[tuple[str, str, os.stat_result]]:
     yield from visit(root, "")
 
 
+def _clone_file(source: str, destination: str) -> bool:
+    """Attempt a fast copy-on-write filesystem clone."""
+    if sys.platform == "darwin":
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            if hasattr(libc, "clonefile"):
+                fn = libc.clonefile
+                fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+                fn.restype = ctypes.c_int
+                ret = fn(source.encode("utf-8"), destination.encode("utf-8"), 0)
+                if ret == 0:
+                    return True
+        except Exception:
+            pass
+    elif sys.platform.startswith("linux"):
+        try:
+            import fcntl
+            FICLONE = 0x40049409
+            src_fd = os.open(source, os.O_RDONLY)
+            try:
+                dst_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                try:
+                    fcntl.ioctl(dst_fd, FICLONE, src_fd)
+                    return True
+                except Exception:
+                    try:
+                        os.unlink(destination)
+                    except OSError:
+                        pass
+                    return False
+                finally:
+                    try:
+                        os.close(dst_fd)
+                    except OSError:
+                        pass
+            finally:
+                os.close(src_fd)
+        except Exception:
+            pass
+    return False
+
+
 def _snapshot_file(source: str, destination: str, before: os.stat_result,
                    mode: int) -> tuple[int, str]:
     flags = os.O_RDONLY | _O_NOFOLLOW
@@ -235,6 +277,7 @@ def _snapshot_file(source: str, destination: str, before: os.stat_result,
     except OSError as exc:
         raise BundleError(f"cannot open source {source}: {exc}",
                           code="source_open") from exc
+    cloned = False
     try:
         first = os.fstat(fd)
         if (first.st_dev, first.st_ino, first.st_size) != \
@@ -244,36 +287,70 @@ def _snapshot_file(source: str, destination: str, before: os.stat_result,
         total = 0
         parent = os.path.dirname(destination)
         os.makedirs(parent, exist_ok=True)
-        out_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                          mode or 0o644)
-        try:
+        cloned = _clone_file(source, destination)
+        if cloned:
+            if mode:
+                try:
+                    os.chmod(destination, mode)
+                except OSError:
+                    pass
             while True:
                 block = os.read(fd, 1 << 20)
                 if not block:
                     break
-                view = memoryview(block)
-                while view:
-                    written = os.write(out_fd, view)
-                    if written <= 0:
-                        raise OSError("short write while staging source")
-                    view = view[written:]
                 h.update(block)
                 total += len(block)
-            os.fsync(out_fd)
-        finally:
-            os.close(out_fd)
+        else:
+            out_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                              mode or 0o644)
+            try:
+                while True:
+                    block = os.read(fd, 1 << 20)
+                    if not block:
+                        break
+                    view = memoryview(block)
+                    while view:
+                        written = os.write(out_fd, view)
+                        if written <= 0:
+                            raise OSError("short write while staging source")
+                        view = view[written:]
+                    h.update(block)
+                    total += len(block)
+                os.fsync(out_fd)
+            finally:
+                os.close(out_fd)
         after = os.fstat(fd)
         if ((after.st_dev, after.st_ino, after.st_size) !=
                 (first.st_dev, first.st_ino, first.st_size) or
                 after.st_mtime_ns != first.st_mtime_ns or
                 after.st_ctime_ns != first.st_ctime_ns):
+            if cloned:
+                try:
+                    os.unlink(destination)
+                except OSError:
+                    pass
             raise BundleSourceChanged(f"source changed during read: {source}")
         if total != after.st_size:
+            if cloned:
+                try:
+                    os.unlink(destination)
+                except OSError:
+                    pass
             raise BundleSourceChanged(f"source size changed during read: {source}")
         return total, h.hexdigest()
     except BundleError:
+        if cloned:
+            try:
+                os.unlink(destination)
+            except OSError:
+                pass
         raise
     except OSError as exc:
+        if cloned:
+            try:
+                os.unlink(destination)
+            except OSError:
+                pass
         raise BundleError(f"cannot snapshot source {source}: {exc}",
                           code="source_read") from exc
     finally:
@@ -715,10 +792,12 @@ def _merge_external_dependencies(bundle: dict, requirements: dict[str, list[dict
 
 
 def _member_chunks(reader: ArchiveReader, member) -> list:
+    if member.size == 0:
+        return []
     chunks = []
     end = member.dst + member.size
     for chunk in reader.chunks:
-        if member.dst <= chunk.dst < end or (member.size == 0 and chunk.dst == member.dst):
+        if member.dst <= chunk.dst < end:
             if chunk.dst < member.dst or chunk.dst + chunk.rlen > end:
                 raise BundleError(f"archive chunk crosses member {member.path}",
                                   code="archive_coverage")
@@ -765,7 +844,7 @@ def _actual_representation(chunks: list) -> dict:
     stored = sum(c.clen for c in chunks)
     return {
         "mode": mode,
-        "codec": codecs[0] if len(codecs) == 1 else "mixed",
+        "codec": codecs[0] if len(codecs) == 1 else ("plain" if not codecs else "mixed"),
         "codecs": codecs,
         "codec_counts": counts,
         "stored_bytes": stored,

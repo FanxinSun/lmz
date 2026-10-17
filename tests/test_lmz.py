@@ -4496,5 +4496,73 @@ def test_shared_payloads_survive_a_second_append():
             assert got[-len(ft):] == ft, i
 
 
+def test_append_with_dest_mapping_and_cli():
+    """Verify that dest parameter in append() and --dest in CLI allows custom member names and prefixes."""
+    w1 = weights_bf16(300000, 101)
+    w2 = nudged_bf16(w1, 102)
+    with tempfile.TemporaryDirectory() as d:
+        p1 = os.path.join(d, "model.safetensors")
+        write_safetensors(p1, [("layer.weight", "BF16", [300000], w1)])
+        arc = os.path.join(d, "joint.lmz")
+        lmz.compress(p1, arc)
+
+        # 1. Reject hostile path escapes
+        for hostile in ("../escape.safetensors", "/abs/path.safetensors", "a/../../b"):
+            try:
+                lmz.append(arc, p1, dest=hostile)
+            except lmz.FormatError:
+                pass
+            else:
+                raise AssertionError(f"hostile dest {hostile!r} was accepted")
+
+        # 2. Append single file with explicit custom name
+        st2 = lmz.append(arc, p1, dest="v1_copy.safetensors")
+        assert st2.detail.get("dedup_bytes", 0) > 0 or st2.detail.get("shared_bytes", 0) > 0
+
+        # 3. Append single file with trailing slash directory prefix
+        lmz.append(arc, p1, dest="v1_dir/")
+
+        # 4. Append fine-tuned model under directory prefix to verify delta coding across prefixes
+        p2_dir = os.path.join(d, "ft_dir")
+        os.makedirs(p2_dir)
+        p2 = os.path.join(p2_dir, "model.safetensors")
+        write_safetensors(p2, [("layer.weight", "BF16", [300000], w2)])
+        st_ft = lmz.append(arc, p2_dir, dest="instruct")
+        assert st_ft.detail.get("delta_bytes", 0) > 0, "fine-tune across prefix should delta-code"
+
+        # 5. Test CLI with --dest
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cli = os.path.join(repo_root, "lmz-cli")
+        res = subprocess.run([sys.executable, cli, "append", arc, p1, "--dest", "cli_member.safetensors"],
+                             check=False, capture_output=True, text=True)
+        assert res.returncode == 0, res.stderr
+
+        # 6. Verify all members in the archive
+        with lmz.MappedArchive(arc, verify=True) as m:
+            member_names = {mem.path for mem in m.members}
+            assert "model.safetensors" in member_names
+            assert "v1_copy.safetensors" in member_names
+            assert "v1_dir/model.safetensors" in member_names
+            assert "instruct/model.safetensors" in member_names
+            assert "cli_member.safetensors" in member_names
+
+            # Verify byte-exact tensors
+            _dt, _sh, raw1 = m.tensor("layer.weight", member="model.safetensors")
+            _dt, _sh, raw1_copy = m.tensor("layer.weight", member="v1_copy.safetensors")
+            _dt, _sh, raw2 = m.tensor("layer.weight", member="instruct/model.safetensors")
+            assert raw1 == w1
+            assert raw1_copy == w1
+            assert raw2 == w2
+
+        # 7. Verify decompress roundtrip
+        out = os.path.join(d, "restored")
+        lmz.decompress(arc, out)
+        assert open(os.path.join(out, "model.safetensors"), "rb").read() == open(p1, "rb").read()
+        assert open(os.path.join(out, "v1_copy.safetensors"), "rb").read() == open(p1, "rb").read()
+        assert open(os.path.join(out, "v1_dir", "model.safetensors"), "rb").read() == open(p1, "rb").read()
+        assert open(os.path.join(out, "instruct", "model.safetensors"), "rb").read() == open(p2, "rb").read()
+        assert open(os.path.join(out, "cli_member.safetensors"), "rb").read() == open(p1, "rb").read()
+
+
 if __name__ == "__main__":
     sys.exit(main())
