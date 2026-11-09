@@ -1,0 +1,1 @@
+{"parent_pid": 34344, "pytest_pid": 34371, "reason": "new Vulkan fixture waits for parent lock and recognizes only lmsluice-executor prefix; parent paused while fixture owns GPU, then reacquired before no-GPU runner", "idle_samples": [66, 0, 0, 0, 0]}

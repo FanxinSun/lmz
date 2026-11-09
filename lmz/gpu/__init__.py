@@ -30,7 +30,7 @@ __all__ = ["available", "backend", "can_decode_chunk", "cost_model",
            "decode_batch", "decode_batch_dev", "decode_chunk", "decode_chunks",
            "dequant_q8_0_to_fp16", "grain", "header_bytes", "last_error",
            "make_mtl_buffer", "pad_bytes", "project_fp8_to_bf16",
-           "release_mtl_buffer", "state", "verify", "vulkan"]
+           "release_mtl_buffer", "prepare_metal_batch", "decode_bf16_fused", "state", "verify", "vulkan"]
 
 # Kept in step with ABI_VERSION in lmzgpu.cu. A library built from an older
 # source is ignored rather than called with the wrong argument list.
@@ -178,6 +178,25 @@ def _load():
             if hasattr(lib, "lmz_gpu_release_mtl_buffer"):
                 lib.lmz_gpu_release_mtl_buffer.restype = None
                 lib.lmz_gpu_release_mtl_buffer.argtypes = [v]
+            if hasattr(lib, "lmz_gpu_metal_decode"):
+                lib.lmz_gpu_metal_decode.restype = c_int
+                lib.lmz_gpu_metal_decode.argtypes = [v, v, ctypes.c_size_t, v, c_uint, c_uint,
+                                                     v, ctypes.c_size_t, ctypes.POINTER(v), ctypes.POINTER(v)]
+                lib.lmz_gpu_metal_decode_bf16.restype = c_int
+                lib.lmz_gpu_metal_decode_bf16.argtypes = [v,v,ctypes.c_size_t,v,c_uint,c_uint,v,ctypes.c_size_t,v,ctypes.c_size_t,ctypes.POINTER(v),ctypes.POINTER(v)]
+                lib.lmz_gpu_metal_prepare.restype = v
+                lib.lmz_gpu_metal_prepare.argtypes = [v,v,ctypes.c_size_t,v,c_uint,c_uint,v,ctypes.c_size_t,v,ctypes.c_size_t]
+                lib.lmz_gpu_metal_run_prepared.restype = c_int
+                lib.lmz_gpu_metal_run_prepared.argtypes = [v]
+                lib.lmz_gpu_metal_prepared_contents.restype = v
+                lib.lmz_gpu_metal_prepared_contents.argtypes = [v]
+                lib.lmz_gpu_metal_release_prepared.argtypes = [v]
+                lib.lmz_gpu_metal_release_prepared.restype = None
+                lib.lmz_gpu_metal_decode_batch_dev_sized.restype = c_int
+                lib.lmz_gpu_metal_decode_batch_dev_sized.argtypes = [v,v,v,c_uint,c_uint,v,v,c_uint,ctypes.c_size_t,ctypes.c_size_t]
+                lib.lmz_gpu_metal_last_timing.restype = ctypes.POINTER(ctypes.c_double)
+                lib.lmz_gpu_mtl_contents.restype = v
+                lib.lmz_gpu_mtl_contents.argtypes = [v]
             device = _probed
             prefix = "metal:" if sys.platform == "darwin" or "Metal" in device else "cuda:"
             if not _selftest(lib):
@@ -508,8 +527,11 @@ def _cost_model_metal_shared() -> dict:
                       "report excludes it from its primary interval. A CPU "
                       "streaming 71-81 GB/s (measured read+write) on the same "
                       "bus slowed the decoder 17-29% although DRAM did not "
-                      "bind it. Record: "
-                      "docs/evaluations/m4-metal-decoder-remeasure.md",
+                      "bind it. The kernel is byte-identical to the one "
+                      "measured: the 2026-11-09 host-path rewrite did not "
+                      "change it. Record: "
+                      "docs/evaluations/m4-metal-decoder-remeasure.md "
+                      "(Phases 3b-5)",
         },
     }
 
@@ -546,7 +568,12 @@ def _cost_model_metal_per_chunk() -> dict:
         "compiled_threadgroup_bytes_at_32_threads": 20_992,
         "blocks_per_unit_at_measurement": (1, 3),
         # The launch geometry matters more here than anywhere else measured:
-        # one threadgroup per four streams is far from the best grid.
+        # one threadgroup per four streams is far from the best grid. These two
+        # are KERNEL-ONLY rates of the unchanged kernel. Since 2026-11-09 the host
+        # path defaults to that shipped geometry and tuning is opt-in
+        # (prepare_metal_batch, or LMZ_METAL_PERSTREAM_TGS=auto): through the API
+        # the default decodes 4.0 GB/s and a tuned grid (80-160 TGs here, varying
+        # with load) 10-11 GB/s, at a one-time cost of ~20 batch decodes.
         "shipped_geometry_gbps": 4.577,
         "best_measured_grid": {"threadgroups": 100, "gbps": 10.557},
         "residency_formula": (
@@ -580,8 +607,12 @@ def _cost_model_metal_per_chunk() -> dict:
                        "core only; above that the occupancy is unresolved",
             "supersedes": "nothing: the first measured Metal per-chunk cost",
             "status": "one device; desktop GPU clients present in most rows. "
+                      "The kernels are byte-identical to those measured: the "
+                      "2026-11-09 host-path rewrite (zero-copy buffers, ARC) did "
+                      "not change them, and a bounds-guarded variant that did "
+                      "(4-10% slower) was not kept. "
                       "Record: docs/evaluations/m4-metal-decoder-remeasure.md "
-                      "(Phase 4)",
+                      "(Phases 4 and 5)",
         },
     }
 
@@ -908,6 +939,133 @@ def _ptr(obj):
         return ctypes.cast(p, ctypes.c_void_p).value, (p, b)
 
 
+class _MetalBuffer(ctypes.Structure):
+    """A retained contiguous Python buffer export, including read-only mmaps."""
+    _fields_ = [("buf", ctypes.c_void_p), ("obj", ctypes.c_void_p),
+                ("size", ctypes.c_ssize_t), ("itemsize", ctypes.c_ssize_t),
+                ("readonly", ctypes.c_int), ("ndim", ctypes.c_int),
+                ("format", ctypes.c_void_p), ("shape", ctypes.c_void_p),
+                ("strides", ctypes.c_void_p), ("suboffsets", ctypes.c_void_p),
+                ("internal", ctypes.c_void_p)]
+
+    def __init__(self, value, writable=False):
+        super().__init__()
+        get = ctypes.pythonapi.PyObject_GetBuffer
+        get.argtypes = [ctypes.py_object, ctypes.c_void_p, ctypes.c_int]
+        get.restype = ctypes.c_int
+        get(value, ctypes.byref(self), 1 if writable else 0)
+
+    def __del__(self):
+        if self.obj:
+            release = ctypes.pythonapi.PyBuffer_Release
+            release.argtypes = [ctypes.c_void_p]
+            release.restype = None
+            release(ctypes.byref(self))
+
+
+class _MetalOwned:
+    def __init__(self, lib, handle):
+        self.lib, self.handle = lib, handle
+
+    def __del__(self):
+        self.lib.lmz_gpu_release_mtl_buffer(self.handle)
+
+
+def _metal_decode(lib, streams, offsets, nstr, plane, out, header, smplane=None):
+    src, off = _MetalBuffer(streams), _MetalBuffer(offsets)
+    hdr = _MetalBuffer(header) if header is not None else None
+    dst = _MetalBuffer(out, writable=True) if out is not None else None
+    need = nstr * plane * (2 if smplane is not None else 1)
+    sm = _MetalBuffer(smplane) if smplane is not None else None
+    if dst is not None and dst.size < need:
+        raise ValueError("output is too small")
+    owned, address = ctypes.c_void_p(), ctypes.c_void_p()
+    args = (hdr.buf if hdr else None, src.buf, src.size, off.buf, nstr, plane)
+    output = (dst.buf if dst else None, dst.size if dst else 0, ctypes.byref(owned), ctypes.byref(address))
+    rc = (lib.lmz_gpu_metal_decode_bf16(*args, sm.buf, sm.size, *output) if sm is not None
+          else lib.lmz_gpu_metal_decode(*args, *output))
+    if rc == EBADSTREAM:
+        raise ValueError("malformed rANS stream")
+    if rc != OK:
+        return None
+    if out is not None:
+        return memoryview(out).cast("B")[:need]
+    array = (ctypes.c_ubyte * need).from_address(address.value)
+    array._metal_owner = _MetalOwned(lib, owned.value)
+    return memoryview(array).cast("B")
+
+
+class _MetalBatch:
+    def __init__(self, lib, handle, refs, size):
+        self.lib, self.handle, self.refs, self.size = lib, handle, refs, size
+
+    def decode(self):
+        """Synchronously decode into the retained output; prior views are overwritten."""
+        if self.lib.lmz_gpu_metal_run_prepared(self.handle) != OK:
+            return None
+        address = self.lib.lmz_gpu_metal_prepared_contents(self.handle)
+        array = (ctypes.c_ubyte * self.size).from_address(address)
+        array._metal_owner = self
+        return memoryview(array).cast("B")
+
+    def __del__(self):
+        self.lib.lmz_gpu_metal_release_prepared(self.handle)
+
+
+def prepare_metal_batch(streams, offsets, nstr, plane, out=None, header=None, smplane=None):
+    """Prepare reusable synchronous Metal bindings, or None without Metal.
+
+    Preparation validates with one decode and may autotune per-stream geometry.
+    Inputs must remain unchanged for the lifetime of the object. Views returned
+    by .decode() share its output and keep all bindings/exported memory alive;
+    the next decode overwrites prior views. Aligned coded inputs share their
+    mapped final page only when it contains pad_bytes() of readable tail space;
+    otherwise they are copied once with zero padding. This assumes valid rANS
+    streams, like CUDA; corrupted payloads may fail the command buffer. Other
+    inputs share complete aligned pages or are copied once. An explicit output must span whole
+    aligned writable pages. smplane selects fused BF16 and requires header.
+    """
+    lib = _load()
+    if lib is None or not _state.startswith("metal:") or not hasattr(lib, "lmz_gpu_metal_prepare"):
+        return None
+    _check_metal_shape(offsets, nstr, plane, header)
+    if not nstr: return None
+    src, off = _MetalBuffer(streams), _MetalBuffer(offsets)
+    hdr = _MetalBuffer(header) if header is not None else None
+    sm = _MetalBuffer(smplane) if smplane is not None else None
+    dst = _MetalBuffer(out, writable=True) if out is not None else None
+    if sm is not None and hdr is None: raise ValueError("fused decode requires header")
+    handle = lib.lmz_gpu_metal_prepare(hdr.buf if hdr else None, src.buf, src.size, off.buf,
+              nstr, plane, sm.buf if sm else None, sm.size if sm else 0,
+              dst.buf if dst else None, dst.size if dst else 0)
+    if not handle: return None
+    return _MetalBatch(lib, handle, (src, off, hdr, sm, dst), nstr * plane * (2 if sm else 1))
+
+
+def _check_metal_shape(offsets, nstr, plane, header):
+    if nstr < 0 or nstr > 0xFFFFFFFF or plane <= 0 or plane > 0xFFFFFFFF:
+        raise ValueError("invalid batch dimensions")
+    if memoryview(offsets).nbytes < nstr * 16: raise ValueError("offsets too short")
+    if header is not None and memoryview(header).nbytes != 516: raise ValueError("shared header must be 516 bytes")
+
+
+def decode_bf16_fused(streams, offsets, smplane, nstr, plane, header, out=None):
+    """Metal rANS exponent + raw sign/mantissa merge to original BF16 bytes.
+
+    Offsets describe headerless exponent streams against the required shared
+    header. smplane holds nstr*plane raw sign/mantissa bytes. Returns an owned
+    Metal-backed view or a view of writable out; None means CPU fallback.
+    CUDA is unaffected and declines this Metal-only entrypoint.
+    """
+    lib = _load()
+    if lib is None or not _state.startswith("metal:") or not hasattr(lib, "lmz_gpu_metal_decode_bf16"):
+        return None
+    _check_metal_shape(offsets, nstr, plane, header)
+    if header is None: raise ValueError("fused decode requires header")
+    if not nstr: return memoryview(b"")
+    return _metal_decode(lib, streams, offsets, nstr, plane, out, header, smplane)
+
+
 def decode_batch(streams, offsets, nstr: int, plane: int, out=None, header=None):
     """Decode `nstr` lmz rANS streams to `plane` bytes each. None if unavailable.
 
@@ -943,6 +1101,11 @@ def decode_batch(streams, offsets, nstr: int, plane: int, out=None, header=None)
     if header is not None and len(header) != header_bytes():
         raise ValueError(f"a shared table is {header_bytes()} bytes, not {len(header)}")
 
+    if _state.startswith("metal:") and hasattr(lib, "lmz_gpu_metal_decode"):
+        if out is not None and memoryview(out).nbytes < nstr * plane:
+            out = None  # preserve the legacy undersized-scratch fallback
+        return _metal_decode(lib, streams, offsets, nstr, plane, out, header)
+
     need = nstr * plane
     dst = out if (out is not None and len(out) >= need) else bytearray(need)
     s_addr, _a = _ptr(streams)
@@ -960,10 +1123,18 @@ def decode_batch(streams, offsets, nstr: int, plane: int, out=None, header=None)
 
 
 def decode_batch_dev(streams, offsets, nstr: int, plane: int, out,
-                     header=None, stream=None, tpb: int = 0) -> int:
+                     header=None, stream=None, tpb: int = 0,
+                     streams_nbytes: int = 0, out_nbytes: int = 0) -> int:
     """Decode a batch that is already in device memory. Returns a status code.
 
-    Every pointer is the caller's: `streams`, `offsets`, `out` and `header` are
+    On Metal these are CPU-accessible unified-memory pointers. The default
+    queue is synchronous; an explicit Metal queue enqueues asynchronously and
+    the caller must keep all pointed-to memory alive through completion.
+    streams_nbytes/out_nbytes optionally declare the exported capacities; the
+    coded extent is checked against streams_nbytes when supplied. Metal wraps
+    safe aligned ranges and otherwise copies, including output copy-back.
+
+    On CUDA every pointer is the caller's: `streams`, `offsets`, `out` and `header` are
     device addresses as plain integers, and `stream` is a CUDA stream handle,
     or None for the default stream. This allocates nothing, copies nothing,
     creates no context and **does not synchronise** -- when it returns, the
@@ -995,6 +1166,11 @@ def decode_batch_dev(streams, offsets, nstr: int, plane: int, out,
         raise ValueError("nstr is negative")
     if out is None or streams is None or offsets is None:
         raise ValueError("streams, offsets and out are device pointers")
+    if _state.startswith("metal:") and hasattr(lib, "lmz_gpu_metal_decode_batch_dev_sized"):
+        if streams_nbytes < 0 or out_nbytes < 0:
+            raise ValueError("negative exported capacity")
+        return lib.lmz_gpu_metal_decode_batch_dev_sized(header or 0, streams, offsets,
+                 nstr, plane, out, stream or 0, tpb, streams_nbytes, out_nbytes)
     return lib.lmz_gpu_decode_batch_dev(
         ctypes.c_void_p(header or 0), ctypes.c_void_p(streams),
         ctypes.c_void_p(offsets), nstr, plane, ctypes.c_void_p(out),
@@ -1031,6 +1207,9 @@ def project_fp8_to_bf16(fp8_data, nelem: int, out=None):
     return None
 
 
+_metal_exports = {}
+
+
 def make_mtl_buffer(data):
     """Wrap or share memoryview/bytes into an Apple Silicon MTLBuffer.
     Returns (raw_ptr, offset, length) or None if Metal is unavailable.
@@ -1038,14 +1217,16 @@ def make_mtl_buffer(data):
     lib = _load()
     if lib is None or not hasattr(lib, "lmz_gpu_make_mtl_buffer"):
         return None
-    ptr, ref = _ptr(data)
+    ref = _MetalBuffer(data)
+    ptr = ref.buf
     if ptr is None:
         return None
-    length = len(data)
+    length = ref.size
     out_off = ctypes.c_size_t(0)
     buf_ptr = lib.lmz_gpu_make_mtl_buffer(ptr, length, ctypes.byref(out_off))
     if not buf_ptr:
         return None
+    _metal_exports[buf_ptr] = ref
     return buf_ptr, out_off.value, length
 
 
@@ -1054,6 +1235,7 @@ def release_mtl_buffer(buf_ptr):
     lib = _load()
     if lib is not None and hasattr(lib, "lmz_gpu_release_mtl_buffer") and buf_ptr:
         lib.lmz_gpu_release_mtl_buffer(buf_ptr)
+        _metal_exports.pop(buf_ptr, None)
 
 
 def can_decode_chunk(codec: int, esize: int, flags: int, rlen: int) -> bool:
@@ -1186,6 +1368,16 @@ def decode_chunk(payload, codec: int, esize: int, flags: int, rlen: int,
         if codec == CODEC_SPLIT_ST and tables is not None:
             hdr = tables.get(CODEC_SPLIT, esize, k)
         plane_hdrs.append(hdr)
+
+    if (os.environ.get("LMZ_METAL_FUSED_CHUNK") == "1" and
+            codec == CODEC_BF16 and plane_methods == [3, 0] and
+            nelem % grain() == 0 and len(streams[1]) == nelem and
+            len(streams[0]) >= 516 + 32 and bytes(streams[0][:2]) == b"R1"):
+        exponent = memoryview(streams[0])
+        fused = decode_bf16_fused(exponent[516:], struct.pack("<QQ", 0, len(exponent)-516),
+                                  streams[1], 1, nelem, exponent[:516], out=out)
+        if fused is not None:
+            return fused
 
     decoded_planes = []
     for k in range(nplanes):

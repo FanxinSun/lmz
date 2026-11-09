@@ -1,0 +1,38 @@
+[
+  {
+    "mode": "pytest",
+    "exit_code": 1,
+    "tail": [
+      "",
+      "-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html",
+      "=========================== short test summary info ============================",
+      "FAILED tests/test_lmz.py::test_gpu_device_entry_point_owns_nothing - test_lmz...",
+      "FAILED tests/test_lmz.py::test_gpu_vulkan_probe_and_shader_structure - Assert...",
+      "FAILED tests/test_lmz.py::test_mount_readahead_serves_the_same_bytes - test_l...",
+      "FAILED tests/test_lmz.py::test_fs_writes_are_compressed_and_read_back - test_...",
+      "FAILED tests/test_lmz.py::test_fs_write_then_immediately_read - test_lmz.Skip...",
+      "FAILED tests/test_lmz.py::test_fs_preserves_metadata_and_namespace - test_lmz...",
+      "FAILED tests/test_lmz.py::test_fs_declines_to_compress_what_will_not_shrink",
+      "FAILED tests/test_lmz.py::test_fs_rewrite_replaces_contents - test_lmz.Skip: ...",
+      "8 failed, 147 passed, 1 warning, 105 subtests passed in 526.65s (0:08:46)"
+    ]
+  },
+  {
+    "mode": "no-gpu",
+    "exit_code": 1,
+    "tail": [
+      "  PASS  test_subblock_mode_spans_a_gap_before_the_quants",
+      "  PASS  test_tensor_blocks_addressing",
+      "  PASS  test_unknown_format_is_opaque",
+      "  PASS  test_v1_archives_still_read",
+      "  PASS  test_v3_q8_block_chunks_still_decode",
+      "  PASS  test_verify_and_info",
+      "  PASS  test_verify_rejects_damaged_archive",
+      "  PASS  test_version_stamp_follows_the_codecs_used",
+      "  PASS  test_workers_do_not_change_output",
+      "  PASS  test_zstd_backend_preference_does_not_change_what_is_readable",
+      "",
+      "122/143 passed, 20 skipped"
+    ]
+  }
+]

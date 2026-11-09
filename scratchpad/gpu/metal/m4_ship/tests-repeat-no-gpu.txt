@@ -1,0 +1,145 @@
+  PASS  test_a_missing_general_coder_does_not_hand_everything_to_rans
+  PASS  test_aligned_archive_starts_blocks_on_page_boundaries
+  PASS  test_append_dedups_a_copy_of_a_delta_coded_member
+  PASS  test_append_dedups_a_copy_of_a_plain_member
+  PASS  test_append_deltas_through_a_reference_source
+  PASS  test_append_grows_an_archive_like_one_shot
+  PASS  test_append_keeps_the_archive_kind
+  PASS  test_append_rejects_a_name_already_present
+  PASS  test_append_with_dest_mapping_and_cli
+  PASS  test_archive_index_decodes_without_doing_io
+  PASS  test_backends_reported
+  SKIP  test_bf16_cond_gpu_decode: GPU decoder not available
+  PASS  test_bf16_conditional_declines_uncorrelated
+  PASS  test_bf16_conditional_detects_corruption
+  PASS  test_bf16_conditional_roundtrip
+  PASS  test_bf16_conditioning_beats_a_byte_split
+  PASS  test_bf16_field_split_roundtrip
+  PASS  test_block_codec_declines_on_noise
+  PASS  test_block_codec_roundtrip
+  PASS  test_block_codec_uses_every_group_mode
+  PASS  test_block_layouts_tile_their_blocks
+  PASS  test_bucket_fallback_matches_native
+  PASS  test_bucket_kernels
+  PASS  test_bucket_partition_accepts_a_precomputed_histogram
+  PASS  test_capabilities_are_declared_not_inferred
+  PASS  test_chunk_order_survives_a_table_written_out_of_order
+  PASS  test_cli
+  PASS  test_coalesced_payload_reads_match
+  PASS  test_codec_detects_corruption
+  PASS  test_codec_roundtrip_all_dtypes
+  PASS  test_colab_notebook_still_opens
+  PASS  test_crc32_arm64_matches_zlib
+  PASS  test_dedup_across_files
+  PASS  test_dedup_deterministic_across_workers
+  PASS  test_dedup_within_file
+  PASS  test_delta_against_an_earlier_file
+  PASS  test_delta_corruption_rejected
+  PASS  test_delta_declines_when_the_files_differ
+  PASS  test_delta_source_does_not_depend_on_file_order
+  PASS  test_delta_sources_are_never_themselves_deltas
+  PASS  test_directory_roundtrip_preserves_tree
+  PASS  test_encode_options_match_the_signature
+  PASS  test_extract_one_member
+  SKIP  test_fs_declines_to_compress_what_will_not_shrink: fs exited: lmz: mount failed: fusermount3 not found -- install fuse3 to use `lmz mount`
+  PASS  test_fs_never_publishes_a_size_it_knows_is_stale
+  SKIP  test_fs_preserves_metadata_and_namespace: fs exited: lmz: mount failed: fusermount3 not found -- install fuse3 to use `lmz mount`
+  SKIP  test_fs_rewrite_replaces_contents: fs exited: lmz: mount failed: fusermount3 not found -- install fuse3 to use `lmz mount`
+  PASS  test_fs_scratch_fd_closes_only_once_unreachable
+  SKIP  test_fs_write_then_immediately_read: fs exited: lmz: mount failed: fusermount3 not found -- install fuse3 to use `lmz mount`
+  SKIP  test_fs_writes_are_compressed_and_read_back: fs exited: lmz: mount failed: fusermount3 not found -- install fuse3 to use `lmz mount`
+  PASS  test_fuse_tree_builds_nested_paths
+  PASS  test_gguf_layout
+  PASS  test_gpu_build_declines_hardware_it_cannot_target
+  PASS  test_gpu_cost_model_is_publishable
+  PASS  test_gpu_cost_model_metal_is_its_own_record
+  SKIP  test_gpu_declines_rather_than_guesses: no GPU decoder: disabled by LMZ_NO_GPU
+  SKIP  test_gpu_decode_archive_and_shared_tables: no GPU decoder: disabled by LMZ_NO_GPU
+  SKIP  test_gpu_decode_matches_cpu: no GPU decoder: disabled by LMZ_NO_GPU
+  SKIP  test_gpu_decode_over_distributions_and_shapes: no GPU decoder: disabled by LMZ_NO_GPU
+  SKIP  test_gpu_decode_shared_table: no GPU decoder: disabled by LMZ_NO_GPU
+  SKIP  test_gpu_dequant_q8_and_project_fp8: GPU decoder not available
+  SKIP  test_gpu_device_entry_point_owns_nothing: no GPU decoder
+  PASS  test_gpu_is_optional
+  PASS  test_gpu_probe_survives_a_driver_that_crashes
+  SKIP  test_gpu_refuses_a_device_that_disagrees_with_the_cpu: no GPU decoder: disabled by LMZ_NO_GPU
+  SKIP  test_gpu_verify_reports_this_machine: no GPU decoder: disabled by LMZ_NO_GPU
+  PASS  test_gpu_vulkan_probe_and_shader_structure
+  PASS  test_incompressible_data_is_stored
+  PASS  test_info_reports_which_coder_did_the_work
+  PASS  test_int8_weights_are_coded_with_rans_not_zstd
+  PASS  test_k4_kernels_agree_and_reverse
+  PASS  test_kernel_fallback_matches_native
+  PASS  test_kernels_reject_bad_input
+  PASS  test_kernels_roundtrip
+  PASS  test_kquant_gguf_file_roundtrip
+  PASS  test_macos_mount_webdav_roundtrip
+  PASS  test_mapped_archive_random_access
+  PASS  test_mapped_archive_reads_concurrently
+  PASS  test_mapped_archive_still_decompresses_whole
+  SKIP  test_mapped_archive_zero_copy_and_mtl_buffer: Metal export unavailable or disabled
+  SKIP  test_metal_fused_and_opt_in_chunk: Metal decoder unavailable or disabled
+  SKIP  test_metal_guarded_pages_and_retained_views: Metal decoder unavailable or disabled
+  SKIP  test_metal_perstream_stride_partial_groups: Metal decoder unavailable or disabled
+  PASS  test_method_tally_counts_only_the_attempt_that_won
+  PASS  test_method_tally_measures_the_losing_coder
+  PASS  test_mount_is_read_only
+  PASS  test_mount_matches_a_full_decompression
+  PASS  test_mount_readahead_serves_the_same_bytes
+  PASS  test_mount_serves_only_the_named_models
+  PASS  test_mount_serves_the_original_bytes
+  PASS  test_multi_source_joint_compression
+  PASS  test_onnx_external_data_typed_and_addressed
+  PASS  test_onnx_initializers_are_addressed_and_typed
+  PASS  test_onnx_round_trips_through_an_archive
+  PASS  test_onnx_that_is_not_onnx_degrades_to_bytes
+  PASS  test_opening_a_huge_index_stays_cheap
+  PASS  test_options_are_honoured
+  PASS  test_prefetch_does_not_change_what_is_read
+  PASS  test_primer_declines_when_pooling_loses
+  PASS  test_pytorch_bin_layout_and_roundtrip
+  PASS  test_q80_gguf_file_roundtrip
+  PASS  test_rans_accepts_a_precomputed_histogram
+  PASS  test_rans_adversarial_distributions
+  PASS  test_rans_cost_is_a_floor
+  PASS  test_rans_decode_many4_neon
+  PASS  test_rans_majority_symbol_states
+  PASS  test_rans_matches_entropy
+  PASS  test_rans_rejects_malformed
+  PASS  test_rans_vector_path_writes_the_same_bytes
+  PASS  test_read_tensor_matches_original
+  PASS  test_readahead_predicts_only_sequential_streams
+  PASS  test_ref_corruption_rejected
+  PASS  test_refuses_to_clobber
+  PASS  test_rejects_path_traversal
+  PASS  test_roundtrip_edge_sizes
+  PASS  test_safetensors_layout
+  PASS  test_scheduling_options_do_not_change_the_bytes
+  PASS  test_shared_payloads_survive_a_second_append
+  PASS  test_shared_table_chunk_needs_its_manifest
+  PASS  test_shared_table_refuses_what_it_cannot_code
+  PASS  test_shared_table_streams_are_ordinary_streams
+  PASS  test_shared_tables_are_decided_per_plane
+  PASS  test_shared_tables_shrink_a_page_mapped_archive
+  PASS  test_single_file_roundtrip
+  PASS  test_store_add_list_and_remove
+  PASS  test_store_names_are_normalised
+  PASS  test_store_reads_tensors_without_expanding
+  PASS  test_store_rebuild_recovers_the_index
+  PASS  test_stride_fallback_matches_native
+  PASS  test_stride_kernels
+  PASS  test_subblock_descriptor_is_validated
+  PASS  test_subblock_mode_declines_without_structure
+  PASS  test_subblock_mode_is_chosen_and_reverses
+  PASS  test_subblock_mode_spans_a_gap_before_the_quants
+  PASS  test_tensor_blocks_addressing
+  PASS  test_unknown_format_is_opaque
+  PASS  test_v1_archives_still_read
+  PASS  test_v3_q8_block_chunks_still_decode
+  PASS  test_verify_and_info
+  PASS  test_verify_rejects_damaged_archive
+  PASS  test_version_stamp_follows_the_codecs_used
+  PASS  test_workers_do_not_change_output
+  PASS  test_zstd_backend_preference_does_not_change_what_is_readable
+
+124/143 passed, 19 skipped

@@ -1,0 +1,60 @@
+{
+  "results": [
+    {
+      "nstr": 28584,
+      "plane": 32768,
+      "forced_grid": 1,
+      "identical": true
+    },
+    {
+      "nstr": 28584,
+      "plane": 32768,
+      "forced_grid": 3,
+      "identical": true
+    },
+    {
+      "nstr": 28584,
+      "plane": 32768,
+      "forced_grid": 7,
+      "identical": true
+    },
+    {
+      "nstr": 28584,
+      "plane": 32768,
+      "forced_grid": 7146,
+      "identical": true
+    }
+  ],
+  "conditions": {
+    "campaign": "ship-real-settings",
+    "timestamp": "2026-11-09T16:49:11.001669+08:00",
+    "git_sha": "7fd045dc5be0566eeaa853088c5508fb0736c8bf",
+    "idle_samples": [
+      [
+        [
+          0
+        ],
+        [
+          0
+        ],
+        [
+          0
+        ],
+        [
+          0
+        ],
+        [
+          0
+        ]
+      ]
+    ],
+    "idle_flag": false,
+    "vm": "1275",
+    "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+    "power": "Now drawing from 'AC Power'",
+    "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+    "memory": "hw.memsize: 25769803776",
+    "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+  },
+  "note": "Correctness-only runs; no rate claims."
+}

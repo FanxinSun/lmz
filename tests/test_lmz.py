@@ -3960,7 +3960,11 @@ def test_gpu_vulkan_probe_and_shader_structure():
     assert "#version 450" in shader_src
     assert "GL_KHR_shader_subgroup_ballot" in shader_src
     assert "subgroupBallot" in shader_src
-    assert "subgroupBallotExclusiveBitCount" in shader_src
+    # Either whole-subgroup prefix counting or the per-eight-lane masked
+    # bitCount formulation supplies the cursor prefix. The latter is used by
+    # the separately updated Vulkan shader; do not require one intrinsic name.
+    assert ("subgroupBallotExclusiveBitCount" in shader_src or
+            ("bitCount" in shader_src and "0xff" in shader_src))
 
 
 class Skip(Exception):
@@ -4754,8 +4758,160 @@ def test_gpu_dequant_q8_and_project_fp8():
     assert w2 == 0xBF80, f"Expected 0xBF80 for -1.0, got {hex(w2)}"
 
 
+def test_metal_perstream_stride_partial_groups():
+    from lmz import gpu
+    if os.environ.get("LMZ_NO_GPU") or not gpu.available()[0] or not gpu.backend().startswith("metal:"):
+        raise Skip("Metal decoder unavailable or disabled")
+    previous = os.environ.get("LMZ_METAL_PERSTREAM_TGS")
+    try:
+        for nstr in (1, 2, 3, 5, 17, 129, 1023, 1025, 4093, 4097):
+            planes = [bytes(((j * 17 + i * 13) % 11) for j in range(128)) for i in range(nstr)]
+            coded, offsets = bytearray(), bytearray()
+            for plain in planes:
+                stream = kernels.rans_encode(plain)
+                assert stream is not None
+                offsets += struct.pack("<QQ", len(coded), len(stream))
+                coded += stream
+            want = b"".join(planes)
+            for grid in (1, 3, 7, (nstr + 3) // 4):
+                os.environ["LMZ_METAL_PERSTREAM_TGS"] = str(grid)
+                got = gpu.decode_batch(coded, offsets, nstr, 128)
+                assert got is not None and got == want, (nstr, grid)
+    finally:
+        if previous is None: os.environ.pop("LMZ_METAL_PERSTREAM_TGS", None)
+        else: os.environ["LMZ_METAL_PERSTREAM_TGS"] = previous
+
+
+def test_metal_perstream_tuning_is_explicit():
+    """Tuning the per-chunk grid costs ~20 batch decodes; nobody pays it unasked.
+
+    Measured on an Apple M4: 4.8 s once per process on a 936 MB batch, for a grid that
+    decodes 3.6x faster. That repays itself only over many calls, so a plain
+    decode_batch() must keep the shipped geometry, a number in LMZ_METAL_PERSTREAM_TGS
+    must force a grid without tuning, and only `auto` (or prepare_metal_batch, whose
+    purpose is repeated decodes) may tune. The grid is process-global state, so each
+    case runs in its own process.
+    """
+    from lmz import gpu
+    if os.environ.get("LMZ_NO_GPU") or not gpu.available()[0] or not gpu.backend().startswith("metal:"):
+        raise Skip("Metal decoder unavailable or disabled")
+    code = (
+        "import ctypes, struct\n"
+        "from lmz import gpu, kernels\n"
+        "n = 1100\n"
+        "planes = [bytes(((j * 17 + i * 13) % 11) for j in range(128)) for i in range(n)]\n"
+        "coded, offs = bytearray(), bytearray()\n"
+        "for p in planes:\n"
+        "    s = kernels.rans_encode(p)\n"
+        "    offs += struct.pack('<QQ', len(coded), len(s))\n"
+        "    coded += s\n"
+        "got = gpu.decode_batch(coded, offs, n, 128)\n"
+        "assert got is not None and bytes(got) == b''.join(planes)\n"
+        "lib = gpu._load()\n"
+        "lib.lmz_gpu_metal_perstream_tgs.restype = ctypes.c_uint\n"
+        "print(lib.lmz_gpu_metal_perstream_tgs())\n")
+
+    def tuned_grid(value):
+        env = dict(os.environ, PYTHONPATH=ROOT)
+        env.pop("LMZ_METAL_PERSTREAM_TGS", None)
+        if value is not None:
+            env["LMZ_METAL_PERSTREAM_TGS"] = value
+        r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                           text=True, timeout=300)
+        assert r.returncode == 0, r.stderr
+        return int(r.stdout.split()[-1])
+
+    assert tuned_grid(None) == 0, "a plain decode_batch tuned the geometry without being asked"
+    assert tuned_grid("7") == 0, "a numeric override must force the grid, not tune"
+    assert tuned_grid("auto") > 0, "LMZ_METAL_PERSTREAM_TGS=auto must tune"
+
+
+def test_metal_guarded_pages_and_retained_views():
+    from lmz import gpu
+    if os.environ.get("LMZ_NO_GPU") or not gpu.available()[0] or not gpu.backend().startswith("metal:"):
+        raise Skip("Metal decoder unavailable or disabled")
+    import ctypes, mmap, gc
+    page = mmap.PAGESIZE
+    plains = [bytes((i * 31 + j) % 13 for i in range(4096)) for j in (0, 4)]
+    hdr = kernels.rans_shared_header(kernels.rans_freqs(kernels.histogram(b"".join(plains))))
+    coded = [kernels.rans_encode_shared(x, hdr) for x in plains]
+    assert all(coded) and sum(map(len, coded)) < page
+    allocation = mmap.mmap(-1, 2 * page)
+    address = ctypes.addressof(ctypes.c_char.from_buffer(allocation))
+    allocation[:len(coded[0])] = coded[0]
+    start = page-len(coded[1])
+    allocation[start:page] = coded[1]  # actual last coded byte abuts PROT_NONE
+    offsets = struct.pack("<QQQQ", 0, len(coded[0]), start, len(coded[1]))
+    libc = ctypes.CDLL(None)
+    libc.mprotect.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    libc.mprotect.restype = ctypes.c_int
+    assert libc.mprotect(address+page, page, 0) == 0
+    source = memoryview(allocation)[:page].toreadonly()
+    try:
+        got = gpu.decode_batch(source, offsets, 2, 4096, header=hdr)
+        assert got is not None and got == b"".join(plains)
+        assert gpu._load().lmz_gpu_metal_last_timing()[7] == 0  # boundary -> padded copy
+        # An aligned coded region with >=pad tail before PROT_NONE shares input.
+        shifted = memoryview(allocation)[:page]
+        safe_start = page-gpu.pad_bytes()-len(coded[1])-8
+        allocation[safe_start:safe_start+len(coded[1])] = coded[1]
+        safe_offsets = struct.pack("<QQQQ", 0, len(coded[0]), safe_start, len(coded[1]))
+        safe = gpu.decode_batch(shifted, safe_offsets, 2, 4096, header=hdr)
+        assert safe is not None and safe == b"".join(plains)
+        assert gpu._load().lmz_gpu_metal_last_timing()[7] == 1
+        shifted.release()
+        allocation[start:page] = coded[1]
+        # Invalid coded length must be contained even if the initial states demand refills.
+        truncated = struct.pack("<QQQQ", 0, len(coded[0]), start, 32)
+        gpu.decode_batch(source, truncated, 2, 4096, header=hdr)
+        short = coded[0][:32]
+        gpu.decode_batch(short, struct.pack("<QQ", 0, len(short)), 1, 4096, header=hdr)
+        assert gpu.decode_batch(source, offsets, 2, 4096, header=hdr) == b"".join(plains)
+        prepared = gpu.prepare_metal_batch(source, offsets, 2, 4096, header=hdr)
+        view = prepared.decode()
+        del prepared
+        gc.collect()
+        assert view == b"".join(plains)
+        del view
+        gc.collect()
+    finally:
+        assert libc.mprotect(address+page, page, 3) == 0
+        source.release()
+        allocation.close()
+
+
+def test_metal_fused_and_opt_in_chunk():
+    from lmz import gpu
+    if os.environ.get("LMZ_NO_GPU") or not gpu.available()[0] or not gpu.backend().startswith("metal:"):
+        raise Skip("Metal decoder unavailable or disabled")
+    exp = bytes([120, 121, 122, 123]) * 1024
+    sm = bytes(range(256)) * 16
+    hdr = kernels.rans_shared_header(kernels.rans_freqs(kernels.histogram(exp)))
+    stream = kernels.rans_encode_shared(exp, hdr)
+    want = kernels.merge_bf16([(exp, 0), (sm, 0)], len(exp))
+    got = gpu.decode_bf16_fused(stream, struct.pack("<QQ", 0, len(stream)), sm, 1, len(exp), hdr)
+    assert isinstance(got, memoryview) and got == want
+    prepared = gpu.prepare_metal_batch(stream, struct.pack("<QQ", 0, len(stream)), 1,
+                                       len(exp), header=hdr, smplane=sm)
+    assert prepared.decode() == want
+    ordinary = kernels.rans_encode(exp)
+    payload = struct.pack("<II", len(ordinary), len(sm)) + ordinary + sm
+    previous = os.environ.get("LMZ_METAL_FUSED_CHUNK")
+    try:
+        for enabled in ("0", "1"):
+            os.environ["LMZ_METAL_FUSED_CHUNK"] = enabled
+            result = gpu.decode_chunk(payload, lmzformat.CODEC_BF16, 2, 3, len(want))
+            assert result is not None and result == want
+    finally:
+        if previous is None: os.environ.pop("LMZ_METAL_FUSED_CHUNK", None)
+        else: os.environ["LMZ_METAL_FUSED_CHUNK"] = previous
+
+
 def test_mapped_archive_zero_copy_and_mtl_buffer():
     """Verify MTLBuffer attachment and tensor export on MappedArchive."""
+    from lmz import gpu
+    if os.environ.get("LMZ_NO_GPU") or (sys.platform == "darwin" and not gpu.available()[0]):
+        raise Skip("Metal export unavailable or disabled")
     w = weights_bf16(2048, 123)
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "model.safetensors")

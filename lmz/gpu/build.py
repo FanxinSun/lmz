@@ -215,7 +215,7 @@ def build(force: bool = False, verbose: bool = False) -> str | None:
             if verbose:
                 print(f"lmz: {last_error}; the decoder stays on the CPU", file=sys.stderr)
             return None
-        flags = ["-O3", "-fPIC", "-shared", "-framework", "Metal", "-framework", "Foundation"]
+        flags = ["-O3", "-fPIC", "-shared", "-fobjc-arc", "-framework", "Metal", "-framework", "Foundation", "-framework", "IOKit"]
         fd, tmp = tempfile.mkstemp(dir=HERE, suffix=_SUFFIX)
         os.close(fd)
         cmd = [c_comp, *flags, "-o", tmp, SOURCE_METAL]
