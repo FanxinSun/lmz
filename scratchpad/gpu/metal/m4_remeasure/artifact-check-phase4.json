@@ -1,0 +1,10 @@
+{
+  "run_rows": 778,
+  "groups": 102,
+  "all_outputs_identical": true,
+  "first_and_last_verified_each_attempt": true,
+  "clock_rule_checked": true,
+  "foreign_own_pid_exclusion_checked": true,
+  "required_retries_retained": true,
+  "traffic_sanity_all_attempts_pass": true
+}

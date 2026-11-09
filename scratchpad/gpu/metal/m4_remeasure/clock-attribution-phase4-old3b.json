@@ -1,0 +1,2417 @@
+{
+  "method": "P15 if P15_seconds >= 0.95 * summed timed kernel GPU seconds; otherwise f_avg_active",
+  "all_attempts": [
+    {
+      "G": 1,
+      "attempt": 0,
+      "n": 5,
+      "rate_gbps": 0.7496878782812362,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 7.209944725036621,
+        "active_s": 6.284313833333333,
+        "off_s": 0.9259313333333333,
+        "f_avg_active_mhz": 1574.7577030486198,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.003205041666666667,
+          "P3": 0.016921958333333334,
+          "P8": 0.0059011666666666665,
+          "P10": 0.0025357083333333334,
+          "P15": 6.255749958333333
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 6.255749958333333,
+        "summed_kernel_s": 6.251002333301585,
+        "p15_to_kernel_ratio": 1.0007594982018253,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 1,
+      "resident_lanes_assumed": 128,
+      "k_ns_apparent": 170.73772126802666,
+      "k_cycles_avg": 268.8705417677931,
+      "k_cycles_attributed": 269.42412416094606,
+      "foreign_fraction": 0.007723421369209515,
+      "foreign_over_2pct": false,
+      "k_status": "rising/first-peak cost"
+    },
+    {
+      "G": 2,
+      "attempt": 0,
+      "n": 5,
+      "rate_gbps": 1.493821088895387,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 3.431443214416504,
+        "active_s": 3.1593672083333333,
+        "off_s": 0.27203391666666665,
+        "f_avg_active_mhz": 1574.764812515924,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.0022824583333333334,
+          "P3": 0.006209958333333333,
+          "P8": 0.004356916666666667,
+          "P10": 0.002523625,
+          "P15": 3.14399425
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 3.14399425,
+        "summed_kernel_s": 3.135074916703161,
+        "p15_to_kernel_ratio": 1.0028450144043826,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 2,
+      "resident_lanes_assumed": 256,
+      "k_ns_apparent": 171.37259736324944,
+      "k_cycles_avg": 269.8715361571044,
+      "k_cycles_attributed": 270.42595863920764,
+      "foreign_fraction": 0.013919935618601354,
+      "foreign_over_2pct": false,
+      "k_status": "rising/first-peak cost"
+    },
+    {
+      "G": 5,
+      "attempt": 0,
+      "n": 5,
+      "rate_gbps": 3.7012622985009203,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 1.4880099296569824,
+        "active_s": 1.29930575,
+        "off_s": 0.18867891666666667,
+        "f_avg_active_mhz": 1568.624025176522,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.002139958333333333,
+          "P3": 0.0049650833333333335,
+          "P8": 0.00856075,
+          "P10": 0.0029510416666666665,
+          "P12": 0.003974833333333334,
+          "P14": 0.002907,
+          "P15": 1.2738070833333333
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 1.2738070833333333,
+        "summed_kernel_s": 1.2672369166393764,
+        "p15_to_kernel_ratio": 1.0051846395947652,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 5,
+      "resident_lanes_assumed": 640,
+      "k_ns_apparent": 172.9139813352898,
+      "k_cycles_avg": 271.2370254114603,
+      "k_cycles_attributed": 272.85826254708735,
+      "foreign_fraction": 0.022785794527336277,
+      "foreign_over_2pct": true,
+      "k_status": "rising/first-peak cost"
+    },
+    {
+      "G": 5,
+      "attempt": 1,
+      "n": 5,
+      "rate_gbps": 3.70158958547158,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 1.4893510341644287,
+        "active_s": 1.2902391666666666,
+        "off_s": 0.19908020833333334,
+        "f_avg_active_mhz": 1571.937102552692,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.00144675,
+          "P3": 0.004464875,
+          "P8": 0.004352875,
+          "P10": 0.0025370416666666666,
+          "P15": 1.277437625
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 1.277437625,
+        "summed_kernel_s": 1.2697565000271425,
+        "p15_to_kernel_ratio": 1.0060492897438944,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 5,
+      "resident_lanes_assumed": 640,
+      "k_ns_apparent": 172.89869263517082,
+      "k_cycles_avg": 271.7858699360789,
+      "k_cycles_attributed": 272.8341369782995,
+      "foreign_fraction": 0.024074859234307168,
+      "foreign_over_2pct": true,
+      "k_status": "rising/first-peak cost"
+    },
+    {
+      "G": 10,
+      "attempt": 0,
+      "n": 5,
+      "rate_gbps": 7.3115990253925975,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.882098913192749,
+        "active_s": 0.6657596666666666,
+        "off_s": 0.21632191666666667,
+        "f_avg_active_mhz": 1563.9159923325685,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.0019075416666666668,
+          "P3": 0.005672791666666666,
+          "P8": 0.004435666666666667,
+          "P10": 0.002551125,
+          "P15": 0.6511925416666666
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.6511925416666666,
+        "summed_kernel_s": 0.644880166684743,
+        "p15_to_kernel_ratio": 1.00978844645568,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 10,
+      "resident_lanes_assumed": 1280,
+      "k_ns_apparent": 175.06430475121277,
+      "k_cycles_avg": 273.78586588700415,
+      "k_cycles_attributed": 276.25147289741375,
+      "foreign_fraction": 0.02944694375952696,
+      "foreign_over_2pct": true,
+      "k_status": "rising/first-peak cost"
+    },
+    {
+      "G": 10,
+      "attempt": 1,
+      "n": 5,
+      "rate_gbps": 7.304001583334884,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.873035192489624,
+        "active_s": 0.67241325,
+        "off_s": 0.200604125,
+        "f_avg_active_mhz": 1558.1576494563922,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.001992166666666667,
+          "P3": 0.010652125,
+          "P8": 0.004369083333333333,
+          "P10": 0.0025314166666666666,
+          "P15": 0.6528684583333333
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.6528684583333333,
+        "summed_kernel_s": 0.6452132916892879,
+        "p15_to_kernel_ratio": 1.0118645519902463,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 10,
+      "resident_lanes_assumed": 1280,
+      "k_ns_apparent": 175.24640231739568,
+      "k_cycles_avg": 273.0615223105625,
+      "k_cycles_attributed": 276.5388228568504,
+      "foreign_fraction": 0.0340063902629058,
+      "foreign_over_2pct": true,
+      "k_status": "rising/first-peak cost"
+    },
+    {
+      "G": 20,
+      "attempt": 0,
+      "n": 5,
+      "rate_gbps": 14.019859290191194,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.5595619678497314,
+        "active_s": 0.36256866666666665,
+        "off_s": 0.196988,
+        "f_avg_active_mhz": 1541.1792297275183,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.0023192083333333333,
+          "P3": 0.010123875,
+          "P8": 0.004410708333333333,
+          "P10": 0.002526,
+          "P15": 0.343188875
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.343188875,
+        "summed_kernel_s": 0.3385366665897891,
+        "p15_to_kernel_ratio": 1.0137421108829197,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 20,
+      "resident_lanes_assumed": 2560,
+      "k_ns_apparent": 182.5981236338848,
+      "k_cycles_avg": 281.4164355317607,
+      "k_cycles_attributed": 288.1398390942702,
+      "foreign_fraction": 0.040123547433811996,
+      "foreign_over_2pct": true,
+      "k_status": "rising/first-peak cost"
+    },
+    {
+      "G": 20,
+      "attempt": 1,
+      "n": 5,
+      "rate_gbps": 14.038701367856312,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.5540499687194824,
+        "active_s": 0.3468598333333333,
+        "off_s": 0.207173875,
+        "f_avg_active_mhz": 1562.1961779469998,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.0010873333333333334,
+          "P3": 0.002012375,
+          "P8": 0.004419125,
+          "P10": 0.002522458333333333,
+          "P15": 0.3368185416666667
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.3368185416666667,
+        "summed_kernel_s": 0.3356353333219886,
+        "p15_to_kernel_ratio": 1.0035252794542433,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 20,
+      "resident_lanes_assumed": 2560,
+      "k_ns_apparent": 182.35304911190002,
+      "k_cycles_avg": 284.87123635959176,
+      "k_cycles_attributed": 287.7531114985782,
+      "foreign_fraction": 0.0220530744684713,
+      "foreign_over_2pct": true,
+      "k_status": "rising/first-peak cost"
+    },
+    {
+      "G": 30,
+      "attempt": 0,
+      "n": 5,
+      "rate_gbps": 20.311853742410623,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.45297670364379883,
+        "active_s": 0.24947304166666667,
+        "off_s": 0.20347991666666668,
+        "f_avg_active_mhz": 1524.6569547511228,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.0012345833333333334,
+          "P3": 0.011859708333333333,
+          "P8": 0.0042955,
+          "P10": 0.0024997083333333334,
+          "P15": 0.22958354166666667
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.22958354166666667,
+        "summed_kernel_s": 0.23461329168640077,
+        "p15_to_kernel_ratio": 0.9785615299816125,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 30,
+      "resident_lanes_assumed": 3840,
+      "k_ns_apparent": 189.05216868424864,
+      "k_cycles_avg": 288.2397037952221,
+      "k_cycles_attributed": 298.32432218374436,
+      "foreign_fraction": 0.03321529630305981,
+      "foreign_over_2pct": true,
+      "k_status": "rising/first-peak cost"
+    },
+    {
+      "G": 30,
+      "attempt": 1,
+      "n": 5,
+      "rate_gbps": 20.389434814883,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.4557077884674072,
+        "active_s": 0.259501,
+        "off_s": 0.19558820833333335,
+        "f_avg_active_mhz": 1537.7930107526881,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.0024328333333333333,
+          "P3": 0.006261791666666666,
+          "P8": 0.0043467083333333335,
+          "P10": 0.002489541666666667,
+          "P15": 0.243970125
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.243970125,
+        "summed_kernel_s": 0.23441329161869362,
+        "p15_to_kernel_ratio": 1.0407691616602182,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 30,
+      "resident_lanes_assumed": 3840,
+      "k_ns_apparent": 188.33283192318027,
+      "k_cycles_avg": 289.61691262672736,
+      "k_cycles_attributed": 297.1892087747785,
+      "foreign_fraction": 0.053343638979057,
+      "foreign_over_2pct": true,
+      "k_status": "rising/first-peak cost"
+    },
+    {
+      "G": 40,
+      "attempt": 0,
+      "n": 5,
+      "rate_gbps": 25.931982372660432,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.40624117851257324,
+        "active_s": 0.20874758333333332,
+        "off_s": 0.19784420833333333,
+        "f_avg_active_mhz": 1521.6976539848165,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.00268,
+          "P3": 0.007565833333333333,
+          "P8": 0.004316291666666667,
+          "P10": 0.0025075,
+          "P15": 0.19167795833333334
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.19167795833333334,
+        "summed_kernel_s": 0.18520249996799976,
+        "p15_to_kernel_ratio": 1.03496420602558,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 40,
+      "resident_lanes_assumed": 5120,
+      "k_ns_apparent": 197.43959125153165,
+      "k_cycles_avg": 300.4433628111768,
+      "k_cycles_attributed": 311.5596749949169,
+      "foreign_fraction": 0.05937352358580455,
+      "foreign_over_2pct": true,
+      "k_status": "rising/first-peak cost"
+    },
+    {
+      "G": 40,
+      "attempt": 1,
+      "n": 5,
+      "rate_gbps": 25.800547823539755,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.40419507026672363,
+        "active_s": 0.207320875,
+        "off_s": 0.19687229166666667,
+        "f_avg_active_mhz": 1509.1743760326435,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.0018658333333333333,
+          "P3": 0.012033875,
+          "P8": 0.0043925,
+          "P10": 0.0025090833333333332,
+          "P15": 0.18651958333333332
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.18651958333333332,
+        "summed_kernel_s": 0.18386345834005624,
+        "p15_to_kernel_ratio": 1.0144461820595398,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 40,
+      "resident_lanes_assumed": 5120,
+      "k_ns_apparent": 198.44539871857464,
+      "k_cycles_avg": 299.48871078765404,
+      "k_cycles_attributed": 313.14683917791075,
+      "foreign_fraction": 0.059503851927800375,
+      "foreign_over_2pct": true,
+      "k_status": "rising/first-peak cost"
+    },
+    {
+      "G": 80,
+      "attempt": 0,
+      "n": 5,
+      "rate_gbps": 25.915868240009516,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.4032759666442871,
+        "active_s": 0.20604341666666667,
+        "off_s": 0.19722595833333334,
+        "f_avg_active_mhz": 1535.4895671260224,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.002179125,
+          "P3": 0.004468666666666667,
+          "P8": 0.004415,
+          "P10": 0.002536875,
+          "P15": 0.19244375
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.19244375,
+        "summed_kernel_s": 0.18373679171781987,
+        "p15_to_kernel_ratio": 1.0473882133282926,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 40,
+      "resident_lanes_assumed": 5120,
+      "k_ns_apparent": 197.56235649074748,
+      "k_cycles_avg": 303.35493724837477,
+      "k_cycles_attributed": 311.7533985423995,
+      "foreign_fraction": 0.09483199220523945,
+      "foreign_over_2pct": true,
+      "k_status": "saturation diagnostic, not a compute measurement"
+    },
+    {
+      "G": 80,
+      "attempt": 1,
+      "n": 5,
+      "rate_gbps": 25.925313054285567,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.40170907974243164,
+        "active_s": 0.20633833333333335,
+        "off_s": 0.19536004166666668,
+        "f_avg_active_mhz": 1540.2193505003918,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.0018318333333333333,
+          "P3": 0.0038254583333333335,
+          "P8": 0.0043512916666666665,
+          "P10": 0.002524291666666667,
+          "P15": 0.19380545833333335
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.19380545833333335,
+        "summed_kernel_s": 0.1821457082987763,
+        "p15_to_kernel_ratio": 1.064013311888916,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 40,
+      "resident_lanes_assumed": 5120,
+      "k_ns_apparent": 197.49038282697387,
+      "k_cycles_avg": 304.1785091678354,
+      "k_cycles_attributed": 311.63982410096474,
+      "foreign_fraction": 0.06102143225778475,
+      "foreign_over_2pct": true,
+      "k_status": "saturation diagnostic, not a compute measurement"
+    },
+    {
+      "G": 200,
+      "attempt": 0,
+      "n": 5,
+      "rate_gbps": 23.828797054238034,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.4128079414367676,
+        "active_s": 0.214199,
+        "off_s": 0.198595125,
+        "f_avg_active_mhz": 1552.9134056803875,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.0018022083333333334,
+          "P3": 0.004013791666666666,
+          "P15": 0.208383
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.208383,
+        "summed_kernel_s": 0.19361287500942126,
+        "p15_to_kernel_ratio": 1.076286894607913,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 40,
+      "resident_lanes_assumed": 5120,
+      "k_ns_apparent": 214.86607101256882,
+      "k_cycles_avg": 333.66840210129226,
+      "k_cycles_attributed": 339.0586600578336,
+      "foreign_fraction": 0.15032208471974695,
+      "foreign_over_2pct": true,
+      "k_status": "saturation diagnostic, not a compute measurement"
+    },
+    {
+      "G": 200,
+      "attempt": 1,
+      "n": 5,
+      "rate_gbps": 23.21088659366491,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.4142470359802246,
+        "active_s": 0.21991754166666666,
+        "off_s": 0.19431366666666666,
+        "f_avg_active_mhz": 1517.0449011097153,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.0016465833333333332,
+          "P3": 0.011321583333333333,
+          "P8": 0.004324458333333333,
+          "P10": 0.0024849166666666665,
+          "P15": 0.20014
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.20014,
+        "summed_kernel_s": 0.19468445825623348,
+        "p15_to_kernel_ratio": 1.0280224820852737,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 40,
+      "resident_lanes_assumed": 5120,
+      "k_ns_apparent": 220.58614518402038,
+      "k_cycles_avg": 334.6390868068655,
+      "k_cycles_attributed": 348.08493710038414,
+      "foreign_fraction": 0.11575975402380849,
+      "foreign_over_2pct": true,
+      "k_status": "saturation diagnostic, not a compute measurement"
+    },
+    {
+      "G": 1787,
+      "attempt": 0,
+      "n": 5,
+      "rate_gbps": 25.409378541420335,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.4054861068725586,
+        "active_s": 0.21112341666666667,
+        "off_s": 0.19434741666666666,
+        "f_avg_active_mhz": 1544.998249838858,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.0019750416666666666,
+          "P3": 0.0025135416666666665,
+          "P8": 0.0044095,
+          "P10": 0.0025124166666666667,
+          "P15": 0.19971291666666666
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.19971291666666666,
+        "summed_kernel_s": 0.18710199993802235,
+        "p15_to_kernel_ratio": 1.067401293053103,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 40,
+      "resident_lanes_assumed": 5120,
+      "k_ns_apparent": 201.50040236733008,
+      "k_cycles_avg": 311.3177689993507,
+      "k_cycles_attributed": 317.96763493564686,
+      "foreign_fraction": 0.08102643480573071,
+      "foreign_over_2pct": true,
+      "k_status": "saturation diagnostic, not a compute measurement"
+    },
+    {
+      "G": 1787,
+      "attempt": 1,
+      "n": 5,
+      "rate_gbps": 25.40001884618981,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.40479087829589844,
+        "active_s": 0.20334408333333334,
+        "off_s": 0.20145425,
+        "f_avg_active_mhz": 1549.208304970762,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.00193975,
+          "P3": 0.0011669166666666666,
+          "P8": 0.004357541666666667,
+          "P10": 0.00252975,
+          "P15": 0.193350125
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.193350125,
+        "summed_kernel_s": 0.18674516666214913,
+        "p15_to_kernel_ratio": 1.035368831525371,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 40,
+      "resident_lanes_assumed": 5120,
+      "k_ns_apparent": 201.57465358605583,
+      "k_cycles_avg": 312.281127407122,
+      "k_cycles_attributed": 318.08480335879614,
+      "foreign_fraction": 0.09887627792480132,
+      "foreign_over_2pct": true,
+      "k_status": "saturation diagnostic, not a compute measurement"
+    }
+  ],
+  "selected_rows": [
+    {
+      "G": 1,
+      "attempt": 0,
+      "n": 5,
+      "rate_gbps": 0.7496878782812362,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 7.209944725036621,
+        "active_s": 6.284313833333333,
+        "off_s": 0.9259313333333333,
+        "f_avg_active_mhz": 1574.7577030486198,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.003205041666666667,
+          "P3": 0.016921958333333334,
+          "P8": 0.0059011666666666665,
+          "P10": 0.0025357083333333334,
+          "P15": 6.255749958333333
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 6.255749958333333,
+        "summed_kernel_s": 6.251002333301585,
+        "p15_to_kernel_ratio": 1.0007594982018253,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 1,
+      "resident_lanes_assumed": 128,
+      "k_ns_apparent": 170.73772126802666,
+      "k_cycles_avg": 268.8705417677931,
+      "k_cycles_attributed": 269.42412416094606,
+      "foreign_fraction": 0.007723421369209515,
+      "foreign_over_2pct": false,
+      "k_status": "rising/first-peak cost"
+    },
+    {
+      "G": 2,
+      "attempt": 0,
+      "n": 5,
+      "rate_gbps": 1.493821088895387,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 3.431443214416504,
+        "active_s": 3.1593672083333333,
+        "off_s": 0.27203391666666665,
+        "f_avg_active_mhz": 1574.764812515924,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.0022824583333333334,
+          "P3": 0.006209958333333333,
+          "P8": 0.004356916666666667,
+          "P10": 0.002523625,
+          "P15": 3.14399425
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 3.14399425,
+        "summed_kernel_s": 3.135074916703161,
+        "p15_to_kernel_ratio": 1.0028450144043826,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 2,
+      "resident_lanes_assumed": 256,
+      "k_ns_apparent": 171.37259736324944,
+      "k_cycles_avg": 269.8715361571044,
+      "k_cycles_attributed": 270.42595863920764,
+      "foreign_fraction": 0.013919935618601354,
+      "foreign_over_2pct": false,
+      "k_status": "rising/first-peak cost"
+    },
+    {
+      "G": 5,
+      "attempt": 1,
+      "n": 5,
+      "rate_gbps": 3.70158958547158,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 1.4893510341644287,
+        "active_s": 1.2902391666666666,
+        "off_s": 0.19908020833333334,
+        "f_avg_active_mhz": 1571.937102552692,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.00144675,
+          "P3": 0.004464875,
+          "P8": 0.004352875,
+          "P10": 0.0025370416666666666,
+          "P15": 1.277437625
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 1.277437625,
+        "summed_kernel_s": 1.2697565000271425,
+        "p15_to_kernel_ratio": 1.0060492897438944,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 5,
+      "resident_lanes_assumed": 640,
+      "k_ns_apparent": 172.89869263517082,
+      "k_cycles_avg": 271.7858699360789,
+      "k_cycles_attributed": 272.8341369782995,
+      "foreign_fraction": 0.024074859234307168,
+      "foreign_over_2pct": true,
+      "k_status": "rising/first-peak cost"
+    },
+    {
+      "G": 10,
+      "attempt": 1,
+      "n": 5,
+      "rate_gbps": 7.304001583334884,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.873035192489624,
+        "active_s": 0.67241325,
+        "off_s": 0.200604125,
+        "f_avg_active_mhz": 1558.1576494563922,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.001992166666666667,
+          "P3": 0.010652125,
+          "P8": 0.004369083333333333,
+          "P10": 0.0025314166666666666,
+          "P15": 0.6528684583333333
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.6528684583333333,
+        "summed_kernel_s": 0.6452132916892879,
+        "p15_to_kernel_ratio": 1.0118645519902463,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 10,
+      "resident_lanes_assumed": 1280,
+      "k_ns_apparent": 175.24640231739568,
+      "k_cycles_avg": 273.0615223105625,
+      "k_cycles_attributed": 276.5388228568504,
+      "foreign_fraction": 0.0340063902629058,
+      "foreign_over_2pct": true,
+      "k_status": "rising/first-peak cost"
+    },
+    {
+      "G": 20,
+      "attempt": 1,
+      "n": 5,
+      "rate_gbps": 14.038701367856312,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.5540499687194824,
+        "active_s": 0.3468598333333333,
+        "off_s": 0.207173875,
+        "f_avg_active_mhz": 1562.1961779469998,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.0010873333333333334,
+          "P3": 0.002012375,
+          "P8": 0.004419125,
+          "P10": 0.002522458333333333,
+          "P15": 0.3368185416666667
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.3368185416666667,
+        "summed_kernel_s": 0.3356353333219886,
+        "p15_to_kernel_ratio": 1.0035252794542433,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 20,
+      "resident_lanes_assumed": 2560,
+      "k_ns_apparent": 182.35304911190002,
+      "k_cycles_avg": 284.87123635959176,
+      "k_cycles_attributed": 287.7531114985782,
+      "foreign_fraction": 0.0220530744684713,
+      "foreign_over_2pct": true,
+      "k_status": "rising/first-peak cost"
+    },
+    {
+      "G": 30,
+      "attempt": 1,
+      "n": 5,
+      "rate_gbps": 20.389434814883,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.4557077884674072,
+        "active_s": 0.259501,
+        "off_s": 0.19558820833333335,
+        "f_avg_active_mhz": 1537.7930107526881,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.0024328333333333333,
+          "P3": 0.006261791666666666,
+          "P8": 0.0043467083333333335,
+          "P10": 0.002489541666666667,
+          "P15": 0.243970125
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.243970125,
+        "summed_kernel_s": 0.23441329161869362,
+        "p15_to_kernel_ratio": 1.0407691616602182,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 30,
+      "resident_lanes_assumed": 3840,
+      "k_ns_apparent": 188.33283192318027,
+      "k_cycles_avg": 289.61691262672736,
+      "k_cycles_attributed": 297.1892087747785,
+      "foreign_fraction": 0.053343638979057,
+      "foreign_over_2pct": true,
+      "k_status": "rising/first-peak cost"
+    },
+    {
+      "G": 40,
+      "attempt": 1,
+      "n": 5,
+      "rate_gbps": 25.800547823539755,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.40419507026672363,
+        "active_s": 0.207320875,
+        "off_s": 0.19687229166666667,
+        "f_avg_active_mhz": 1509.1743760326435,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.0018658333333333333,
+          "P3": 0.012033875,
+          "P8": 0.0043925,
+          "P10": 0.0025090833333333332,
+          "P15": 0.18651958333333332
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.18651958333333332,
+        "summed_kernel_s": 0.18386345834005624,
+        "p15_to_kernel_ratio": 1.0144461820595398,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 40,
+      "resident_lanes_assumed": 5120,
+      "k_ns_apparent": 198.44539871857464,
+      "k_cycles_avg": 299.48871078765404,
+      "k_cycles_attributed": 313.14683917791075,
+      "foreign_fraction": 0.059503851927800375,
+      "foreign_over_2pct": true,
+      "k_status": "rising/first-peak cost"
+    },
+    {
+      "G": 80,
+      "attempt": 1,
+      "n": 5,
+      "rate_gbps": 25.925313054285567,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.40170907974243164,
+        "active_s": 0.20633833333333335,
+        "off_s": 0.19536004166666668,
+        "f_avg_active_mhz": 1540.2193505003918,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.0018318333333333333,
+          "P3": 0.0038254583333333335,
+          "P8": 0.0043512916666666665,
+          "P10": 0.002524291666666667,
+          "P15": 0.19380545833333335
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.19380545833333335,
+        "summed_kernel_s": 0.1821457082987763,
+        "p15_to_kernel_ratio": 1.064013311888916,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 40,
+      "resident_lanes_assumed": 5120,
+      "k_ns_apparent": 197.49038282697387,
+      "k_cycles_avg": 304.1785091678354,
+      "k_cycles_attributed": 311.63982410096474,
+      "foreign_fraction": 0.06102143225778475,
+      "foreign_over_2pct": true,
+      "k_status": "saturation diagnostic, not a compute measurement"
+    },
+    {
+      "G": 200,
+      "attempt": 1,
+      "n": 5,
+      "rate_gbps": 23.21088659366491,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.4142470359802246,
+        "active_s": 0.21991754166666666,
+        "off_s": 0.19431366666666666,
+        "f_avg_active_mhz": 1517.0449011097153,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.0016465833333333332,
+          "P3": 0.011321583333333333,
+          "P8": 0.004324458333333333,
+          "P10": 0.0024849166666666665,
+          "P15": 0.20014
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.20014,
+        "summed_kernel_s": 0.19468445825623348,
+        "p15_to_kernel_ratio": 1.0280224820852737,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 40,
+      "resident_lanes_assumed": 5120,
+      "k_ns_apparent": 220.58614518402038,
+      "k_cycles_avg": 334.6390868068655,
+      "k_cycles_attributed": 348.08493710038414,
+      "foreign_fraction": 0.11575975402380849,
+      "foreign_over_2pct": true,
+      "k_status": "saturation diagnostic, not a compute measurement"
+    },
+    {
+      "G": 1787,
+      "attempt": 1,
+      "n": 5,
+      "rate_gbps": 25.40001884618981,
+      "conditions": {
+        "campaign": "phase3b-frequency",
+        "timestamp": "2026-11-09T12:15:21.999038+08:00",
+        "git_sha": "f39a8d47714480a080f49ca9dcd3870eb7026be9",
+        "idle_samples": [
+          [
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ],
+            [
+              0
+            ]
+          ]
+        ],
+        "idle_flag": false,
+        "vm": "1275",
+        "therm": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+        "power": "Now drawing from 'AC Power'",
+        "os": "ProductName:\t\tmacOS\nProductVersion:\t\t15.4.1\nBuildVersion:\t\t24E263",
+        "memory": "hw.memsize: 25769803776",
+        "gpu_registry": "  |   \"model\" = \"Apple M4\"\n  |   \"gpu-core-count\" = 10"
+      },
+      "gpu_frequency": {
+        "wall_s": 0.40479087829589844,
+        "active_s": 0.20334408333333334,
+        "off_s": 0.20145425,
+        "f_avg_active_mhz": 1549.208304970762,
+        "f_max_mhz": 1578.0,
+        "by_state_s": {
+          "P1": 0.00193975,
+          "P3": 0.0011669166666666666,
+          "P8": 0.004357541666666667,
+          "P10": 0.00252975,
+          "P15": 0.193350125
+        },
+        "table_mhz": [
+          0,
+          338,
+          618,
+          796,
+          928,
+          952,
+          1056,
+          1053,
+          1170,
+          1152,
+          1278,
+          1204,
+          1338,
+          1326,
+          1470,
+          1578
+        ],
+        "timebase_hz_assumed": 24000000
+      },
+      "clock_attribution": {
+        "p15_s": 0.193350125,
+        "summed_kernel_s": 0.18674516666214913,
+        "p15_to_kernel_ratio": 1.035368831525371,
+        "p15_ge_95pct": true,
+        "kernel_attributed_mhz": 1578,
+        "kernel_clock_method": "P15"
+      },
+      "resident_tgs_assumed": 40,
+      "resident_lanes_assumed": 5120,
+      "k_ns_apparent": 201.57465358605583,
+      "k_cycles_avg": 312.281127407122,
+      "k_cycles_attributed": 318.08480335879614,
+      "foreign_fraction": 0.09887627792480132,
+      "foreign_over_2pct": true,
+      "k_status": "saturation diagnostic, not a compute measurement"
+    }
+  ],
+  "resident_cap_assumption": 40,
+  "note": "Above 40 TGs apparent k uses the curve-derived cap of 40 resident TGs, and cannot isolate compute cost. No old run or shipped model is edited."
+}

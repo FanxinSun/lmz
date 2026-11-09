@@ -1,0 +1,21 @@
+{
+  "attempts": [
+    {
+      "attempt": 1,
+      "exit_code": 1,
+      "result": "6 failed, 142 passed, 1 warning in 84.26s (0:01:24)",
+      "matches_baseline": true
+    }
+  ],
+  "final": {
+    "attempt": 1,
+    "exit_code": 1,
+    "result": "6 failed, 142 passed, 1 warning in 84.26s (0:01:24)",
+    "matches_baseline": true
+  },
+  "baseline": {
+    "passed": 142,
+    "failed": 6,
+    "total": 148
+  }
+}

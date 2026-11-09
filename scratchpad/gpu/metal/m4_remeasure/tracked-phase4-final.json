@@ -1,0 +1,10 @@
+{
+  "index_version": 2,
+  "index_entries": 107,
+  "content_mismatches": [
+    "docs/evaluations/m4-metal-decoder-remeasure.md"
+  ],
+  "missing": [],
+  "method": "read-only Git index parsing and blob hashing; no git command",
+  "report_prefix_preserved": true
+}

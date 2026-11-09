@@ -1,0 +1,15 @@
+{
+  "source_sha256": "dcc1fa357504f1df173fd04d1da810ccf10e923660d56af5eaa1d2e7028c5240",
+  "kernels": {
+    "lmz_decode_perstream": {
+      "per_stream_sha256": "8ac9ab3cfa1598e48708dffc452c54d757bf3a55734f79b416c526519fdb15fa",
+      "threadgroup_barriers_in_stream_body": 0,
+      "changes": "gid declaration replaced with grid-stride loop; pre-loop declarations/LUT construction retained verbatim"
+    },
+    "lmz_decode_bf16": {
+      "per_stream_sha256": "8d020d6ea1041ef360ced274b9e9001e21942de2ce3f52ba0fa00cafd4329c80",
+      "threadgroup_barriers_in_stream_body": 0,
+      "changes": "gid declaration replaced with grid-stride loop; pre-loop declarations/LUT construction retained verbatim"
+    }
+  }
+}

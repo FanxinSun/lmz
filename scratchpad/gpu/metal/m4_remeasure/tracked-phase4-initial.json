@@ -1,0 +1,9 @@
+{
+  "index_version": 2,
+  "index_entries": 107,
+  "content_mismatches": [],
+  "missing": [],
+  "method": "read-only Git index parsing and blob hashing; no git command",
+  "report_prefix_length": 27255,
+  "report_prefix_sha256": "8f05785b98c0291f52eaf473296d2cae106000b591e9e60b5d55baf866385477"
+}

@@ -1,0 +1,6 @@
+{
+  "shipped_bf16_gbps": 39.174920189331935,
+  "stride_bf16_gbps": 38.49748131225887,
+  "relative_drift": -0.017292667701657383,
+  "pass_3pct": true
+}
