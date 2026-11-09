@@ -5,6 +5,19 @@
 **OS**: macOS Sequoia 15.4.1 (Darwin arm64)  
 **Parent Authority**: [`../../plan/PLAN.md`](../../plan/PLAN.md) § `LMZ-I0` / `LMZ-T0`
 
+> **Superseded 2026-11-09** by [m4-metal-decoder-remeasure.md](m4-metal-decoder-remeasure.md). Original text is
+> retained below unchanged. Errata:
+> - **Memory.** The machine has 24 GB (`hw.memsize` 25769803776), not 16 GB.
+> - **§2 kernel table.** The input was synthetic. The figures are GPU-timed best-of-7, and the exact historical runs are
+>   not recoverable. Re-measured kernel-only: 23.2 GB/s on this synthetic shape, 25.2 GB/s on real Qwen3 planes.
+>   Fused BF16 was not re-measured.
+> - **§3.** 19,456 B is correct for the *compiled* direct kernel, because the compiler removes the unused input ring. The
+>   source declares 23,552 B.
+> - **§5.** The fused row's 3.69 ms divides the exponent-only byte count, which is inconsistent with §2's 7.39 ms. The GPU rows
+>   reuse the kernel table rather than measured arms of `bench_unified_memory_io.py`, and the mmap baseline is a warm
+>   page-cache read, so this is not a cold-disk comparison.
+> - **Calling the decoder the shipped way** (`lmz.gpu.decode_batch`) delivers ~2.0 GB/s, because host copies dominate.
+
 ---
 
 ## 1. Executive Summary

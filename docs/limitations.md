@@ -147,6 +147,14 @@
   (36.3 GB/s) are canonical and verified byte-identical. The prefetch variant
   is avoided on Apple Silicon because `simdgroup_barrier` inside divergent
   refill loops causes lane divergence.
+  *Correction 2026-11-09 ([re-measurement](evaluations/m4-metal-decoder-remeasure.md)):*
+  24.1 and 36.3 GB/s were GPU-timed best-of-7 on synthetic planes. Kernel-only
+  re-measurement: 23.2 GB/s median on that synthetic shape, 25.2 GB/s on real
+  Qwen3 exponent planes. Fused BF16 was not re-measured. The shipped Python call
+  path (`lmz.gpu.decode_batch`) delivers ~2.0 GB/s because host-side copies,
+  not decoding, set that rate. The host library is built with clang on first
+  use, so a stock Mac without the Command Line Tools cannot build it unless a
+  matching prebuilt dylib ships.
 - **CPython's bundled zstd is slow on macOS.** Measured on a GitHub
   `macos-latest` runner: 103 MiB/s compressing a 64 MiB BF16 sample through
   `compression.zstd`, against 767 MiB/s for the same work through the

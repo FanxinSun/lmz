@@ -66,6 +66,9 @@ Model distribution over network interfaces (Internet downloads, edge fleet synch
 
 Under unified memory on Apple Silicon M4:
 - `lmz` achieves **24.1 GB/s** direct Metal plane decoding and **36.3 GB/s** fused BF16 decoding.
+  *Correction 2026-11-09:* those are kernel-only figures on synthetic planes. Re-measured: 25.2 GB/s kernel-only on
+  real Qwen3 planes; fused not re-measured; ~2.0 GB/s through the shipped Python call path
+  ([re-measurement](m4-metal-decoder-remeasure.md)).
 - With the newly integrated `MappedArchive.as_torch_tensor()`, `MappedArchive.as_mlx_array()`, and `MappedArchive.tensor_mtl_buffer()`, decompressed tensors are exposed directly into framework tensors without intermediate Python memory copies.
 - Zero-copy MTLBuffer wrapping allows MLX / Metal compute graphs to bind decoded tensors with 0 byte allocation overhead during model activation.
 

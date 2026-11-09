@@ -208,11 +208,20 @@ Measured over 4,096 streams (134.2 MB plain across 32 KiB exponent planes, 65.2%
 | **Metal Direct Plane Decoder** | **24.1 GB/s** | **16–24×** | Direct device reads, no barrier divergence |
 | **Metal Fused BF16 Decoder** | **36.3 GB/s** | **24–36×** | Fused rANS exponent decode + sign/mantissa bit-merge |
 
+> *Correction 2026-11-09 ([re-measurement](evaluations/m4-metal-decoder-remeasure.md)):* this input was
+> synthetic (`scratchpad/gpu/prep_bench_shared.py`) and the figures are GPU-timed best-of-7. Kernel-only
+> re-measurement: 23.2 GB/s median on the same synthetic shape, 25.2 GB/s on real Qwen3 exponent planes.
+> Fused BF16 was not re-measured. The shipped Python call path delivers ~2.0 GB/s.
+
 ### 2. Cold-Disk to Unified-Memory Ingestion (LMZ-I0)
 134.2 MB multi-tensor BF16 checkpoint compressed to 45.0 MB (66.5% saved) with v7 shared tables:
 - **Raw safetensors mmap + read**: 17.7 ms (7.06 GB/s)
 - **lmz CPU streaming decode (NEON)**: 98.3 ms (1.27 GB/s effective uncompressed throughput)
 - **lmz Metal GPU batched decode**: 5.56 ms (24.1 GB/s sustained throughput)
+
+> *Correction 2026-11-09:* not a cold-disk comparison. The GPU row reuses the kernel table's rate rather than
+> a measured arm of `scratchpad/bench_unified_memory_io.py`, and the mmap baseline is a warm page-cache read.
+> See [the re-measurement](evaluations/m4-metal-decoder-remeasure.md).
 
 ## Real Checkpoint & Storage Architecture Benchmarks (Qwen3-4B Family & Multimodal Qwen3.5-4B)
 

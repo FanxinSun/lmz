@@ -54,6 +54,9 @@ With `lmz` v7+, building and deploying a multi-model family zoo requires zero cu
    ```
 3. **Execution**:
    Existing inference engines (`llama.cpp`, `mlx-lm`, `vLLM`, PyTorch) load from `/Volumes/Models/zoo/...` with zero modifications. Pages are paged in and decompressed on-the-fly via Metal/NEON at >24 GB/s.
+   *Correction 2026-11-09:* that rate is unsupported for demand paging. The M4 evaluation itself measured page-ins on
+   the CPU (NEON) at ~48 µs per 64 KiB block (~1.4 GB/s), and Metal single-block dispatch at 0.20 GB/s. The Metal
+   kernel's 25.2 GB/s (kernel-only, [re-measurement](m4-metal-decoder-remeasure.md)) applies to bulk batches.
 
 ---
 
