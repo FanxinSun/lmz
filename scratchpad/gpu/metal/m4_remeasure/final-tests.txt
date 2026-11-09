@@ -1,0 +1,210 @@
+........................................................................ [ 48%]
+...........................................F.............FF..FFF........ [ 97%]
+...                                                                      [100%]
+=================================== FAILURES ===================================
+___________________ test_gpu_device_entry_point_owns_nothing ___________________
+
+    def test_gpu_device_entry_point_owns_nothing():
+        """The device path must take the caller's memory and synchronise nothing.
+    
+        A consumer that has built its own context, staging ring and event chain
+        cannot share a device with a library that quietly builds its own. This is
+        the entry point that lets it drive lmz instead, so what is checked is that
+        it exists, that it is exported, and -- where there is a GPU -- that it
+        decodes correctly against pointers the caller allocated in a context the
+        caller created.
+        """
+        from lmz import gpu
+    
+        assert "decode_batch_dev" in gpu.__all__
+        assert callable(gpu.decode_batch_dev)
+    
+        # Declining is a status, not an exception -- the caller is mid-pipeline and
+        # the decision to fall back is theirs. Which status depends on whether
+        # there is a device, and asserting either one unconditionally tests the
+        # machine rather than the code: an empty batch is OK where the library
+        # loaded and ENODEV where it did not, because the load is checked first.
+        ok, _why = gpu.available()
+        empty = gpu.decode_batch_dev(1, 1, 0, 128, 1)
+        assert empty == (gpu.OK if ok else gpu.ENODEV), empty
+        if not ok:
+            assert gpu.decode_batch_dev(1, 1, 4, 128, 1) == gpu.ENODEV
+            raise Skip("no GPU decoder")
+        if not gpu.backend().startswith("cuda:"):
+>           raise Skip("libcuda.so.1 device entry point test is CUDA-only")
+E           test_lmz.Skip: libcuda.so.1 device entry point test is CUDA-only
+
+tests/test_lmz.py:3581: Skip
+_________________ test_fs_writes_are_compressed_and_read_back __________________
+
+    def test_fs_writes_are_compressed_and_read_back():
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "model.safetensors")
+            write_safetensors(src, [("w", "BF16", [1 << 16], weights_bf16(1 << 16, 21))])
+            back, point = os.path.join(d, "back"), os.path.join(d, "mnt")
+>           with MountedFS(back, point) as fs:
+
+tests/test_lmz.py:4099: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <test_lmz.MountedFS object at 0x1070a9e50>
+
+    def __enter__(self):
+        from lmz import fuse
+    
+        ok, why = fuse.available()
+        if not ok:
+            raise Skip(why)
+        os.makedirs(self.point, exist_ok=True)
+        os.makedirs(self.backing, exist_ok=True)
+        self.proc = subprocess.Popen(
+            CLI + ["fs", self.backing, self.point, "-q"] + self.args,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        for _ in range(200):
+            if os.path.ismount(self.point):
+                return self
+            if self.proc.poll() is not None:
+>               raise Skip(f"fs exited: {self.proc.stderr.read().decode().strip()}")
+E               test_lmz.Skip: fs exited: lmz: mount failed: fusermount3 not found -- install fuse3 to use `lmz mount`
+
+tests/test_lmz.py:4064: Skip
+_____________________ test_fs_write_then_immediately_read ______________________
+
+    def test_fs_write_then_immediately_read():
+        """close() returns before the kernel delivers RELEASE, so this races."""
+        with tempfile.TemporaryDirectory() as d:
+            back, point = os.path.join(d, "back"), os.path.join(d, "mnt")
+>           with MountedFS(back, point):
+
+tests/test_lmz.py:4115: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <test_lmz.MountedFS object at 0x1070cda10>
+
+    def __enter__(self):
+        from lmz import fuse
+    
+        ok, why = fuse.available()
+        if not ok:
+            raise Skip(why)
+        os.makedirs(self.point, exist_ok=True)
+        os.makedirs(self.backing, exist_ok=True)
+        self.proc = subprocess.Popen(
+            CLI + ["fs", self.backing, self.point, "-q"] + self.args,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        for _ in range(200):
+            if os.path.ismount(self.point):
+                return self
+            if self.proc.poll() is not None:
+>               raise Skip(f"fs exited: {self.proc.stderr.read().decode().strip()}")
+E               test_lmz.Skip: fs exited: lmz: mount failed: fusermount3 not found -- install fuse3 to use `lmz mount`
+
+tests/test_lmz.py:4064: Skip
+___________________ test_fs_preserves_metadata_and_namespace ___________________
+
+    def test_fs_preserves_metadata_and_namespace():
+        with tempfile.TemporaryDirectory() as d:
+            back, point = os.path.join(d, "back"), os.path.join(d, "mnt")
+>           with MountedFS(back, point) as fs:
+
+tests/test_lmz.py:4224: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <test_lmz.MountedFS object at 0x117f403d0>
+
+    def __enter__(self):
+        from lmz import fuse
+    
+        ok, why = fuse.available()
+        if not ok:
+            raise Skip(why)
+        os.makedirs(self.point, exist_ok=True)
+        os.makedirs(self.backing, exist_ok=True)
+        self.proc = subprocess.Popen(
+            CLI + ["fs", self.backing, self.point, "-q"] + self.args,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        for _ in range(200):
+            if os.path.ismount(self.point):
+                return self
+            if self.proc.poll() is not None:
+>               raise Skip(f"fs exited: {self.proc.stderr.read().decode().strip()}")
+E               test_lmz.Skip: fs exited: lmz: mount failed: fusermount3 not found -- install fuse3 to use `lmz mount`
+
+tests/test_lmz.py:4064: Skip
+______________ test_fs_declines_to_compress_what_will_not_shrink _______________
+
+    def test_fs_declines_to_compress_what_will_not_shrink():
+        """Random bytes must not be inflated by being stored."""
+        with tempfile.TemporaryDirectory() as d:
+            back, point = os.path.join(d, "back"), os.path.join(d, "mnt")
+>           with MountedFS(back, point) as fs:
+
+tests/test_lmz.py:4253: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <test_lmz.MountedFS object at 0x106d96310>
+
+    def __enter__(self):
+        from lmz import fuse
+    
+        ok, why = fuse.available()
+        if not ok:
+            raise Skip(why)
+        os.makedirs(self.point, exist_ok=True)
+        os.makedirs(self.backing, exist_ok=True)
+        self.proc = subprocess.Popen(
+            CLI + ["fs", self.backing, self.point, "-q"] + self.args,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        for _ in range(200):
+            if os.path.ismount(self.point):
+                return self
+            if self.proc.poll() is not None:
+>               raise Skip(f"fs exited: {self.proc.stderr.read().decode().strip()}")
+E               test_lmz.Skip: fs exited: lmz: mount failed: fusermount3 not found -- install fuse3 to use `lmz mount`
+
+tests/test_lmz.py:4064: Skip
+______________________ test_fs_rewrite_replaces_contents _______________________
+
+    def test_fs_rewrite_replaces_contents():
+        with tempfile.TemporaryDirectory() as d:
+            back, point = os.path.join(d, "back"), os.path.join(d, "mnt")
+>           with MountedFS(back, point) as fs:
+
+tests/test_lmz.py:4276: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <test_lmz.MountedFS object at 0x110370d50>
+
+    def __enter__(self):
+        from lmz import fuse
+    
+        ok, why = fuse.available()
+        if not ok:
+            raise Skip(why)
+        os.makedirs(self.point, exist_ok=True)
+        os.makedirs(self.backing, exist_ok=True)
+        self.proc = subprocess.Popen(
+            CLI + ["fs", self.backing, self.point, "-q"] + self.args,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        for _ in range(200):
+            if os.path.ismount(self.point):
+                return self
+            if self.proc.poll() is not None:
+>               raise Skip(f"fs exited: {self.proc.stderr.read().decode().strip()}")
+E               test_lmz.Skip: fs exited: lmz: mount failed: fusermount3 not found -- install fuse3 to use `lmz mount`
+
+tests/test_lmz.py:4064: Skip
+=============================== warnings summary ===============================
+tests/test_lmz.py::test_mapped_archive_zero_copy_and_mtl_buffer
+  /Users/masshj/YFCE/lmz/lmz/api.py:2299: UserWarning: The given buffer is not writable, and PyTorch does not support non-writable tensors. This means you can write to the underlying (supposedly non-writable) buffer using the tensor. You may want to copy the buffer to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /Users/runner/work/pytorch/pytorch/torch/csrc/utils/tensor_new.cpp:1582.)
+    t = torch.frombuffer(raw, dtype=tdt)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_lmz.py::test_gpu_device_entry_point_owns_nothing - test_lmz...
+FAILED tests/test_lmz.py::test_fs_writes_are_compressed_and_read_back - test_...
+FAILED tests/test_lmz.py::test_fs_write_then_immediately_read - test_lmz.Skip...
+FAILED tests/test_lmz.py::test_fs_preserves_metadata_and_namespace - test_lmz...
+FAILED tests/test_lmz.py::test_fs_declines_to_compress_what_will_not_shrink
+FAILED tests/test_lmz.py::test_fs_rewrite_replaces_contents - test_lmz.Skip: ...
+6 failed, 141 passed, 1 warning in 83.82s (0:01:23)

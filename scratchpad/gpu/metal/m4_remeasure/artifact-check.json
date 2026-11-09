@@ -1,0 +1,13 @@
+{
+  "total_run_rows": 544,
+  "warmup_rows": 150,
+  "timed_dispatch_and_API_rows": 393,
+  "original_sweep_G_count": 25,
+  "frequency_sweep_G_count": 10,
+  "all_outputs_identical": true,
+  "sampler_copy_identical": true,
+  "own_PID_excluded": true,
+  "frequency_arithmetic_checked": true,
+  "final_tests_match": true,
+  "tracked_content_unchanged": true
+}

@@ -1,0 +1,5 @@
+{
+  "exit_code": 1,
+  "result": "6 failed, 141 passed, 1 warning in 83.82s (0:01:23)",
+  "matches_baseline": true
+}
