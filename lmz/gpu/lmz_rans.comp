@@ -1,13 +1,15 @@
 #version 450
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
-#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_8bit_storage : require
 
 // lmz portable rANS compute decoder for Vulkan.
 //
 // Complies with Vulkan 1.1+ compute with subgroup operations.
 // Maps 8 rANS states across 8 lanes of a subgroup, using subgroupBallot
-// and subgroupBallotExclusiveBitCount for parallel refills.
+// and per-8-lane group ballot masking for parallel refills.
 
 #define PROB_BITS 12
 #define PROB_SCALE (1u << PROB_BITS)
@@ -46,21 +48,21 @@ shared uint s_starts[256];
 shared uint8_t s_stage[GROUPS * GRAIN];
 
 void build_lut(uint tid) {
-    if (tid == 0) {
-        uint s = 0;
-        for (uint i = 0; i < 256; i++) {
+    if (tid == 0u) {
+        uint s = 0u;
+        for (uint i = 0u; i < 256u; i++) {
             s_starts[i] = s;
-            uint f = uint(hdr_bytes[4 + 2 * i]) | (uint(hdr_bytes[5 + 2 * i]) << 8);
+            uint f = uint(hdr_bytes[4u + 2u * i]) | (uint(hdr_bytes[5u + 2u * i]) << 8);
             s += f;
         }
     }
     barrier();
 
-    for (uint i = tid; i < 256; i += TG_SIZE) {
-        uint f = uint(hdr_bytes[4 + 2 * i]) | (uint(hdr_bytes[5 + 2 * i]) << 8);
+    for (uint i = tid; i < 256u; i += TG_SIZE) {
+        uint f = uint(hdr_bytes[4u + 2u * i]) | (uint(hdr_bytes[5u + 2u * i]) << 8);
         uint st = s_starts[i];
         uint packed_val = ((f > 0u ? f - 1u : 0u) << 20) | (st << 8) | i;
-        for (uint j = 0; j < f; j++) {
+        for (uint j = 0u; j < f; j++) {
             s_lut[st + j] = packed_val;
         }
     }
@@ -73,52 +75,73 @@ void main() {
 
     uint k = tid % NST;
     uint grp = tid / NST;
+    uint lane = gl_SubgroupInvocationID;
+    uint gbase = lane & ~7u;
+    uint word_idx = gbase >> 5;
+    uint bit_shift = gbase & 31u;
+
+#ifdef STRIDE
+    uint stride = gl_NumWorkGroups.x * GROUPS;
+    uint padded_nstr = (pc.nstr + (GROUPS - 1u)) & ~(GROUPS - 1u);
+    for (uint gid = gl_WorkGroupID.x * GROUPS + grp; gid < padded_nstr; gid += stride)
+#else
     uint gid = gl_WorkGroupID.x * GROUPS + grp;
+#endif
+    {
+        uint src_id = gid < pc.nstr ? gid : 0u;
+        uint64_t stream_base = offsets[2u * src_id];
+        uint64_t stream_len = offsets[2u * src_id + 1u];
+        uint64_t stream_end = stream_base + stream_len;
+        uint64_t dst_base = uint64_t(gid) * uint64_t(pc.plane);
 
-    if (gid >= pc.nstr) {
-        return;
-    }
-
-    uint64_t stream_base = offsets[2 * gid];
-    uint64_t dst_base = uint64_t(gid) * uint64_t(pc.plane);
-
-    uint st = uint(streams[stream_base + 4 * k]) |
-              (uint(streams[stream_base + 4 * k + 1]) << 8) |
-              (uint(streams[stream_base + 4 * k + 2]) << 16) |
-              (uint(streams[stream_base + 4 * k + 3]) << 24);
-
-    uint64_t ptr = stream_base + 4 * NST;
-    uint consumed = 0;
-
-    for (uint base = 0; base < pc.plane; base += GRAIN) {
-        for (uint s = 0; s < STAGE_ITERS; s++) {
-            uint e = s_lut[st & (PROB_SCALE - 1)];
-            s_stage[grp * GRAIN + s * NST + k] = uint8_t(e & 0xff);
-
-            uint sv = (e >> 8) & 0xfff;
-            uint fq = (e >> 20) + 1;
-            uint x = fq * (st >> PROB_BITS) + (st & (PROB_SCALE - 1)) - sv;
-            bool need = (x < RANS_L);
-
-            uvec4 ball = subgroupBallot(need);
-            uint before = subgroupBallotExclusiveBitCount(ball);
-            uint64_t p = ptr + consumed + 2 * before;
-            uint w = uint(streams[p]) | (uint(streams[p + 1]) << 8);
-
-            st = need ? ((x << 16) | w) : x;
-            consumed += 2 * subgroupBallotBitCount(ball);
+        uint st = 0u;
+        if (stream_base + uint64_t(4u * k + 3u) < stream_end) {
+            st = uint(streams[uint(stream_base + 4u * k)]) |
+                 (uint(streams[uint(stream_base + 4u * k + 1u)]) << 8) |
+                 (uint(streams[uint(stream_base + 4u * k + 2u)]) << 16) |
+                 (uint(streams[uint(stream_base + 4u * k + 3u)]) << 24);
         }
 
-        barrier();
+        uint64_t ptr = stream_base + uint64_t(4u * NST);
+        uint consumed = 0u;
 
-        // Write stage buffer to output plane
-        uint out_idx = base + k * 16;
-        if (out_idx < pc.plane) {
-            for (uint b = 0; b < 16 && (out_idx + b) < pc.plane; b++) {
-                out_planes[dst_base + out_idx + b] = s_stage[grp * GRAIN + k * 16 + b];
+        for (uint base = 0u; base < pc.plane; base += GRAIN) {
+            for (uint s = 0u; s < STAGE_ITERS; s++) {
+                uint e = s_lut[st & (PROB_SCALE - 1u)];
+                s_stage[grp * GRAIN + s * NST + k] = uint8_t(e & 0xffu);
+
+                uint sv = (e >> 8) & 0xfffu;
+                uint fq = (e >> 20) + 1u;
+                uint x = fq * (st >> PROB_BITS) + (st & (PROB_SCALE - 1u)) - sv;
+                bool need = (x < RANS_L);
+
+                uvec4 ball = subgroupBallot(need);
+                uint raw_word = ball[word_idx];
+                uint gm = (raw_word >> bit_shift) & 0xffu;
+                uint before = bitCount(gm & ((1u << k) - 1u));
+                uint64_t p = ptr + uint64_t(consumed + 2u * before);
+
+                uint w = 0u;
+                if (need && (p + 1u < stream_end)) {
+                    w = uint(streams[uint(p)]) | (uint(streams[uint(p + 1u)]) << 8);
+                }
+
+                st = need ? ((x << 16) | w) : x;
+                consumed += 2u * bitCount(gm);
             }
-        }
 
-        barrier();
+            barrier();
+
+            if (gid < pc.nstr) {
+                uint out_idx = base + k * 16u;
+                if (out_idx < pc.plane) {
+                    for (uint b = 0u; b < 16u && (out_idx + b) < pc.plane; b++) {
+                        out_planes[uint(dst_base + uint64_t(out_idx + b))] = s_stage[grp * GRAIN + k * 16u + b];
+                    }
+                }
+            }
+
+            barrier();
+        }
     }
 }
