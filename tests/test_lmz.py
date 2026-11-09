@@ -3551,6 +3551,71 @@ def test_gpu_cost_model_is_publishable():
     assert 0 < one_group <= 99 * 1024
 
 
+def test_gpu_cost_model_metal_is_its_own_record():
+    """The Metal kernel's cost is published as itself, never as CUDA's.
+
+    The Metal shared kernel shares the algorithm and the format with CUDA
+    k_shared but not the shape -- 128 threads, direct refill reads, a
+    19,456 B compiled footprint -- and measured a different k on an Apple M4.
+    A consumer predicting an Apple device from CUDA's record lands 26-44% too
+    fast, so the two must stay separate records, and the default must stay
+    exactly the CUDA one every existing caller already reads.
+    """
+    from lmz import gpu
+
+    assert gpu.cost_model()["backend"] == "cuda"
+    assert gpu.cost_model("per_chunk")["backend"] == "cuda"
+    m = gpu.cost_model("shared", backend="metal")
+    assert m["backend"] == "metal" and m["kernel"] == "shared"
+
+    # Format facts are the same on every backend.
+    assert m["lanes"] == m["states"] == gpu.NST == 8
+    assert m["bytes_per_symbol"] == 1
+    assert m["grain"] == gpu.grain()
+
+    # A swept interval, not a point, and not CUDA's.
+    lo, hi = m["k_cycles_per_byte"]
+    assert 0 < lo < hi
+    assert m["k_is_single_point_fit"] is False
+    assert (lo, hi) != tuple(gpu.cost_model()["k_cycles_per_byte"])
+    per_occ = m["k_by_threadgroups_per_core"]
+    assert sorted(per_occ) == [1, 2, 3, 4]
+    assert all(lo <= a <= b <= hi + 1 for a, b in per_occ.values())
+
+    # The two shared-memory fields must reproduce the footprint the compiled
+    # pipeline reported, or a consumer's residency is computed on a fiction.
+    shm = m["shmem_lut_bytes"] + (128 // m["lanes"]) * m["shmem_per_group_bytes"]
+    assert shm == m["compiled_threadgroup_bytes_at_128_threads"] == 19_456
+    assert m["bound"]["compute_below_threads"] == 128
+
+    # And the formula must give the residency that was measured: 4 per core on
+    # the M4's staircase-measured pool, with the cap deciding legality only.
+    cap, pool = 32_768, 77_824
+    assert shm <= cap and pool // shm == 4
+    assert m["blocks_per_unit_at_measurement"] == (1, 4)
+    # A cap substituted for the pool is the conflation the formula warns of.
+    assert cap // shm == 1
+
+    # DRAM never saturated, so no saturation fraction may be published: a
+    # number there would make bandwidth appear to bind at the compute ceiling.
+    assert m["bound"]["saturates_at_fraction_of_peak_dram"] is None
+
+    prov = m["provenance"]
+    for key in ("kernel", "device", "machine", "archive", "method",
+                "k_derivation", "scaling", "status", "supersedes"):
+        assert prov.get(key), key
+
+    # What has not been measured is refused, not answered with CUDA's numbers.
+    for bad in (dict(kernel="per_chunk", backend="metal"),
+                dict(kernel="shared", backend="vulkan")):
+        try:
+            gpu.cost_model(**bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{bad} must be refused")
+
+
 def test_gpu_device_entry_point_owns_nothing():
     """The device path must take the caller's memory and synchronise nothing.
 

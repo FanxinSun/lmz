@@ -324,6 +324,7 @@ def _cost_model_per_chunk() -> dict:
         "grain": grain(),
         "bytes_per_symbol": 1,
         "kernel": "per_chunk",
+        "backend": "cuda",
         # 257-291, and it is a SINGLE-POINT FIT, not a bracket. There is only
         # one launch to measure -- see `k_derivation` -- so this width is
         # run-to-run spread on one configuration, where the shared kernel's
@@ -404,8 +405,115 @@ def _cost_model_per_chunk() -> dict:
     }
 
 
-def cost_model(kernel: str = "shared") -> dict:
+def _cost_model_metal_shared() -> dict:
+    """The Metal shared-table kernel's own cost, measured on an Apple M4.
+
+    A different kernel from CUDA k_shared, not a port of its constants: 128
+    threads a threadgroup, direct device reads in the refill (no cp.async
+    ring), and a compiled footprint of 19,456 B. Its k is therefore its own
+    number. Borrowing CUDA's would predict the M4 26-44% too fast.
+    """
+    return {
+        "lanes": 8,
+        "states": 8,
+        "grain": grain(),
+        "bytes_per_symbol": 1,
+        "kernel": "shared",
+        "backend": "metal",
+        # Lane-cycles per decoded byte across the measured occupancies, 1 to 4
+        # threadgroups per core, at the IOReport-measured clock of each row:
+        # exactly the bracket of the row medians below, unrounded.
+        "k_cycles_per_byte": (268.9, 300.4),
+        "k_by_threadgroups_per_core": {
+            1: (268.9, 273.1), 2: (281.4, 284.9),
+            3: (288.2, 289.6), 4: (299.5, 300.4),
+        },
+        "k_is_single_point_fit": False,
+        "expansion": 2.975,
+        "bound": {
+            # Compute-bound at the shipped 128 threads at every occupancy the
+            # M4 can hold. The key doubles as the block size for consumers that
+            # read it that way, and 128 is correct for both readings.
+            "compute_below_threads": 128,
+            # NOT REACHED: the kernel tops out at its residency limit with
+            # DRAM at ~28% of spec, so no saturation fraction exists to publish.
+            # Writing the 0.28 here would tell a consumer that bandwidth binds
+            # at the compute ceiling, which is the reverse of what was measured.
+            "saturates_at_fraction_of_peak_dram": None,
+            "observed_fraction_of_peak_dram_at_ceiling": 0.28,
+        },
+        # The fixed per-threadgroup term is the LUT (16,384 B) plus the 1 KiB
+        # `starts` array; the per-group term is the 128 B output stage. The
+        # declared 256 B input ring is removed by the compiler in the direct
+        # specialization -- the pipeline reports 19,456 B static threadgroup
+        # memory, which these two fields reproduce exactly at 128 threads:
+        # 17,408 + (128 / 8) * 128 = 19,456. (CUDA's entry counts only the
+        # LUT in its fixed term and omits its own 1 KiB static `starts`.)
+        "shmem_lut_bytes": PROB_SCALE * 4 + 256 * 4,
+        "shmem_per_group_bytes": GRAIN,
+        "compiled_threadgroup_bytes_at_128_threads": 19_456,
+        "blocks_per_unit_at_measurement": (1, 4),
+        "residency_formula": (
+            "blocks = floor(pool / shm) if shm <= cap else 0, where "
+            "shm = shmem_lut_bytes + (threads / lanes) * shmem_per_group_bytes. "
+            "Metal reports the cap (maxThreadgroupMemoryLength, 32768 on the "
+            "M4) and NO per-core pool; the M4's pool was measured by occupancy "
+            "staircase as 77,824 <= pool < 83,968 B (lmsluice "
+            "probe/metal-bench.js), which gives 4 threadgroups per core at "
+            "19,456 B -- the same 4 the decoder grid sweep's knee implies. Say "
+            "which pool you used; a cap substituted for the pool gives 1."
+        ),
+        "provenance": {
+            "kernel": "lmz_rans.metal lmz_decode_plane_direct "
+                      "(decode_plane_shared<false>), shared frequency table",
+            "device": "Apple M4 (Mac16,10), 10 GPU cores, 1.51-1.58 GHz "
+                      "measured per row (IOReport P15 = 1578 MHz), LPDDR5X "
+                      "120 GB/s spec, ~102 GB/s measured streaming read",
+            "machine": "Mac mini, 24 GB unified memory, macOS 15.4.1",
+            "archive": "936.6 MB of real BF16 exponent planes from "
+                       "Qwen3-4B-Instruct-2507 (first 936.6 MB in file order), "
+                       "314.8 MB coded, 28,584 streams of 32,768 bytes, one "
+                       "shared table",
+            "method": "grid sweep at fixed byte traffic -- the shipped "
+                      "decode_plane_shared<false> wrapped in a grid-stride "
+                      "loop and nothing else (drift +0.96% against the shipped "
+                      "kernel at full grid), 1 to 1787 threadgroups, "
+                      "byte-identical at every size, GPU timestamps; row "
+                      "frequency from IOReport GPU P-state residency",
+            "k_derivation": "measured: resident lanes (128 x resident "
+                            "threadgroups) x measured row frequency / decode "
+                            "rate, rows at 1-4 threadgroups per core",
+            "scaling": "scale by resident lanes x clock, never by FP32 rate. "
+                       "On this device k RISES with co-resident threadgroups "
+                       "(268.9 at <=1 per core to ~300 at 4): co-resident "
+                       "groups contend for the core rather than only hiding "
+                       "each other's latency -- the opposite direction to the "
+                       "CUDA reading, so a device holding fewer than 4 per core "
+                       "sits toward the LOW end, not beyond the high end",
+            "supersedes": "nothing: the first measured Metal cost. The earlier "
+                          "24.1/36.3 GB/s Metal figures were synthetic-input "
+                          "rates, not a cost model",
+            "status": "one device. Desktop GPU clients (WindowServer, Terminal, "
+                      "a browser) were present in most rows and only the 1-2 "
+                      "threadgroup rows met a <=2% foreign-time criterion, so "
+                      "the interval is conditional on that background. The "
+                      "4-per-core row is residency-limited at ~28% of DRAM, "
+                      "i.e. still a compute measurement; the re-measurement "
+                      "report excludes it from its primary interval. Record: "
+                      "docs/evaluations/m4-metal-decoder-remeasure.md",
+        },
+    }
+
+
+def cost_model(kernel: str = "shared", backend: str = "cuda") -> dict:
     """What the decoder costs, so a caller can predict it on its own machine.
+
+    `backend` names whose kernel the constants describe: "cuda" (the default,
+    and the record every existing caller gets) or "metal". The two kernels
+    share the algorithm and format but not their shape, so their k differ.
+    Only the Metal shared-table kernel has been measured; asking for the Metal
+    per-chunk cost raises rather than returning CUDA's numbers under a Metal
+    name.
 
     `kernel` selects which of the two lmz ships: "shared", for a batch given
     one frequency table, and "per_chunk", for streams that each carry their
@@ -450,6 +558,15 @@ def cost_model(kernel: str = "shared") -> dict:
     """
     if kernel not in ("shared", "per_chunk"):
         raise ValueError(f"kernel must be 'shared' or 'per_chunk', not {kernel!r}")
+    if backend not in ("cuda", "metal"):
+        raise ValueError(f"backend must be 'cuda' or 'metal', not {backend!r}")
+    if backend == "metal":
+        if kernel != "shared":
+            raise ValueError(
+                "no measured cost for the Metal per-chunk kernel: only the "
+                "Metal shared-table kernel has been measured "
+                "(docs/evaluations/m4-metal-decoder-remeasure.md)")
+        return _cost_model_metal_shared()
     if kernel == "per_chunk":
         return _cost_model_per_chunk()
     return {
@@ -458,6 +575,7 @@ def cost_model(kernel: str = "shared") -> dict:
         "grain": grain(),
         "bytes_per_symbol": 1,
         "kernel": "shared",
+        "backend": "cuda",
         # Validated across 1191x of compute by shrinking the grid at fixed
         # byte traffic, which is the only way to reach the compute-bound
         # regime on a card that saturates on bandwidth at 192 threads. The
