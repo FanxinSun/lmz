@@ -437,3 +437,102 @@ New/recreated external cache artifacts for user cleanup:
 - `/Users/masshj/Library/Caches/lmz-m4-remeasure/phase4-final-tests-1-conditions.json`
 - `/Users/masshj/Library/Caches/lmz-m4-remeasure/phase4-contention-N2-conditions.json`
 - `/Users/masshj/Library/Caches/lmz-m4-remeasure/phase4-fused-drift-conditions.json`
+
+
+## Phase 5 — 2026-11-09, the shipped Metal host path, and what it cost to keep it honest
+
+Executed by a codex session under the lmsluice manager's brief E; audited by the manager against the raw rows
+(`scratchpad/gpu/metal/m4_ship/`). The Vulkan decoder is a separate record, [vulkan-decoder-m4.md](vulkan-decoder-m4.md).
+
+**What changed in shipped code** (`lmz/gpu/lmz_rans.metal`, `lmzgpu_metal.m`, `__init__.py`, `build.py`, tests):
+
+- `lmz_rans.metal` is the HEAD source byte-for-byte plus one new kernel, `lmz_decode_perstream_stride`: HEAD's per-stream body
+  in a grid-stride loop whose bound is rounded up to four streams so the SIMD-group barriers and ballots stay in lockstep.
+- A sized host ABI (`lmz_gpu_metal_decode`, `_decode_bf16`, `_prepare`/`_run_prepared`, `_decode_batch_dev_sized`) that wraps whole
+  aligned pages of the caller's memory instead of copying, validates every offset, length and shared header, and returns either a view
+  of the caller's output or a Metal-owned buffer whose lifetime follows the Python view.
+- `decode_bf16_fused` (the fused BF16 kernel, previously unreachable) and an opt-in `decode_chunk` fast path (`LMZ_METAL_FUSED_CHUNK=1`).
+- The library is now built with **ARC** (`-fobjc-arc`, plus `-framework IOKit`). **HEAD was built without it**, so every
+  `newBufferWith*` was never released (each decode leaked its output buffer, ~936 MB on this workload) and `__bridge_retained`
+  handles were plain casts that dangled once an autorelease pool drained (codex observed a crash). This is a pre-existing bug, not a regression.
+- The pre-existing test `test_mapped_archive_zero_copy_and_mtl_buffer` failed instead of skipping under `LMZ_NO_GPU=1`; it skips now.
+
+**Decisions, in the order they were forced by measurement.**
+
+1. *A bounds-checked kernel was built first* (refills guarded by the stream's own end, which removes the trailing-padding
+   requirement). Same-session against HEAD it was **0.90-0.94x** on every case (shared 25.17 -> 22.93 GB/s, per-chunk 0.90x, fused 0.94x).
+2. *A branchless clamp* recovered some of it (0.931-0.958x) and still failed the pre-set bound of 3% (shared full grid 0.941x; k at G=1 270 -> 288).
+   On a latency-bound dependent chain every extra operation on the address path shows up.
+3. *Final: the HEAD kernels unchanged, with the slack guaranteed by the host.* A coded buffer is wrapped without a copy only if
+   `page_round_up(extent) - extent >= lmz_gpu_pad_bytes()` (576 B); otherwise it is copied into a zero-padded allocation. The trust model is the CUDA
+   one (below). The published Metal `k` records therefore stay valid: the kernels are the ones that were measured.
+4. *Per-chunk grid tuning was made explicit.* The first version tuned inside the first `decode_batch` of 1,024+ per-chunk streams, which costs ~20
+   batch decodes (4.6-4.9 s on this workload) for a grid that is 2.6x faster than the shipped one: it repays only after ~30 batches of this size, so
+   a one-shot caller would have decoded 13x slower. It now runs only when asked (`prepare_metal_batch`, or `LMZ_METAL_PERSTREAM_TGS=auto`).
+5. *The fused `decode_chunk` fast path stays off by default* (table below).
+
+**Trust model.** The kernels may read up to `lmz_gpu_pad_bytes()` past the end of a stream, as the CUDA kernels do, so the coded input needs
+that much readable slack, which the host provides. A *corrupt* archive can make a kernel read past its buffer; the call then fails
+(command-buffer error, the call returns None), a caller-owned output may be partly written, and nothing is written outside the output.
+A test places the final coded byte against a `PROT_NONE` page (both the no-copy case with slack and the exact-boundary case that must take the copy path) and checks
+that a physically short stream neither crashes nor poisons the next decode. **Untrusted archives should not be fed to the GPU path unverified.**
+
+### Kernel-only: HEAD against the final kernels
+
+Machine/conditions: Mac mini Apple M4 (10 GPU cores), 24 GiB unified, macOS 15.4.1, AC power, Parallels VM running and untouched, 2026-11-09; real Qwen3-4B-Instruct-2507 exponent planes, 28,584 streams x 32,768 B (936.6 MB plain); decimal GB/s; GPU lock and idle checks; desktop GPU clients present in most rows, every row over 2% foreign time retried once and the second attempt kept (both attempts in the logs). Kernel GPU timestamps, 14 timed runs (two attempts) per row.
+
+| Kernel | HEAD GB/s | Final GB/s | Ratio |
+|---|---:|---:|---:|
+| shared table, full grid (1,787 TGs) | 25.219 | 25.190 | 0.999 |
+| shared table, stride G=1 | 0.750 | 0.750 | 1.000 |
+| per-chunk tables, shipped geometry (7,146 TGs) | 4.422 | 4.413 | 0.998 |
+| fused BF16 (BF16 bytes out), full grid | 39.276 | 39.270 | 1.000 |
+
+### Through the Python API
+
+Machine/conditions: Mac mini Apple M4 (10 GPU cores), 24 GiB unified, macOS 15.4.1, AC power, Parallels VM running and untouched, 2026-11-09; real Qwen3-4B-Instruct-2507 exponent planes, 28,584 streams x 32,768 B (936.6 MB plain); decimal GB/s; GPU lock and idle checks; desktop GPU clients present in most rows, every row over 2% foreign time retried once and the second attempt kept (both attempts in the logs). API wall time, seven timed calls after two warm-ups. HEAD is the unmodified library (built from `git show HEAD`, with its original flags), each timed sample in
+a fresh short-lived process. The same HEAD, called repeatedly inside one process, measured 1.98 GB/s in Phase 2; codex attributes the difference to the leak above, which was not isolated.
+
+| Path | API GB/s (min-max) | Kernel inside the call |
+|---|---:|---:|
+| HEAD, shared table | 4.68 | 22.8 |
+| HEAD, per-chunk tables | 2.47 | 4.3 |
+| new, shared table, page-aligned no-copy input, output read back every call | 15.04 (12.6-15.8) | 22.9 |
+| new, shared table, prepared, output read back every call | 22.62 (21.1-23.7) | 23.0 |
+| new, shared table, prepared, output left on the GPU* | 24.97 (22.0-25.1) | 25.2 |
+| new, fused BF16, prepared, output read back (BF16 bytes) | 18.35 (17.8-18.8) | 36.4 |
+| new, fused BF16, prepared, output left on the GPU* | 38.91 (17.8-39.1) | 39.2 |
+| new, per-chunk, **plain `decode_batch`** (shipped geometry, nothing tuned) | 4.0-4.1 | 4.4 |
+| new, per-chunk, `prepare_metal_batch` (tuned: 80 TGs in codex's runs, 160 in the manager's) | 10.3-11.4 (5.1-12.1) | 8.8-8.9 |
+
+\* Intermediate outputs are not read by the CPU; the first and last timed outputs are compared byte-for-byte. Which condition applies depends on the consumer: a GPU consumer
+(model weights that stay in unified memory) is the second, a CPU consumer the first. Both are kept. The per-chunk tuned rows are noisy (the low end is rows with foreign GPU work).
+One-time costs are separate: `prepare_metal_batch` on the per-chunk batch took 4.6-4.9 s; these are not cold model-load numbers.
+
+### The fused kernel inside `decode_chunk`
+
+Machine/conditions: Mac mini Apple M4 (10 GPU cores), 24 GiB unified, macOS 15.4.1, AC power, Parallels VM running and untouched, 2026-11-09; real Qwen3-4B-Instruct-2507 exponent planes, 28,584 streams x 32,768 B (936.6 MB plain); decimal GB/s; GPU lock and idle checks; desktop GPU clients present in most rows, every row over 2% foreign time retried once and the second attempt kept (both attempts in the logs). Real `CODEC_BF16` chunks, byte-identical, seven timed API runs after two warm-ups, BF16 bytes per second.
+
+| Chunk (BF16 bytes) | CPU native decode + merge | previous GPU two-plane path | opt-in fused path |
+|---:|---:|---:|---:|
+| 65,536 | 2.152 | 0.035 | 0.044 |
+| 1,048,576 | 1.407 | 0.084 | 0.105 |
+| 4,194,304 | 1.322 | 0.087 | 0.104 |
+
+Every chunk of an ordinary archive has its own table, so the fused kernel gets one stream per dispatch (8 lanes); it is 13-48x slower than the CPU (13x at 1 and 4 MiB, 48x at 64 KiB). It is useful to
+a caller holding many streams against **one** table (39 GB/s above), not to today's archives, hence off by default.
+
+### Tests
+
+- pytest (`tests/`): **151 passed, 6 "failed"**, the 6 being lmz's own `Skip` exceptions that pytest counts as failures (the CUDA-only device test and five FUSE tests needing
+  `fusermount3`); the baseline was 142 passed with the same six. The nine extra passes are four Metal tests (partial SIMD tails at 10 stream counts under forced grids of 1/3/7/full, the
+  guard-page and lifetime test, fused and opt-in chunk identity, explicit tuning) and five Vulkan tests.
+- `LMZ_NO_GPU=1 python tests/test_lmz.py`: 124/144 passed, 20 skipped, no failures, stable over four consecutive runs from a quiet start. **One existing test is environment-flaky:** `test_mount_readahead_serves_the_same_bytes` (macOS loopback WebDAV mount). Run soon after another mount session (the pytest `fs_`/mount tests, or the full pytest run) it turns from a pass into a skip, `mount_webdav failed (19)` (123 passed, 21 skipped, reproduced on demand); after the full pytest run it was once short a test altogether (123 passed + 20 skipped = 143 of 144), which was not captured in a log. It touches `mount_macos.py`, not anything changed here, and it did not occur in the earlier baseline.
+- On all 28,584 real streams the final host path and stride kernel decode byte-identically at forced grids of 1, 3, 7 and the full grid.
+
+### Not established here
+
+An uncontended rate (desktop GPU clients were present throughout); a cold end-to-end model load; any device other than this M4; that one process-cached tuned grid suits a later,
+different workload; the CPU-contention cost of the *new* host path (Phase 4's contention numbers are for the kernel); behaviour of the corrupt-archive path beyond "does not crash or hang and the next decode works".
+
+Reproduction: `scratchpad/gpu/metal/m4_ship/` (drivers, raw `*.jsonl`, `summary.json` with the cache cleanup list); `default_perstream.py` there regenerates the plain-vs-tuned rows.

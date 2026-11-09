@@ -16,7 +16,8 @@
 > - **§5.** The fused row's 3.69 ms divides the exponent-only byte count, which is inconsistent with §2's 7.39 ms. The GPU rows
 >   reuse the kernel table rather than measured arms of `bench_unified_memory_io.py`, and the mmap baseline is a warm
 >   page-cache read, so this is not a cold-disk comparison.
-> - **Calling the decoder the shipped way** (`lmz.gpu.decode_batch`) delivers ~2.0 GB/s, because host copies dominate.
+> - **Calling the decoder the shipped way** (`lmz.gpu.decode_batch`) delivered 2-5 GB/s at the time, because host copies
+>   dominated; the zero-copy host path of 2026-11-09 reaches 15-25 GB/s (Phase 5 of the re-measurement).
 
 ---
 

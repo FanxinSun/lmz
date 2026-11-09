@@ -149,22 +149,39 @@
   refill loops causes lane divergence.
   *Correction 2026-11-09 ([re-measurement](evaluations/m4-metal-decoder-remeasure.md)):*
   24.1 and 36.3 GB/s were GPU-timed best-of-7 on synthetic planes. Kernel-only
-  re-measurement: 23.2 GB/s median on that synthetic shape, 25.2 GB/s on real
-  Qwen3 exponent planes. Fused BF16 was not re-measured. The shipped Python call
-  path (`lmz.gpu.decode_batch`) delivers ~2.0 GB/s because host-side copies,
-  not decoding, set that rate. The host library is built with clang on first
-  use, so a stock Mac without the Command Line Tools cannot build it unless a
-  matching prebuilt dylib ships.
-  *Added 2026-11-09 (Phase 4 of the same record):*
-  - **The fused BF16 kernel is not reachable through lmz's API.** `lmz_decode_bf16`
-    exists only in `lmz_rans.metal`; the host library exposes no fused decode
-    function. Dispatched directly on real Qwen3 BF16 it runs at 39.2 GB/s of
-    BF16 output (19.6 GB/s of exponent plane), byte-identical.
-  - **The per-chunk-table kernel, which every archive written today uses, runs at
-    4.58 GB/s with the shipped launch geometry** (one 32-thread threadgroup per four
-    streams). The same kernel reaches ~10.6 GB/s at about 100 threadgroups, so the
-    shipped geometry costs ~2.3x on this M4.
-  - **Measured costs** are in `gpu.cost_model(..., backend="metal")` for both kernels.
+  re-measurement on real Qwen3 planes: shared-table kernel 25.2 GB/s, fused BF16
+  39.2 GB/s of BF16 output (19.6 of exponent plane), per-chunk-table kernel 4.4 GB/s at
+  its shipped geometry. The host library needs clang on first use, so a stock Mac
+  without the Command Line Tools cannot build it unless a matching prebuilt dylib ships.
+  *Phase 5, 2026-11-09 (host path rewritten; kernels unchanged):*
+  - **Through the Python API** the old copying host path reached 4.7 GB/s in a fresh process
+    and 2 GB/s when called repeatedly in one (attributed, not isolated, to its non-ARC build
+    leaking every call's Metal buffers, including the output). The new path reaches **15 GB/s** with
+    page-aligned buffers and **22–25 GB/s** with `prepare_metal_batch`, against a
+    22–25 GB/s kernel. Ordinary unaligned buffers are copied (with trailing padding).
+  - **`decode_batch` on Metal now returns a `memoryview`** (of the caller's `out`, or of
+    a Metal-owned buffer that lives as long as the view). `prepare_metal_batch(...).decode()`
+    returns a view that the next decode overwrites.
+  - **Per-chunk archives** (a table per stream; what `lmz compress` writes today) decode
+    at 4.0 GB/s through the API at the shipped geometry. A device-measured grid reaches
+    10-11 GB/s, but finding it costs ~20x one batch's decode (4.6-4.9 s on 936 MB), which a
+    single batch never repays (break-even is ~30 such batches). Tuning is therefore
+    **opt-in**: `prepare_metal_batch`, or `LMZ_METAL_PERSTREAM_TGS=auto`; a number in that
+    variable forces a grid. The tuned grid varies with load (80-160 here).
+  - **The fused BF16 kernel is callable** (`decode_bf16_fused`) for callers holding many
+    streams against one table. The `decode_chunk` fast path is **off by default**
+    (`LMZ_METAL_FUSED_CHUNK=1` enables it): each `CODEC_BF16` chunk carries its own table,
+    so it is one tiny dispatch per chunk, 0.04-0.10 GB/s against 1.3-2.2 GB/s on the CPU.
+  - **Trust model, same as CUDA's.** The kernels read up to `lmz_gpu_pad_bytes()` past a
+    stream's end, so coded input must have that much readable slack. The host guarantees it
+    (a no-copy buffer only when the final page leaves >= 576 bytes; otherwise a padded
+    copy). A corrupt archive may fault the GPU command buffer, in which case the call
+    returns None and a caller-owned output may be partly written; it never writes outside
+    the output. Do not feed untrusted archives to the GPU path without verifying them.
+    (A bounds-checked kernel was built and measured: it cost 4-10% on every decode and was
+    not kept.)
+  - **Measured costs** are in `gpu.cost_model(..., backend="metal")` for both kernels; they
+    describe the unchanged kernels.
 - **CPython's bundled zstd is slow on macOS.** Measured on a GitHub
   `macos-latest` runner: 103 MiB/s compressing a 64 MiB BF16 sample through
   `compression.zstd`, against 767 MiB/s for the same work through the

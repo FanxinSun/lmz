@@ -29,12 +29,16 @@ positioning remain independently assessed. This is planned support, not a claim
 that every model/engine is already supported.
 
 And the decoder runs on the GPU — **111 GB/s** on an RTX 5080 from an
-ordinary archive, **25.2 GB/s** kernel-only on Apple Silicon M4 via Metal (real Qwen3
-exponent planes; the shipped Python call path delivers ~2 GB/s because host copies
-dominate, and the 36.3 GB/s fused figure has not been re-measured — see
-[the re-measurement](docs/evaluations/m4-metal-decoder-remeasure.md), 2026-11-09),
-and **3.5–4.5 GB/s** on CPU via ARM NEON SIMD, shipped in the wheel. A portable
-Vulkan compute decoder provides driver-level reach across AMD and Intel iGPUs.
+ordinary archive; on an Apple M4 via Metal **25.2 GB/s** kernel-only on real Qwen3
+exponent planes, of which a Python caller gets **15–25 GB/s** with page-aligned or
+prepared buffers (the copying host path it replaced measured 4.7 GB/s), and **39 GB/s**
+for the fused BF16 kernel through `decode_bf16_fused` (archives' per-chunk path does
+not use it by default: it is slower than the CPU for one table per chunk) — see
+[the re-measurement](docs/evaluations/m4-metal-decoder-remeasure.md), 2026-11-09 —
+and **3.5–4.5 GB/s** on CPU via ARM NEON SIMD, shipped in the wheel. An opt-in Vulkan
+compute decoder (`lmz.gpu.vulkan`, standard library only, precompiled SPIR-V) decodes
+byte-identically on the M4 through MoltenVK; it has not yet run on a native AMD, Intel
+or NVIDIA driver ([evaluation](docs/evaluations/vulkan-decoder-m4.md)).
 [Jump to it](#on-a-gpu).
 
 ```

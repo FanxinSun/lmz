@@ -211,7 +211,8 @@ Measured over 4,096 streams (134.2 MB plain across 32 KiB exponent planes, 65.2%
 > *Correction 2026-11-09 ([re-measurement](evaluations/m4-metal-decoder-remeasure.md)):* this input was
 > synthetic (`scratchpad/gpu/prep_bench_shared.py`) and the figures are GPU-timed best-of-7. Kernel-only
 > re-measurement: 23.2 GB/s median on the same synthetic shape, 25.2 GB/s on real Qwen3 exponent planes.
-> Fused BF16 was not re-measured. The shipped Python call path delivers ~2.0 GB/s.
+> Fused BF16: 39.2 GB/s of BF16 output on real data. The Python API path, then 2-5 GB/s because of
+> host copies, reaches 15-25 GB/s after the zero-copy host rewrite (Phase 5 of the re-measurement).
 
 ### 2. Cold-Disk to Unified-Memory Ingestion (LMZ-I0)
 134.2 MB multi-tensor BF16 checkpoint compressed to 45.0 MB (66.5% saved) with v7 shared tables:
