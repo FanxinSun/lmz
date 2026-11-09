@@ -3605,9 +3605,29 @@ def test_gpu_cost_model_metal_is_its_own_record():
                 "k_derivation", "scaling", "status", "supersedes"):
         assert prov.get(key), key
 
+    # The Metal per-chunk kernel is its own record too, measured on the same
+    # device: no fixed table term, a 5,248 B slice per group, and the compiled
+    # 20,992 B reproduced at its 32 threads.
+    pm = gpu.cost_model("per_chunk", backend="metal")
+    assert pm["backend"] == "metal" and pm["kernel"] == "per_chunk"
+    assert pm["shmem_lut_bytes"] == 0
+    pshm = pm["shmem_lut_bytes"] + (32 // pm["lanes"]) * pm["shmem_per_group_bytes"]
+    assert pshm == pm["compiled_threadgroup_bytes_at_32_threads"] == 20_992
+    assert pm["bound"]["compute_below_threads"] == 32
+    assert pool // pshm == 3 and pm["blocks_per_unit_at_measurement"] == (1, 3)
+    # The same invariant the CUDA pair satisfies: a table per stream costs
+    # more per byte than one shared table, and not wildly more.
+    p_lo, p_hi = pm["k_cycles_per_byte"]
+    assert p_lo > lo and p_hi < 2 * hi, ((lo, hi), (p_lo, p_hi))
+    assert pm["k_is_single_point_fit"] is False
+    assert pm["shipped_geometry_gbps"] < pm["best_measured_grid"]["gbps"]
+    for key in ("kernel", "device", "archive", "method", "k_derivation",
+                "status"):
+        assert pm["provenance"].get(key), key
+
     # What has not been measured is refused, not answered with CUDA's numbers.
-    for bad in (dict(kernel="per_chunk", backend="metal"),
-                dict(kernel="shared", backend="vulkan")):
+    for bad in (dict(kernel="shared", backend="vulkan"),
+                dict(kernel="per_chunk", backend="vulkan")):
         try:
             gpu.cost_model(**bad)
         except ValueError:

@@ -155,6 +155,16 @@
   not decoding, set that rate. The host library is built with clang on first
   use, so a stock Mac without the Command Line Tools cannot build it unless a
   matching prebuilt dylib ships.
+  *Added 2026-11-09 (Phase 4 of the same record):*
+  - **The fused BF16 kernel is not reachable through lmz's API.** `lmz_decode_bf16`
+    exists only in `lmz_rans.metal`; the host library exposes no fused decode
+    function. Dispatched directly on real Qwen3 BF16 it runs at 39.2 GB/s of
+    BF16 output (19.6 GB/s of exponent plane), byte-identical.
+  - **The per-chunk-table kernel, which every archive written today uses, runs at
+    4.58 GB/s with the shipped launch geometry** (one 32-thread threadgroup per four
+    streams). The same kernel reaches ~10.6 GB/s at about 100 threadgroups, so the
+    shipped geometry costs ~2.3x on this M4.
+  - **Measured costs** are in `gpu.cost_model(..., backend="metal")` for both kernels.
 - **CPython's bundled zstd is slow on macOS.** Measured on a GitHub
   `macos-latest` runner: 103 MiB/s compressing a 64 MiB BF16 sample through
   `compression.zstd`, against 767 MiB/s for the same work through the

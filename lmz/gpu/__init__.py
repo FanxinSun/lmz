@@ -421,12 +421,16 @@ def _cost_model_metal_shared() -> dict:
         "kernel": "shared",
         "backend": "metal",
         # Lane-cycles per decoded byte across the measured occupancies, 1 to 4
-        # threadgroups per core, at the IOReport-measured clock of each row:
-        # exactly the bracket of the row medians below, unrounded.
-        "k_cycles_per_byte": (268.9, 300.4),
+        # threadgroups per core, at the KERNEL's clock: IOReport state P15
+        # (1578 MHz), whose residency matched the summed kernel time in every
+        # row (0.98-1.06x). The residency-weighted average clock, diluted by
+        # background low-state time between runs, gave 268.9-300.4 and
+        # under-reads most where kernel windows are shortest. Exact bracket of
+        # the row medians below, unrounded.
+        "k_cycles_per_byte": (269.4, 313.1),
         "k_by_threadgroups_per_core": {
-            1: (268.9, 273.1), 2: (281.4, 284.9),
-            3: (288.2, 289.6), 4: (299.5, 300.4),
+            1: (269.4, 276.5), 2: (287.8, 288.1),
+            3: (297.2, 298.3), 4: (311.6, 313.1),
         },
         "k_is_single_point_fit": False,
         "expansion": 2.975,
@@ -481,11 +485,13 @@ def _cost_model_metal_shared() -> dict:
                       "byte-identical at every size, GPU timestamps; row "
                       "frequency from IOReport GPU P-state residency",
             "k_derivation": "measured: resident lanes (128 x resident "
-                            "threadgroups) x measured row frequency / decode "
-                            "rate, rows at 1-4 threadgroups per core",
+                            "threadgroups) x the kernel's clock (P15, 1578 MHz, "
+                            "attributed by P15 residency >= 0.95 x summed "
+                            "kernel time) / decode rate, rows at 1-4 "
+                            "threadgroups per core",
             "scaling": "scale by resident lanes x clock, never by FP32 rate. "
                        "On this device k RISES with co-resident threadgroups "
-                       "(268.9 at <=1 per core to ~300 at 4): co-resident "
+                       "(269.4 at <=1 per core to ~313 at 4): co-resident "
                        "groups contend for the core rather than only hiding "
                        "each other's latency -- the opposite direction to the "
                        "CUDA reading, so a device holding fewer than 4 per core "
@@ -499,8 +505,83 @@ def _cost_model_metal_shared() -> dict:
                       "the interval is conditional on that background. The "
                       "4-per-core row is residency-limited at ~28% of DRAM, "
                       "i.e. still a compute measurement; the re-measurement "
-                      "report excludes it from its primary interval. Record: "
+                      "report excludes it from its primary interval. A CPU "
+                      "streaming 71-81 GB/s (measured read+write) on the same "
+                      "bus slowed the decoder 17-29% although DRAM did not "
+                      "bind it. Record: "
                       "docs/evaluations/m4-metal-decoder-remeasure.md",
+        },
+    }
+
+
+def _cost_model_metal_per_chunk() -> dict:
+    """The Metal per-chunk-table kernel, measured on an Apple M4.
+
+    What every archive written today holds: each stream carries its own table,
+    so the kernel builds one per stream in threadgroup memory -- 32 threads, 4
+    streams a threadgroup, 20,992 B compiled -- and pays for it per byte.
+    """
+    return {
+        "lanes": 8,
+        "states": 8,
+        "grain": grain(),
+        "bytes_per_symbol": 1,
+        "kernel": "per_chunk",
+        "backend": "metal",
+        # At the kernel's clock (P15, attributed as for the shared record),
+        # over the rows where the threadgroup count is the resident count:
+        # 1-30 threadgroups, at most 3 per core, linear to within 1%.
+        "k_cycles_per_byte": (349.3, 355.4),
+        "k_is_single_point_fit": False,
+        "expansion": 2.934,
+        "bound": {
+            "compute_below_threads": 32,
+            "saturates_at_fraction_of_peak_dram": None,
+        },
+        # No fixed term: every table is per stream, so per group. 4,096 B of
+        # symbols + 1,024 B of starts/frequencies + the 128 B output stage =
+        # 5,248 B a group, 20,992 B at 32 threads -- the compiled figure.
+        "shmem_lut_bytes": 0,
+        "shmem_per_group_bytes": 5_248,
+        "compiled_threadgroup_bytes_at_32_threads": 20_992,
+        "blocks_per_unit_at_measurement": (1, 3),
+        # The launch geometry matters more here than anywhere else measured:
+        # one threadgroup per four streams is far from the best grid.
+        "shipped_geometry_gbps": 4.577,
+        "best_measured_grid": {"threadgroups": 100, "gbps": 10.557},
+        "residency_formula": (
+            "blocks = floor(pool / shm) if shm <= cap else 0, where "
+            "shm = shmem_lut_bytes + (threads / lanes) * shmem_per_group_bytes. "
+            "On the M4's staircase-measured pool (77,824 <= pool < 83,968 B) "
+            "this gives 3 per core at 20,992 B, which the probe's staircase "
+            "also measured. UNRESOLVED ABOVE THAT: the decoder's rate keeps "
+            "rising past 30 threadgroups, to ~10.6 GB/s at 100 -- about 73 "
+            "threadgroups' worth at the low-grid cost -- so the measured curve "
+            "does not support a hard 3-per-core ceiling for this kernel, and "
+            "none is published. k is valid only at the occupancies listed."
+        ),
+        "provenance": {
+            "kernel": "lmz_rans.metal lmz_decode_perstream, a table per stream",
+            "device": "Apple M4 (Mac16,10), 10 GPU cores, kernel clock P15 = "
+                      "1578 MHz (IOReport), LPDDR5X 120 GB/s spec",
+            "machine": "Mac mini, 24 GB unified memory, macOS 15.4.1",
+            "archive": "the same 936.6 MB of real Qwen3-4B-Instruct-2507 BF16 "
+                       "exponent planes, 28,584 ordinary lmz streams of "
+                       "32,768 bytes each with its own 516-byte table, "
+                       "319.2 MB coded including the tables",
+            "method": "grid sweep at fixed byte traffic -- the shipped "
+                      "per-stream body verbatim in a grid-stride loop (drift "
+                      "-1.06% against the shipped kernel at full grid), 1 to "
+                      "7146 threadgroups, byte-identical at every size, GPU "
+                      "timestamps, IOReport residency per row",
+            "k_derivation": "measured: 32 x threadgroups x 1578 MHz / decode "
+                            "rate over 1-30 threadgroups",
+            "scaling": "by resident lanes x clock, at 1-3 threadgroups per "
+                       "core only; above that the occupancy is unresolved",
+            "supersedes": "nothing: the first measured Metal per-chunk cost",
+            "status": "one device; desktop GPU clients present in most rows. "
+                      "Record: docs/evaluations/m4-metal-decoder-remeasure.md "
+                      "(Phase 4)",
         },
     }
 
@@ -511,9 +592,8 @@ def cost_model(kernel: str = "shared", backend: str = "cuda") -> dict:
     `backend` names whose kernel the constants describe: "cuda" (the default,
     and the record every existing caller gets) or "metal". The two kernels
     share the algorithm and format but not their shape, so their k differ.
-    Only the Metal shared-table kernel has been measured; asking for the Metal
-    per-chunk cost raises rather than returning CUDA's numbers under a Metal
-    name.
+    Both Metal kernels have their own measured records; an unknown backend
+    raises rather than returning CUDA's numbers under another name.
 
     `kernel` selects which of the two lmz ships: "shared", for a batch given
     one frequency table, and "per_chunk", for streams that each carry their
@@ -561,11 +641,8 @@ def cost_model(kernel: str = "shared", backend: str = "cuda") -> dict:
     if backend not in ("cuda", "metal"):
         raise ValueError(f"backend must be 'cuda' or 'metal', not {backend!r}")
     if backend == "metal":
-        if kernel != "shared":
-            raise ValueError(
-                "no measured cost for the Metal per-chunk kernel: only the "
-                "Metal shared-table kernel has been measured "
-                "(docs/evaluations/m4-metal-decoder-remeasure.md)")
+        if kernel == "per_chunk":
+            return _cost_model_metal_per_chunk()
         return _cost_model_metal_shared()
     if kernel == "per_chunk":
         return _cost_model_per_chunk()
